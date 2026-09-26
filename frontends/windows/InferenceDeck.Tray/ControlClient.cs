@@ -22,6 +22,8 @@ internal sealed class ControlClient
     private static readonly TimeSpan ShortTimeout = TimeSpan.FromSeconds(5);
     // api/start waits for the model to load (up to 45 s server-side) before replying.
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(120);
+    // api/stop allows 5 s for a clean exit plus 3 s after a forced kill.
+    private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(20);
     private readonly HttpClient _http;
 
     public ControlClient(string baseUrl)
@@ -74,7 +76,7 @@ internal sealed class ControlClient
     public Task<JsonDocument> DisableRemotesAsync() => PostAsync("api/remote", new { action = "disable" });
 
     public Task<JsonDocument> StartAsync(string mode) => PostAsync("api/start", new { mode }, StartTimeout);
-    public Task<JsonDocument> StopAsync(string serverId) => PostAsync("api/stop", new { server_id = serverId });
+    public Task<JsonDocument> StopAsync(string serverId) => PostAsync("api/stop", new { server_id = serverId }, StopTimeout);
     public Task<JsonDocument> SuspendAsync(string serverId) => PostAsync("api/suspend", new { server_id = serverId });
     public Task<JsonDocument> ResumeAsync(string serverId) => PostAsync("api/resume", new { server_id = serverId });
 

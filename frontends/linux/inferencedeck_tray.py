@@ -18,12 +18,14 @@ gi.require_version("Notify", "0.7")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import GLib, Gtk, Notify  # noqa: E402
 
-CONTROL_URL = os.environ.get("INFERENCEDECK_CONTROL_URL", "http://127.0.0.1:8717").rstrip("/")
-WEB_URL = os.environ.get("INFERENCEDECK_WEB_URL", "http://127.0.0.1:8716").rstrip("/")
+# inferencedeck-web serves both the API and the UI; it is the one process that owns server state.
+BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("/")
 TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 SYNC_SECONDS = 5
 # start waits for the model to load (up to 45 s server-side) before replying.
 START_TIMEOUT_SECONDS = 120
+# stop allows 5 s for a clean exit plus 3 s after SIGKILL server-side.
+STOP_TIMEOUT_SECONDS = 20
 
 
 class ApiClient:
@@ -35,7 +37,7 @@ class ApiClient:
         if TOKEN:
             headers["X-Auth-Token"] = TOKEN
         request = urllib.request.Request(
-            CONTROL_URL + path,
+            BASE_URL + path,
             data=data,
             headers=headers,
             method="POST" if data is not None else "GET",
@@ -64,7 +66,8 @@ class ApiClient:
         return self._request("/api/start", {"mode": mode}, timeout=START_TIMEOUT_SECONDS)
 
     def action(self, action: str, server_id: str) -> dict[str, Any]:
-        return self._request(f"/api/{action}", {"server_id": server_id})
+        timeout = STOP_TIMEOUT_SECONDS if action == "stop" else 5
+        return self._request(f"/api/{action}", {"server_id": server_id}, timeout=timeout)
 
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self._request("/api/remote", {"action": action, "name": name})
@@ -199,34 +202,34 @@ class TrayApplication:
         self.remotes_menu.show_all()
 
     def _start_profile(self, _widget, mode: str) -> None:
-        # Starting blocks until the model is loaded; keep the GTK loop responsive.
         self._notify(f"Starting {mode}…")
-        threading.Thread(target=self._start_worker, args=(mode,), daemon=True).start()
-
-    def _start_worker(self, mode: str) -> None:
-        error = ""
-        try:
-            result = self.api.start(mode)
-            if not result.get("success", True):
-                error = result.get("error", "start failed")
-        except Exception as exc:
-            error = str(exc)
-        GLib.idle_add(self._start_done, error)
-
-    def _start_done(self, error: str) -> bool:
-        if error:
-            self._notify(error, True)
-        self.refresh()
-        return False
+        self._in_background(self.api.start, mode)
 
     def _act(self, action: str) -> None:
         if not self.active:
             return
-        try:
-            self.api.action(action, str(self.active.get("id")))
-        except Exception as exc:
-            self._notify(str(exc), True)
+        self._in_background(self.api.action, action, str(self.active.get("id")))
+
+    def _in_background(self, call, *args) -> None:
+        # Lifecycle calls can block for many seconds (start waits for the model
+        # to load, stop for a clean exit); keep the GTK loop responsive.
+        def worker() -> None:
+            error = ""
+            try:
+                result = call(*args)
+                if not result.get("success", True):
+                    error = result.get("error") or result.get("message") or "request failed"
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(self._background_done, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _background_done(self, error: str) -> bool:
+        if error:
+            self._notify(error, True)
         self.refresh()
+        return False
 
     def _toggle_remote(self, widget: Gtk.CheckMenuItem, remote: dict[str, Any]) -> None:
         if widget.get_active() and not remote.get("enabled"):
@@ -235,15 +238,11 @@ class TrayApplication:
             self._remote_action("disable")
 
     def _remote_action(self, action: str, name: str = "") -> None:
-        try:
-            self.api.remote(action, name)
-        except Exception as exc:
-            self._notify(str(exc), True)
-        self.refresh()
+        self._in_background(self.api.remote, action, name)
 
     def _open_web(self) -> None:
         try:
-            subprocess.Popen(["xdg-open", WEB_URL], start_new_session=True)
+            subprocess.Popen(["xdg-open", BASE_URL], start_new_session=True)
         except Exception as exc:
             self._notify(str(exc), True)
 

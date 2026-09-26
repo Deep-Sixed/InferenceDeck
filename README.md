@@ -79,9 +79,12 @@ python -m inferencedeck inventory --pretty
 ## Local control API and web UI
 
 ```bash
-inferencedeck-control --host 127.0.0.1 --port 8717
 inferencedeck-web --host 127.0.0.1 --port 8716
 ```
+
+This one process serves the web UI and the control API (`/api/*`) and is the only
+process that changes tracked server state. The Windows and Linux trays talk to it
+at `INFERENCEDECK_URL` (default `http://127.0.0.1:8716`).
 
 For authenticated LAN/tailnet use:
 

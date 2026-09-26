@@ -15,11 +15,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _command = new("Show active command");
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 5000 };
     private ServerState? _active;
+    // inferencedeck-web serves both the API and the UI; it is the one process that owns server state.
+    private static readonly string BaseUrl = Environment.GetEnvironmentVariable("INFERENCEDECK_URL") ?? "http://127.0.0.1:8716";
 
     public TrayApplicationContext()
     {
-        var controlUrl = Environment.GetEnvironmentVariable("INFERENCEDECK_CONTROL_URL") ?? "http://127.0.0.1:8717";
-        _client = new ControlClient(controlUrl);
+        _client = new ControlClient(BaseUrl);
         var menu = new ContextMenuStrip();
         menu.Items.Add(_status);
         menu.Items.Add(new ToolStripSeparator());
@@ -151,8 +152,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private static void OpenWebUi()
     {
-        var url = Environment.GetEnvironmentVariable("INFERENCEDECK_WEB_URL") ?? "http://127.0.0.1:8716";
-        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        Process.Start(new ProcessStartInfo(BaseUrl) { UseShellExecute = true });
     }
 
     private static void ShowError(Exception ex) => MessageBox.Show(ex.Message, "InferenceDeck", MessageBoxButtons.OK, MessageBoxIcon.Error);
