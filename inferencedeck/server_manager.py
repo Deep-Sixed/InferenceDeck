@@ -75,14 +75,29 @@ def pid_is_running(pid: int | None) -> bool:
         return False
     # A killed-but-unreaped child becomes a zombie; os.kill(pid, 0) still
     # succeeds for it. Treat zombies as dead so Stop reports success and the
-    # server list doesn't show a corpse as running. Linux /proc only; elsewhere
-    # we keep the os.kill result.
-    # ponytail: /proc check, fine until this needs to run on macOS.
+    # server list doesn't show a corpse as running. Linux exposes state in
+    # /proc; macOS/BSD have no /proc, so ask ps instead.
     try:
         with open(f"/proc/{int(pid)}/stat", encoding="ascii") as f:
             return f.read().rpartition(")")[2].split()[0] != "Z"
+    except FileNotFoundError:
+        pass
     except (OSError, IndexError):
         return True
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(int(pid))],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    stat = result.stdout.strip()
+    if result.returncode != 0 and not stat:
+        return False
+    return not stat.startswith("Z")
 
 
 def _wait_gone(pid: int, seconds: float) -> bool:

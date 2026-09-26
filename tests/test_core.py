@@ -122,7 +122,8 @@ class ManifestTests(unittest.TestCase):
 
     def test_find_project_root_uses_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # resolve(): macOS temp dirs live under the /var -> /private/var symlink.
+            root = Path(tmp).resolve()
             child = root / "a" / "b"
             child.mkdir(parents=True)
             (root / "models.json").write_text('{"models": []}', encoding="utf-8")
