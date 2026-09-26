@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
 
 MAX_BODY_BYTES = 1024 * 1024
@@ -14,17 +15,32 @@ MAX_BODY_BYTES = 1024 * 1024
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
     control_plane = ControlPlane()
+    auth_state = AuthState()
     server_version = "InferenceDeckControl/1"
 
     def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _json(self, status: int, payload: Any) -> None:
+    def _cookie(self, name: str) -> str:
+        for part in self.headers.get("Cookie", "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return value
+        return ""
+
+    def _authed(self) -> bool:
+        if not self.auth_state.enabled:
+            return True
+        return self.auth_state.session_ok(self._cookie("sid")) or self.auth_state.supplied_token_ok(self.path, self.headers)
+
+    def _json(self, status: int, payload: Any, cookies: list[str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for cookie in cookies or []:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -49,6 +65,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        if parsed.path == "/healthz":
+            self._json(HTTPStatus.OK, {"ok": True})
+            return
+        if parsed.path == "/api/auth":
+            self._json(HTTPStatus.OK, {"required": self.auth_state.enabled, "username": self.auth_state.username})
+            return
+        if not self._authed():
+            self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "unauthorized"})
+            return
         try:
             if parsed.path == "/api/status":
                 self._json(HTTPStatus.OK, self.control_plane.status())
@@ -76,6 +101,23 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             body = self._body()
+            if parsed.path == "/api/login":
+                if not self.auth_state.enabled:
+                    self._json(HTTPStatus.OK, {"success": True})
+                    return
+                if not self.auth_state.credentials_ok(str(body.get("username", "")), str(body.get("password", ""))):
+                    self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "invalid credentials"})
+                    return
+                sid = self.auth_state.issue_session()
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"])
+                return
+            if parsed.path == "/api/logout":
+                self.auth_state.revoke_session(self._cookie("sid"))
+                self._json(HTTPStatus.OK, {"success": True}, cookies=["sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"])
+                return
+            if not self._authed():
+                self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "unauthorized"})
+                return
             if parsed.path == "/api/prepare":
                 mode = str(body.get("mode") or "")
                 payload = self.control_plane.prepare(mode, body.get("overrides"))
@@ -115,9 +157,17 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"success": False, "error": str(exc)})
 
 
-def serve(host: str = "127.0.0.1", port: int = 8717, control_plane: ControlPlane | None = None) -> None:
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8717,
+    control_plane: ControlPlane | None = None,
+    auth_state: AuthState | None = None,
+) -> None:
+    auth = auth_state or AuthState()
+    validate_bind_security(host, auth)
     handler = type("BoundControlRequestHandler", (ControlRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
+    handler.auth_state = auth
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 

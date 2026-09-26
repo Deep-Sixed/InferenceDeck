@@ -6,6 +6,7 @@ from http.server import ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
 
+from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
 from .control_api import ControlRequestHandler
 
@@ -38,9 +39,17 @@ class WebRequestHandler(ControlRequestHandler):
         super().do_GET()
 
 
-def serve(host: str = "127.0.0.1", port: int = 8716, control_plane: ControlPlane | None = None) -> None:
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8716,
+    control_plane: ControlPlane | None = None,
+    auth_state: AuthState | None = None,
+) -> None:
+    auth = auth_state or AuthState()
+    validate_bind_security(host, auth)
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
+    handler.auth_state = auth
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 

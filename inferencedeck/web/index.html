@@ -43,6 +43,15 @@
     <div id="benchmarks" class="list"></div>
   </section>
 </main>
+<div id="login" class="overlay hidden">
+  <form id="login-form" class="login-card">
+    <h2>Sign in</h2>
+    <input id="login-user" autocomplete="username" placeholder="Username" value="admin">
+    <input id="login-password" autocomplete="current-password" type="password" placeholder="Password">
+    <button class="primary" type="submit">Sign in</button>
+    <div id="login-error" class="muted"></div>
+  </form>
+</div>
 <div id="toast" role="status"></div>
 <script src="/app.js"></script>
 </body>
