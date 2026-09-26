@@ -65,3 +65,20 @@ class ControlApiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(req, timeout=2)
         self.assertEqual(caught.exception.code, 400)
+
+class PerformanceControlTests(unittest.TestCase):
+    def test_hardware_delegates(self) -> None:
+        with mock.patch("inferencedeck.control.detect_system_hardware", return_value={"cpu": {"model": "test"}}):
+            self.assertEqual(ControlPlane().hardware()["cpu"]["model"], "test")
+
+    def test_fit_delegates_with_scope(self) -> None:
+        plane = ControlPlane(project_root="/tmp/project", model_dirs=["/tmp/models"])
+        with mock.patch("inferencedeck.control.run_fit_test", return_value={"success": True}) as call:
+            self.assertTrue(plane.fit("demo", target_mib=2048)["success"])
+        call.assert_called_once_with("demo", project_root="/tmp/project", model_dirs=["/tmp/models"], overrides=None, target_mib=2048)
+
+    def test_benchmark_delegates_with_scope(self) -> None:
+        plane = ControlPlane(project_root="/tmp/project", model_dirs=["/tmp/models"])
+        with mock.patch("inferencedeck.control.run_profile_benchmark", return_value={"success": True}) as call:
+            self.assertTrue(plane.benchmark("demo", completion_tokens=64)["success"])
+        call.assert_called_once_with("demo", project_root="/tmp/project", model_dirs=["/tmp/models"], overrides=None, completion_tokens=64)
