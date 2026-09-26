@@ -172,12 +172,21 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
         return {"success": True, "message": "Tracked server has no PID to stop."}
     pid = int(raw_pid)
     if not pid_is_running(pid):
-        _update_server(server["id"], {"status": "stopped", "running": False, "stopped_at": _now()})
+        _update_server(server["id"], {"status": "stopped", "running": False, "suspended": False, "stopped_at": _now()})
         return {"success": True, "message": f"Tracked PID {pid} is no longer running."}
 
     if is_windows():
         cmd = ["taskkill", "/PID", str(pid), "/T", "/F"]
     else:
+        if server.get("suspended"):
+            # A SIGSTOPped process leaves SIGTERM pending until continued, which
+            # would always end in the SIGKILL fallback. Wake it so it can exit cleanly.
+            import signal
+
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
         cmd = ["kill", str(pid)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
@@ -223,6 +232,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
             {
                 "status": "stopped",
                 "running": False,
+                "suspended": False,
                 "stopped_at": _now(),
                 "stop_stdout": result.stdout.strip(),
                 "stop_stderr": result.stderr.strip(),

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from typing import Any
@@ -21,10 +22,12 @@ CONTROL_URL = os.environ.get("INFERENCEDECK_CONTROL_URL", "http://127.0.0.1:8717
 WEB_URL = os.environ.get("INFERENCEDECK_WEB_URL", "http://127.0.0.1:8716").rstrip("/")
 TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 SYNC_SECONDS = 5
+# start waits for the model to load (up to 45 s server-side) before replying.
+START_TIMEOUT_SECONDS = 120
 
 
 class ApiClient:
-    def _request(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(self, path: str, body: dict[str, Any] | None = None, timeout: float = 5) -> dict[str, Any]:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Accept": "application/json"}
         if data is not None:
@@ -37,8 +40,16 @@ class ApiClient:
             headers=headers,
             method="POST" if data is not None else "GET",
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            # Surface the API's own error message instead of "HTTP Error 400".
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+            except (ValueError, OSError):
+                raise exc from None
+            raise RuntimeError(payload.get("error") or payload.get("message") or str(exc)) from None
 
     def status(self) -> dict[str, Any]:
         return self._request("/api/status")
@@ -50,7 +61,7 @@ class ApiClient:
         return self._request("/api/remotes")
 
     def start(self, mode: str) -> dict[str, Any]:
-        return self._request("/api/start", {"mode": mode})
+        return self._request("/api/start", {"mode": mode}, timeout=START_TIMEOUT_SECONDS)
 
     def action(self, action: str, server_id: str) -> dict[str, Any]:
         return self._request(f"/api/{action}", {"server_id": server_id})
@@ -188,13 +199,25 @@ class TrayApplication:
         self.remotes_menu.show_all()
 
     def _start_profile(self, _widget, mode: str) -> None:
+        # Starting blocks until the model is loaded; keep the GTK loop responsive.
+        self._notify(f"Starting {mode}…")
+        threading.Thread(target=self._start_worker, args=(mode,), daemon=True).start()
+
+    def _start_worker(self, mode: str) -> None:
+        error = ""
         try:
             result = self.api.start(mode)
             if not result.get("success", True):
-                raise RuntimeError(result.get("error", "start failed"))
+                error = result.get("error", "start failed")
         except Exception as exc:
-            self._notify(str(exc), True)
+            error = str(exc)
+        GLib.idle_add(self._start_done, error)
+
+    def _start_done(self, error: str) -> bool:
+        if error:
+            self._notify(error, True)
         self.refresh()
+        return False
 
     def _act(self, action: str) -> None:
         if not self.active:

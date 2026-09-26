@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .auth import AuthState, validate_bind_security
+from .auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
 from .control import ControlPlane
 
 MAX_BODY_BYTES = 1024 * 1024
@@ -27,6 +27,18 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             if key == name:
                 return value
         return ""
+
+    def _host_ok(self) -> bool:
+        # Without auth the API only binds to loopback. Reject any other Host
+        # header so a DNS-rebinding page can't read or drive the local API.
+        if self.auth_state.enabled:
+            return True
+        host = self.headers.get("Host", "")
+        if host.startswith("["):
+            name = host[1:].partition("]")[0]
+        else:
+            name = host.rpartition(":")[0] if host.count(":") == 1 else host
+        return name.lower() in LOOPBACK_HOSTS
 
     def _authed(self) -> bool:
         if not self.auth_state.enabled:
@@ -65,6 +77,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        if not self._host_ok():
+            self._json(HTTPStatus.FORBIDDEN, {"success": False, "error": "host not allowed"})
+            return
         if parsed.path == "/healthz":
             self._json(HTTPStatus.OK, {"ok": True})
             return
@@ -92,7 +107,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 if not server_id:
                     self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "server_id is required"})
                     return
-                lines = int((query.get("lines") or ["200"])[0])
+                try:
+                    lines = int((query.get("lines") or ["200"])[0])
+                except ValueError:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "lines must be an integer"})
+                    return
                 self._json(HTTPStatus.OK, self.control_plane.logs(server_id, lines=max(1, min(lines, 2000))))
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "not found"})
@@ -101,6 +120,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if not self._host_ok():
+            self._json(HTTPStatus.FORBIDDEN, {"success": False, "error": "host not allowed"})
+            return
+        # Browsers can send text/plain cross-origin without a CORS preflight;
+        # requiring application/json forces one, which this server never grants.
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"success": False, "error": "Content-Type must be application/json"})
+            return
         try:
             body = self._body()
             if parsed.path == "/api/login":
