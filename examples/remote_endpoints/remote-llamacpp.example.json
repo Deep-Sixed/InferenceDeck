@@ -1,0 +1,10 @@
+{
+  "provider": "llamacpp",
+  "enabled": false,
+  "lane": "remote_host",
+  "model": null,
+  "baseUrl": "http://TAILNET_OR_LAN_HOST:8080/v1",
+  "apiKeyEnv": "LLAMACPP_API_KEY",
+  "displayName": "Remote llama.cpp",
+  "tags": ["remote_host", "llamacpp"]
+}

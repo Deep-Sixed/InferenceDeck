@@ -1,0 +1,11 @@
+{
+  "provider": "openai-compatible",
+  "enabled": false,
+  "lane": "true_cloud",
+  "model": "provider/model-id",
+  "baseUrl": "https://example.invalid/v1",
+  "apiKeyEnv": "PROVIDER_API_KEY",
+  "displayName": "Example hosted model",
+  "contextSize": 128000,
+  "tags": ["cloud"]
+}

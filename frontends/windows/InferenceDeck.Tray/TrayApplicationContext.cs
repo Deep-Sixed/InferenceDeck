@@ -8,6 +8,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _icon;
     private readonly ToolStripMenuItem _status = new("Connecting…") { Enabled = false };
     private readonly ToolStripMenuItem _profiles = new("Start profile");
+    private readonly ToolStripMenuItem _remotes = new("Remote & cloud models");
     private readonly ToolStripMenuItem _suspend = new("Suspend (free GPU)");
     private readonly ToolStripMenuItem _resume = new("Resume server");
     private readonly ToolStripMenuItem _stop = new("Stop server");
@@ -23,6 +24,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_status);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_profiles);
+        menu.Items.Add(_remotes);
         menu.Items.Add(_suspend);
         menu.Items.Add(_resume);
         menu.Items.Add(_stop);
@@ -45,6 +47,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _stop.Click += async (_, _) => await ActAsync("Stop", id => _client.StopAsync(id));
         _command.Click += (_, _) => MessageBox.Show(_active?.CommandLine ?? "No active command.", "InferenceDeck — Active command");
         _profiles.DropDownOpening += async (_, _) => await PopulateProfilesAsync();
+        _remotes.DropDownOpening += async (_, _) => await PopulateRemotesAsync();
         _timer.Tick += async (_, _) => await RefreshAsync();
         _timer.Start();
         _ = RefreshAsync();
@@ -100,6 +103,36 @@ internal sealed class TrayApplicationContext : ApplicationContext
             if (_profiles.DropDownItems.Count == 0) _profiles.DropDownItems.Add(new ToolStripMenuItem("No profiles found") { Enabled = false });
         }
         catch (Exception ex) { _profiles.DropDownItems.Add(new ToolStripMenuItem(ex.Message) { Enabled = false }); }
+    }
+
+
+    private async Task PopulateRemotesAsync()
+    {
+        _remotes.DropDownItems.Clear();
+        try
+        {
+            var remotes = await _client.GetRemotesAsync();
+            foreach (var remote in remotes)
+            {
+                var suffix = remote.Enabled ? " — active" : remote.Selectable ? "" : $" — set ${remote.ApiKeyEnv}";
+                var item = new ToolStripMenuItem(remote.DisplayName + suffix) { Checked = remote.Enabled, Enabled = remote.Enabled || remote.Selectable };
+                item.Click += async (_, _) =>
+                {
+                    try
+                    {
+                        using var _ = remote.Enabled ? await _client.DisableRemotesAsync() : await _client.EnableRemoteAsync(remote.Name);
+                        await RefreshAsync();
+                    }
+                    catch (Exception ex) { ShowError(ex); }
+                };
+                _remotes.DropDownItems.Add(item);
+            }
+            if (remotes.Count > 0) _remotes.DropDownItems.Add(new ToolStripSeparator());
+            var disable = new ToolStripMenuItem("Disable all remote/cloud models");
+            disable.Click += async (_, _) => { try { using var _ = await _client.DisableRemotesAsync(); await RefreshAsync(); } catch (Exception ex) { ShowError(ex); } };
+            _remotes.DropDownItems.Add(disable);
+        }
+        catch (Exception ex) { _remotes.DropDownItems.Add(new ToolStripMenuItem(ex.Message) { Enabled = false }); }
     }
 
     private async Task ToggleSuspendAsync()
