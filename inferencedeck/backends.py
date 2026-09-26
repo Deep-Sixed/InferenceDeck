@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .config import AppConfig
+from .llama_runtimes import resolve_llama_runtime, sibling_tool
 from .paths import candidate_llama_roots, executable_names, is_windows
 from .schema import Environment
 
@@ -63,6 +64,15 @@ def _find_executable(base_name: str, env_vars: list[str] | None = None, roots: l
     return None
 
 
+def _env_file(*names: str) -> str | None:
+    """An explicitly configured binary from the environment (no PATH search)."""
+    for name in names:
+        found = _configured_file(os.environ.get(name))
+        if found:
+            return found
+    return None
+
+
 def _configured_file(path_value: str | None) -> str | None:
     if not path_value:
         return None
@@ -107,13 +117,23 @@ def _binary_version(binary_path: str | None, timeout: float = 2.0) -> str | None
 def detect_llama_cpp(project_root: Path | None = None, config: AppConfig | None = None) -> Environment:
     app_config = config or AppConfig.load()
     roots = _configured_roots(app_config) + candidate_llama_roots(project_root)
-    server = _configured_file(app_config.llama_server_path) or _find_executable(
-        "llama-server", ["LLAMA_SERVER", "LLAMA_SERVER_BIN"], roots
+    # Explicit paths are pins; the resolver still refuses them if this CPU
+    # can't run them (e.g. an AVX2 build on an AVX-only Xeon).
+    pinned_paths = [app_config.llama_server_path] + [
+        os.environ.get(name, "") for name in ("LLAMA_SERVER", "LLAMA_SERVER_BIN")
+    ]
+    selection = resolve_llama_runtime(roots, app_config.llama_runtime, [p for p in pinned_paths if p])
+    server = (selection.get("selected") or {}).get("path")
+    # Companion tools come from the same build as the server, so an AVX2
+    # llama-fit-params is never paired with an AVX1 llama-server.
+    cli = _env_file("LLAMA_CLI", "LLAMA_CLI_BIN") or sibling_tool(server, "llama-cli")
+    fit = (
+        _configured_file(app_config.llama_fit_params_path)
+        or _env_file("LLAMA_FIT_PARAMS", "LLAMA_FIT_PARAMS_BIN")
+        or sibling_tool(server, "llama-fit-params")
     )
-    cli = _find_executable("llama-cli", ["LLAMA_CLI", "LLAMA_CLI_BIN"], roots)
-    fit = _configured_file(app_config.llama_fit_params_path) or _find_executable(
-        "llama-fit-params", ["LLAMA_FIT_PARAMS", "LLAMA_FIT_PARAMS_BIN"], roots
-    )
+    if not server:
+        cli = fit = None
 
     configured_url = os.environ.get("LLAMA_SERVER_URL")
     if configured_url:
@@ -128,9 +148,9 @@ def detect_llama_cpp(project_root: Path | None = None, config: AppConfig | None 
     if ok and isinstance(models_payload, dict):
         model_count = len(models_payload.get("data", []) or [])
 
-    warnings: list[str] = []
+    warnings: list[str] = list(selection.get("warnings") or [])
     if not server:
-        warnings.append("llama-server was not found on PATH, LLAMA_SERVER, or discovered project roots.")
+        warnings.append(selection["reason"])
 
     return Environment(
         id="llama.cpp",
@@ -147,6 +167,7 @@ def detect_llama_cpp(project_root: Path | None = None, config: AppConfig | None 
             "probe_url": api_url,
             "probe_error": None if ok else error,
             "candidate_roots": [str(path) for path in roots],
+            "runtime_selection": selection,
         },
         warnings=warnings,
     )

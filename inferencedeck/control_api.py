@@ -137,6 +137,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"benchmarks": self.control_plane.benchmark_history()})
             elif parsed.path == "/api/remotes":
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
+            elif parsed.path == "/api/runtime":
+                self._json(HTTPStatus.OK, self.control_plane.runtime())
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -229,6 +231,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     validate_overrides(body.get("overrides")),
                     completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
                 )
+            elif parsed.path == "/api/runtime":
+                payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))
             elif parsed.path == "/api/remote":
                 action = str(body.get("action") or "")
                 if action == "enable":

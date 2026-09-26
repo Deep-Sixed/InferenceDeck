@@ -76,6 +76,31 @@ or:
 python -m inferencedeck inventory --pretty
 ```
 
+## Choosing a llama.cpp build
+
+InferenceDeck picks the llama-server build this CPU can run:
+
+1. A pinned build (`llama_runtime` in config, or the web UI's Runtime menu), if it is compatible.
+2. The standard build. Standard builds need AVX2.
+3. An AVX1 compatibility build with CUDA, when an NVIDIA GPU is present.
+4. A CPU-only AVX1 compatibility build.
+5. Otherwise it refuses to start and says why each build was rejected.
+
+So AVX2 machines use the normal llama.cpp build, and AVX-only CPUs (e.g. older
+Xeons) fall back to a CUDA AVX1 build. It never launches a build that needs an
+instruction set the CPU lacks, even if pinned. `llama-fit-params` and `llama-cli`
+are taken from the same build folder as the chosen server.
+
+Builds are found under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root (including
+`build*/bin`) and `PATH`. Each build's requirements come from, in order:
+
+- an `inferencedeck-runtime.json` next to the binary:
+  ```json
+  {"variant": "cuda-avx1", "label": "CUDA AVX1 build", "cpu": {"requires": ["avx", "f16c"]}, "gpu": {"backend": "cuda"}}
+  ```
+- the build's `CMakeCache.txt` (`GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_CUDA`);
+- otherwise it is assumed to be a standard build that needs AVX2.
+
 ## Local control API and web UI
 
 ```bash

@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .backends import detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
 from .config import AppConfig
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
 from .inventory import build_inventory
+from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
@@ -98,6 +100,27 @@ class ControlPlane:
 
     def benchmark_history(self) -> list[dict[str, Any]]:
         return load_benchmark_results()
+
+    def runtime(self) -> dict[str, Any]:
+        """Which llama.cpp build will be used, why, and what else was found."""
+        # Same root the launch path uses, so this reports the build Start will run.
+        root = Path(self.project_root).expanduser().resolve() if self.project_root else find_project_root()
+        env = detect_llama_cpp(root, config=self._config())
+        return env.details["runtime_selection"]
+
+    def set_runtime(self, runtime: str) -> dict[str, Any]:
+        """Pin a discovered, compatible build (by id), or go back to "auto"."""
+        runtime = (runtime or "").strip()
+        if runtime != "auto":
+            match = next((c for c in self.runtime()["candidates"] if c["id"] == runtime), None)
+            if match is None:
+                raise ValueError(f"Unknown runtime: {runtime}")
+            if not match["compatible"]:
+                raise ValueError(f"{match['label']} can't run on this machine: {match['incompatible_reason']}")
+        config = self._config()
+        config.llama_runtime = runtime
+        config.save()
+        return {"success": True, "runtime": self.runtime()}
 
     def remote_endpoints(self) -> dict[str, Any]:
         endpoints = list_endpoints()
