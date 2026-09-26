@@ -16,7 +16,7 @@ from inferencedeck.paths import executable_names
 CLEAR_TOOL_ENV = {name: "" for name in ("LLAMA_SERVER", "LLAMA_SERVER_BIN", "LLAMA_CLI", "LLAMA_CLI_BIN", "LLAMA_FIT_PARAMS", "LLAMA_FIT_PARAMS_BIN")}
 
 # Thanatos / Lenovo P70 class: Haswell-or-later, AVX2 + FMA + F16C.
-AVX2_BOX = CpuFeatures(x86=True, features=frozenset({"sse4_2", "avx", "avx2", "fma", "f16c"}), source="test")
+AVX2_BOX = CpuFeatures(x86=True, features=frozenset({"sse4_2", "avx", "avx2", "fma", "f16c", "bmi2"}), source="test")
 # Friday class: Ivy Bridge-era Xeon, AVX + F16C but no AVX2/FMA.
 AVX_ONLY_BOX = CpuFeatures(x86=True, features=frozenset({"sse4_2", "avx", "f16c"}), source="test")
 # Sandy Bridge: AVX without F16C, so even the AVX1 build (F16C on) can't run.
@@ -165,6 +165,69 @@ class RuntimeSelectionTests(unittest.TestCase):
         result = self._resolve(AVX_ONLY_BOX, cuda=True)
         self.assertEqual(result["selected"]["variant"], "standard")
         self.assertEqual(result["selected"]["requires"], [])
+
+
+# avx-llama-manager's build profiles (scripts/build.ps1).
+AVX_LLAMA_MANAGER_AVX = "\n".join(
+    [
+        "GGML_SSE42:BOOL=ON", "GGML_AVX:BOOL=ON", "GGML_AVX2:BOOL=OFF", "GGML_FMA:BOOL=OFF",
+        "GGML_F16C:BOOL=OFF", "GGML_BMI2:BOOL=OFF", "GGML_AVX_VNNI:BOOL=OFF", "GGML_AVX512:BOOL=OFF",
+        "GGML_CUDA:BOOL=ON",
+    ]
+)
+AVX_LLAMA_MANAGER_AVX2 = "\n".join(
+    ["GGML_SSE42:BOOL=ON", "GGML_AVX:BOOL=ON", "GGML_AVX2:BOOL=ON", "GGML_FMA:BOOL=ON", "GGML_F16C:BOOL=ON", "GGML_BMI2:BOOL=ON"]
+)
+
+
+class OtherBuildLayoutTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        patcher = mock.patch.object(llama_runtimes.shutil, "which", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _msvc_build(self, cache: str) -> Path:
+        # Visual Studio generators: llama.cpp/build/bin/Release/llama-server.exe
+        build = self.root / "llama.cpp" / "build"
+        build.mkdir(parents=True)
+        (build / "CMakeCache.txt").write_text(cache, encoding="utf-8")
+        return _binary(build / "bin" / "Release")
+
+    def test_finds_visual_studio_release_build_and_its_cmake_cache(self) -> None:
+        binary = self._msvc_build(AVX_LLAMA_MANAGER_AVX2)
+        result = resolve_llama_runtime([self.root / "llama.cpp"], cpu=AVX2_BOX, has_cuda=False)
+        self.assertEqual(result["selected"]["path"], str(binary))
+        self.assertEqual(result["selected"]["source"], "CMakeCache.txt")
+        self.assertIn("bmi2", result["selected"]["requires"])
+
+    def test_avx_llama_manager_avx_profile_runs_without_f16c(self) -> None:
+        # Unlike Friday's build it compiles F16C off, so Sandy Bridge can run it.
+        self._msvc_build(AVX_LLAMA_MANAGER_AVX)
+        result = resolve_llama_runtime([self.root / "llama.cpp"], cpu=SANDY_BRIDGE, has_cuda=True)
+        self.assertEqual(result["selected"]["variant"], "cuda-avx1")
+        self.assertEqual(result["selected"]["requires"], ["avx", "sse4_2"])
+
+    def test_bmi2_build_is_refused_without_bmi2(self) -> None:
+        self._msvc_build(AVX_LLAMA_MANAGER_AVX2)
+        no_bmi2 = CpuFeatures(x86=True, features=frozenset({"sse4_2", "avx", "avx2", "fma", "f16c"}), source="test")
+        result = resolve_llama_runtime([self.root / "llama.cpp"], cpu=no_bmi2, has_cuda=False)
+        self.assertIsNone(result["selected"])
+        self.assertIn("needs BMI2", result["reason"])
+
+    def test_features_windows_cannot_report_are_refused_with_that_reason(self) -> None:
+        self._msvc_build(AVX_LLAMA_MANAGER_AVX2 + "\nGGML_AVX_VNNI:BOOL=ON")
+        windows_avx2 = CpuFeatures(
+            x86=True,
+            features=AVX2_BOX.features,
+            source="IsProcessorFeaturePresent",
+            unverifiable=frozenset({"avx_vnni"}),
+        )
+        result = resolve_llama_runtime([self.root / "llama.cpp"], cpu=windows_avx2, has_cuda=False)
+        self.assertIsNone(result["selected"])
+        self.assertIn("AVX-VNNI, which can't be verified on this OS", result["reason"])
 
 
 class DetectLlamaCppTests(unittest.TestCase):

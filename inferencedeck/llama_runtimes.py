@@ -37,15 +37,25 @@ LABELS = {
     CUDA_AVX1: "CUDA AVX1 compatibility build",
     CPU_AVX1: "CPU AVX1 compatibility build",
 }
-FEATURE_NAMES = {"sse4_2": "SSE4.2", "avx": "AVX", "avx2": "AVX2", "fma": "FMA", "f16c": "F16C", "avx512f": "AVX-512F"}
+FEATURE_NAMES = {
+    "sse4_2": "SSE4.2", "avx": "AVX", "avx2": "AVX2", "fma": "FMA", "f16c": "F16C", "bmi2": "BMI2",
+    "avx_vnni": "AVX-VNNI", "avx512f": "AVX-512F", "avx512vbmi": "AVX-512 VBMI",
+    "avx512_vnni": "AVX-512 VNNI", "avx512_bf16": "AVX-512 BF16",
+}
 # Build-time switches in CMakeCache.txt -> CPU feature they require. Older
 # llama.cpp trees used LLAMA_* names.
 CMAKE_ISA_FLAGS = {
+    "SSE42": "sse4_2",
     "AVX": "avx",
     "AVX2": "avx2",
     "FMA": "fma",
     "F16C": "f16c",
+    "BMI2": "bmi2",
+    "AVX_VNNI": "avx_vnni",
     "AVX512": "avx512f",
+    "AVX512_VBMI": "avx512vbmi",
+    "AVX512_VNNI": "avx512_vnni",
+    "AVX512_BF16": "avx512_bf16",
 }
 
 
@@ -145,8 +155,9 @@ def classify_binary(binary: Path) -> RuntimeCandidate:
             )
         except (OSError, ValueError, AttributeError, TypeError) as exc:
             notes.append(f"ignored unreadable {SIDECAR_NAME}: {exc}")
-    # bin/llama-server usually sits one level below the CMake build directory.
-    for build_dir in (binary.parent, binary.parent.parent):
+    # The CMake build dir is usually one level up (build/bin/llama-server), or
+    # two with Visual Studio's per-config folder (build/bin/Release/llama-server.exe).
+    for build_dir in (binary.parent, binary.parent.parent, binary.parent.parent.parent):
         cache = build_dir / "CMakeCache.txt"
         if cache.is_file():
             try:
@@ -175,11 +186,15 @@ def classify_binary(binary: Path) -> RuntimeCandidate:
 
 
 def _binaries_under(root: Path) -> list[Path]:
-    dirs = [root, root / "bin", root / "build" / "bin"]
+    bins = [root / "bin", root / "build" / "bin"]
     try:
-        dirs += sorted(p / "bin" for p in root.glob("build*") if p.is_dir())
+        bins += sorted(p / "bin" for p in root.glob("build*") if p.is_dir() and p.name != "build")
     except OSError:
         pass
+    dirs = [root]
+    for directory in bins:
+        # Visual Studio generators put outputs in a per-configuration folder.
+        dirs += [directory, directory / "Release", directory / "RelWithDebInfo"]
     found = []
     for directory in dirs:
         for name in executable_names("llama-server"):
@@ -235,6 +250,9 @@ def incompatibility(candidate: RuntimeCandidate, cpu: CpuFeatures, cuda_availabl
         if cpu.source == "unavailable" and candidate.requires:
             return "could not read this CPU's instruction sets"
         missing = candidate.requires - cpu.features
+        unknown = missing & cpu.unverifiable
+        if unknown:
+            return f"needs {_feature_list(unknown)}, which can't be verified on this OS"
         if missing:
             return f"needs {_feature_list(missing)}, which this CPU lacks"
     if candidate.gpu_backend == "cuda" and not cuda_available:

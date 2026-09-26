@@ -17,7 +17,13 @@ from typing import Any
 
 from .paths import is_windows
 
-TRACKED_FEATURES = ("sse4_2", "avx", "avx2", "fma", "f16c", "avx512f")
+TRACKED_FEATURES = (
+    "sse4_2", "avx", "avx2", "fma", "f16c", "bmi2", "avx_vnni",
+    "avx512f", "avx512vbmi", "avx512_vnni", "avx512_bf16",
+)
+# Windows has no IsProcessorFeaturePresent id for these, so a build that needs
+# them can't be verified there and is refused rather than risked.
+WINDOWS_UNVERIFIABLE = frozenset({"avx_vnni", "avx512vbmi", "avx512_vnni", "avx512_bf16"})
 X86_MACHINES = {"x86_64", "amd64", "i386", "i686", "x86"}
 
 # Windows IsProcessorFeaturePresent ids.
@@ -32,8 +38,10 @@ class CpuFeatures:
     x86: bool
     features: frozenset[str] = field(default_factory=frozenset)
     source: str = "unknown"
-    # Features implied rather than read directly (Windows can't query FMA/F16C).
+    # Features implied rather than read directly (Windows can't query FMA/F16C/BMI2).
     inferred: frozenset[str] = field(default_factory=frozenset)
+    # Features this platform can't report at all.
+    unverifiable: frozenset[str] = field(default_factory=frozenset)
 
     def has(self, feature: str) -> bool:
         return feature in self.features
@@ -45,6 +53,7 @@ class CpuFeatures:
             "avx2": self.has("avx2"),
             "source": self.source,
             "inferred": sorted(self.inferred),
+            "unverifiable": sorted(self.unverifiable),
         }
 
 
@@ -83,14 +92,15 @@ def _windows() -> CpuFeatures:
     }
     inferred: set[str] = set()
     if "avx2" in found:
-        # Windows exposes no FMA/F16C query; every AVX2 CPU (Intel Haswell+,
-        # AMD Excavator+) has both.
-        inferred = {"fma", "f16c"}
+        # Windows exposes no FMA/F16C/BMI2 query; every AVX2 CPU (Intel
+        # Haswell+, AMD Excavator+) has all three.
+        inferred = {"fma", "f16c", "bmi2"}
     return CpuFeatures(
         x86=True,
         features=frozenset(found | inferred),
         source="IsProcessorFeaturePresent",
         inferred=frozenset(inferred),
+        unverifiable=WINDOWS_UNVERIFIABLE,
     )
 
 
