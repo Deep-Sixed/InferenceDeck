@@ -26,6 +26,9 @@ SYNC_SECONDS = 5
 START_TIMEOUT_SECONDS = 120
 # stop allows 5 s for a clean exit plus 3 s after SIGKILL server-side.
 STOP_TIMEOUT_SECONDS = 20
+# restart stops and then starts, so it can take both.
+RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS
+CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 
 
 class ApiClient:
@@ -65,12 +68,25 @@ class ApiClient:
     def start(self, mode: str) -> dict[str, Any]:
         return self._request("/api/start", {"mode": mode}, timeout=START_TIMEOUT_SECONDS)
 
-    def action(self, action: str, server_id: str) -> dict[str, Any]:
-        timeout = STOP_TIMEOUT_SECONDS if action == "stop" else 5
-        return self._request(f"/api/{action}", {"server_id": server_id}, timeout=timeout)
+    def action(self, action: str, server_id: str, ctx_size: int | None = None) -> dict[str, Any]:
+        timeout = {
+            "stop": STOP_TIMEOUT_SECONDS,
+            "release": STOP_TIMEOUT_SECONDS,
+            "restore": START_TIMEOUT_SECONDS,
+            "restart": RESTART_TIMEOUT_SECONDS,
+        }.get(action, 5)
+        body: dict[str, Any] = {"server_id": server_id}
+        if ctx_size is not None:
+            body["ctx_size"] = ctx_size
+        return self._request(f"/api/{action}", body, timeout=timeout)
 
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self._request("/api/remote", {"action": action, "name": name})
+
+
+def _is_parked(server: dict[str, Any]) -> bool:
+    # Released to free VRAM: no process, but Restore can start it again.
+    return server.get("status") in ("parked", "restoring")
 
 
 class TrayApplication:
@@ -86,14 +102,28 @@ class TrayApplication:
         self.remotes_item = Gtk.MenuItem(label="Remote & cloud models")
         self.remotes_menu = Gtk.Menu()
         self.remotes_item.set_submenu(self.remotes_menu)
-        self.suspend_item = Gtk.MenuItem(label="Suspend (free GPU)")
-        self.resume_item = Gtk.MenuItem(label="Resume server")
+        self.suspend_item = Gtk.MenuItem(label="Pause (model stays in VRAM)")
+        self.resume_item = Gtk.MenuItem(label="Resume")
+        self.release_item = Gtk.MenuItem(label="Release GPU")
+        self.restore_item = Gtk.MenuItem(label="Restore")
+        self.restart_item = Gtk.MenuItem(label="Reload & restart")
+        self.context_item = Gtk.MenuItem(label="Context size")
+        context_menu = Gtk.Menu()
+        self.context_items: dict[int, Gtk.CheckMenuItem] = {}
+        for size in CONTEXT_PRESETS:
+            item = Gtk.CheckMenuItem(label=f"{size // 1024}K")
+            item.connect("activate", self._set_context, size)
+            context_menu.append(item)
+            self.context_items[size] = item
+        self.context_item.set_submenu(context_menu)
         self.stop_item = Gtk.MenuItem(label="Stop server")
         self.command_item = Gtk.MenuItem(label="Show active command")
+        self._syncing = False
 
         menu = Gtk.Menu()
         for item in [self.status_item, Gtk.SeparatorMenuItem(), self.profiles_item, self.remotes_item,
-                     self.suspend_item, self.resume_item, self.stop_item, Gtk.SeparatorMenuItem()]:
+                     self.suspend_item, self.resume_item, self.release_item, self.restore_item,
+                     self.restart_item, self.context_item, self.stop_item, Gtk.SeparatorMenuItem()]:
             menu.append(item)
         web = Gtk.MenuItem(label="Open Web UI")
         web.connect("activate", lambda *_: self._open_web())
@@ -108,6 +138,9 @@ class TrayApplication:
         self.suspend_item.connect("activate", lambda *_: self._act("suspend"))
         self.resume_item.connect("activate", lambda *_: self._act("resume"))
         self.stop_item.connect("activate", lambda *_: self._act("stop"))
+        self.release_item.connect("activate", lambda *_: self._act("release"))
+        self.restore_item.connect("activate", lambda *_: self._act("restore"))
+        self.restart_item.connect("activate", lambda *_: self._act("restart"))
         self.command_item.connect("activate", lambda *_: self._show_command())
         self.profiles_menu.connect("show", self._populate_profiles)
         self.remotes_menu.connect("show", self._populate_remotes)
@@ -131,11 +164,16 @@ class TrayApplication:
     def refresh(self) -> None:
         try:
             status = self.api.status()
-            running = [s for s in status.get("servers", []) if s.get("running")]
-            self.active = running[0] if running else None
+            servers = status.get("servers", [])
+            running = [s for s in servers if s.get("running")]
+            parked_servers = [s for s in servers if _is_parked(s)]
+            self.active = (running or parked_servers or [None])[0]
             self.remote_active = bool(status.get("remote_active"))
             if self.active:
-                state = "Suspended" if self.active.get("suspended") else "Running"
+                if _is_parked(self.active):
+                    state = "Released (GPU free)"
+                else:
+                    state = "Paused" if self.active.get("suspended") else "Running"
                 model = os.path.basename(str(self.active.get("model_path") or self.active.get("mode") or "server"))
                 text = f"{state} — {model} on :{self.active.get('port', '—')}"
             elif self.remote_active:
@@ -145,16 +183,32 @@ class TrayApplication:
                 text = "Stopped — no tracked server"
             self.status_item.set_label(text)
             self.indicator.set_title(f"InferenceDeck — {text}")
-            suspended = bool(self.active and self.active.get("suspended"))
-            self.suspend_item.set_sensitive(bool(self.active) and not suspended)
-            self.resume_item.set_sensitive(bool(self.active) and suspended)
+            parked = bool(self.active and _is_parked(self.active))
+            alive = bool(self.active and self.active.get("running"))
+            suspended = bool(alive and self.active.get("suspended"))
+            live = alive and not suspended
+            self.suspend_item.set_sensitive(live)
+            self.resume_item.set_sensitive(suspended)
+            self.release_item.set_sensitive(alive)
+            self.restore_item.set_sensitive(parked)
+            self.restart_item.set_sensitive(live)
+            self.context_item.set_sensitive(live or parked)
+            current = int((self.active or {}).get("ctx_size") or 0)
+            self._syncing = True  # set_active fires "activate"; don't treat it as a click
+            try:
+                for size, item in self.context_items.items():
+                    item.set_active(size == current)
+            finally:
+                self._syncing = False
+            self.stop_item.set_label("Forget released server" if parked else "Stop server")
             self.stop_item.set_sensitive(bool(self.active))
-            self.command_item.set_sensitive(bool(self.active))
+            self.command_item.set_sensitive(alive)
             self.profiles_item.set_sensitive(not self.remote_active)
         except Exception as exc:
             self.status_item.set_label("Control API unavailable")
             self.indicator.set_title("InferenceDeck — API unavailable")
-            for item in [self.suspend_item, self.resume_item, self.stop_item, self.command_item]:
+            for item in [self.suspend_item, self.resume_item, self.release_item, self.restore_item,
+                         self.restart_item, self.context_item, self.stop_item, self.command_item]:
                 item.set_sensitive(False)
             sys.stderr.write(f"inferencedeck tray refresh: {exc}\n")
 
@@ -205,10 +259,19 @@ class TrayApplication:
         self._notify(f"Starting {mode}…")
         self._in_background(self.api.start, mode)
 
-    def _act(self, action: str) -> None:
+    def _act(self, action: str, ctx_size: int | None = None) -> None:
         if not self.active:
             return
-        self._in_background(self.api.action, action, str(self.active.get("id")))
+        self._in_background(self.api.action, action, str(self.active.get("id")), ctx_size)
+
+    def _set_context(self, _item: Gtk.CheckMenuItem, size: int) -> None:
+        if self._syncing or not self.active:
+            return
+        if not _is_parked(self.active) and int(self.active.get("ctx_size") or 0) == size:
+            self.refresh()  # re-check the current size; clicking it unchecked it
+            return
+        # A released server restores at the new size; a running one restarts at it.
+        self._act("restore" if _is_parked(self.active) else "restart", size)
 
     def _in_background(self, call, *args) -> None:
         # Lifecycle calls can block for many seconds (start waits for the model

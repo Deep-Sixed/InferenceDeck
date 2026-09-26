@@ -12,7 +12,13 @@ internal sealed record ServerState(
     string? CommandLine,
     string? ModelPath,
     string? Host,
-    int? Port);
+    int? Port,
+    string? Status,
+    int? CtxSize)
+{
+    // Released to free VRAM: no process, but Restore can start it again.
+    public bool Parked => Status is "parked" or "restoring";
+}
 
 internal sealed record ProfileState(string Mode, string Name, bool Launchable, string? ModelName);
 internal sealed record RemoteState(string Name, string DisplayName, string Provider, string Lane, bool Enabled, bool Selectable, string ApiKeyEnv);
@@ -24,6 +30,9 @@ internal sealed class ControlClient
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(120);
     // api/stop allows 5 s for a clean exit plus 3 s after a forced kill.
     private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(20);
+    // api/restart stops and then starts, so it can take both.
+    private static readonly TimeSpan RestartTimeout = StopTimeout + StartTimeout;
+    public static readonly int[] ContextPresets = { 8192, 16384, 32768, 65536, 131072 };
     private readonly HttpClient _http;
 
     public ControlClient(string baseUrl)
@@ -42,7 +51,8 @@ internal sealed class ControlClient
         {
             values.Add(new ServerState(
                 Text(item, "id"), Text(item, "mode"), Int(item, "pid"), Bool(item, "running"), Bool(item, "suspended"),
-                TextOrNull(item, "command_line"), TextOrNull(item, "model_path"), TextOrNull(item, "host"), Int(item, "port")));
+                TextOrNull(item, "command_line"), TextOrNull(item, "model_path"), TextOrNull(item, "host"), Int(item, "port"),
+                TextOrNull(item, "status"), Int(item, "ctx_size")));
         }
         return values;
     }
@@ -79,6 +89,11 @@ internal sealed class ControlClient
     public Task<JsonDocument> StopAsync(string serverId) => PostAsync("api/stop", new { server_id = serverId }, StopTimeout);
     public Task<JsonDocument> SuspendAsync(string serverId) => PostAsync("api/suspend", new { server_id = serverId });
     public Task<JsonDocument> ResumeAsync(string serverId) => PostAsync("api/resume", new { server_id = serverId });
+    public Task<JsonDocument> ReleaseAsync(string serverId) => PostAsync("api/release", new { server_id = serverId }, StopTimeout);
+    public Task<JsonDocument> RestoreAsync(string serverId, int? ctxSize = null) =>
+        PostAsync("api/restore", new { server_id = serverId, ctx_size = ctxSize }, StartTimeout);
+    public Task<JsonDocument> RestartAsync(string serverId, int? ctxSize = null) =>
+        PostAsync("api/restart", new { server_id = serverId, ctx_size = ctxSize }, RestartTimeout);
 
     private async Task<JsonDocument> GetJsonAsync(string path)
     {

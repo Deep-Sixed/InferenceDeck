@@ -12,8 +12,12 @@ from .inventory import build_inventory
 from .profile_resolver import resolve_profiles
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
+    CONTEXT_PRESETS,
     list_servers,
     prepare_launch_command,
+    release_gpu,
+    restart_server,
+    restore_server,
     resume_server,
     server_logs,
     start_profile,
@@ -50,11 +54,17 @@ class ControlPlane:
             "capabilities": {
                 "start": True,
                 "stop": True,
+                # suspend/resume pause the process but keep its model in VRAM;
+                # release/restore stop it (freeing VRAM) and start it again.
                 "suspend": True,
                 "resume": True,
+                "release": True,
+                "restore": True,
+                "restart": True,
                 "prepare": True,
                 "logs": True,
             },
+            "context_presets": list(CONTEXT_PRESETS),
         }
 
     def inventory(self) -> dict[str, Any]:
@@ -114,14 +124,20 @@ class ControlPlane:
             config=self._config(),
         )
 
-    def start(self, mode: str, overrides: dict[str, Any] | None = None, *, stop_existing: bool = False) -> dict[str, Any]:
+    def _remote_blocks_local(self) -> dict[str, Any] | None:
         remote = active_endpoint()
-        if remote is not None:
-            return {
-                "success": False,
-                "error": f"Remote endpoint '{remote.display_name}' is active; disable it before starting a local profile.",
-                "remote": remote.to_dict(),
-            }
+        if remote is None:
+            return None
+        return {
+            "success": False,
+            "error": f"Remote endpoint '{remote.display_name}' is active; disable it before starting a local profile.",
+            "remote": remote.to_dict(),
+        }
+
+    def start(self, mode: str, overrides: dict[str, Any] | None = None, *, stop_existing: bool = False) -> dict[str, Any]:
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
         return start_profile(
             mode,
             project_root=self.project_root,
@@ -138,6 +154,21 @@ class ControlPlane:
 
     def resume(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
         return resume_server(server_id=server_id, mode=mode)
+
+    def release_gpu(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
+        return release_gpu(server_id=server_id, mode=mode)
+
+    def restore(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
+        return restore_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+
+    def restart(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
+        return restart_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
 
     def logs(self, server_id: str, *, lines: int = 200) -> dict[str, Any]:
         return server_logs(server_id, lines=lines)

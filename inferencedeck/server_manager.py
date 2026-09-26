@@ -21,6 +21,11 @@ from .profile_resolver import ResolvedProfile, resolve_profiles
 
 
 STATE_FILENAME = "servers.json"
+# A parked server was stopped to free its GPU memory; its record keeps the
+# restart spec (mode + overrides) so Restore can bring it back.
+PARKED = "parked"
+RESTORING = "restoring"
+CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 LOG_DIRNAME = "logs"
 
 
@@ -224,11 +229,12 @@ def prune_stale_servers() -> None:
 
 
 def trim_server_history(limit: int = 5) -> None:
-    """Cap non-running records at ``limit``, keeping the newest. Running servers are never dropped."""
+    """Cap non-running records at ``limit``, keeping the newest. Running and parked servers are never dropped."""
 
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
-        running = [pid_is_running(s.get("pid")) for s in servers]
+        # Parked records are not history: they are how Restore finds the server.
+        running = [pid_is_running(s.get("pid")) or s.get("status") in (PARKED, RESTORING) for s in servers]
         idle = [i for i, alive in enumerate(running) if not alive]
         excess = len(servers) - max(limit, running.count(True))
         if excess <= 0 or not idle:
@@ -241,11 +247,13 @@ def trim_server_history(limit: int = 5) -> None:
 
 
 def _find_server(server_id: str | None = None, mode: str | None = None) -> dict[str, Any] | None:
-    for server in list_servers():
-        if server_id and server.get("id") == server_id:
-            return server
-        if mode and server.get("mode") == mode:
-            return server
+    servers = list_servers()
+    if server_id:
+        return next((s for s in servers if s.get("id") == server_id), None)
+    if mode:
+        # Prefer a live server over a parked record of the same profile.
+        matches = [s for s in servers if s.get("mode") == mode]
+        return next((s for s in matches if s.get("running")), matches[0] if matches else None)
     return None
 
 
@@ -253,6 +261,10 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
     server = _find_server(server_id, mode)
     if not server:
         return {"success": True, "message": "No tracked server matched the request."}
+
+    if server.get("status") == PARKED:
+        _remove_server(server["id"])
+        return {"success": True, "message": f"Forgot parked server {server['id']}."}
 
     raw_pid = server.get("pid")
     if not raw_pid:
@@ -426,6 +438,15 @@ def _upsert_server(server: dict[str, Any]) -> None:
     _mutate_state(change)
 
 
+def _remove_server(server_id: str) -> None:
+    def change(state: dict[str, Any]) -> bool:
+        servers = state["servers"]
+        state["servers"] = [s for s in servers if s.get("id") != server_id]
+        return len(state["servers"]) != len(servers)
+
+    _mutate_state(change)
+
+
 def _health_url(host: str, port: int) -> str:
     probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
     return f"http://{probe_host}:{int(port)}/v1/models"
@@ -589,6 +610,9 @@ def start_profile(
         "stderr_log": str(stderr_path),
         "started_at": _now(),
         "warnings": prepared.get("warnings", []),
+        # What Release GPU / Restart need to bring this server back as it was.
+        "overrides": dict(overrides or {}),
+        "ctx_size": params.get("ctx_size"),
     }
     _upsert_server(server)
     app_config = AppConfig.load()
@@ -613,6 +637,94 @@ def start_profile(
             }
 
     return {"success": True, "server": _find_server(server_id), "prepared": prepared}
+
+
+def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
+    """Stop a server to free its GPU memory, keeping what Restore needs to start it again."""
+
+    server = _find_server(server_id, mode)
+    if not server:
+        return {"success": False, "error": "No tracked server matched the request."}
+    if server.get("status") in (PARKED, RESTORING):
+        return {"success": False, "error": "Server is already released.", "server": server}
+    stopped = stop_server(server_id=server["id"])
+    if not stopped.get("success"):
+        return {"success": False, "error": stopped.get("message") or "Could not stop server.", "server": stopped.get("server")}
+    parked = {
+        **{k: v for k, v in server.items() if k != "running"},
+        "pid": None,
+        "status": PARKED,
+        "suspended": False,
+        "parked_at": _now(),
+        "restart": {"mode": server.get("mode"), "overrides": dict(server.get("overrides") or {})},
+    }
+    # Written whole: stop_server may already have pruned the stopped record.
+    _upsert_server(parked)
+    return {
+        "success": True,
+        "message": f"Released GPU: stopped {server.get('mode')}. Restore starts it again.",
+        "server": _find_server(server["id"]),
+    }
+
+
+def restore_server(
+    server_id: str,
+    overrides: dict[str, Any] | None = None,
+    project_root: str | Path | None = None,
+    model_dirs: list[str | Path] | None = None,
+) -> dict[str, Any]:
+    """Start a parked server again from its saved spec, optionally with changed overrides."""
+
+    claimed: dict[str, Any] = {}
+
+    def claim(state: dict[str, Any]) -> bool:
+        for record in state["servers"]:
+            if record.get("id") == server_id and record.get("status") == PARKED:
+                record["status"] = RESTORING
+                claimed.update(record)
+                return True
+        return False
+
+    # Claiming under the state lock means a double-click can't start two copies.
+    _mutate_state(claim)
+    if not claimed:
+        return {"success": False, "error": "No parked server matched the request."}
+    spec = claimed.get("restart") or {}
+    merged = {**(spec.get("overrides") or {}), **(overrides or {})}
+    result = start_profile(
+        str(spec.get("mode") or claimed.get("mode") or ""),
+        project_root=project_root,
+        model_dirs=model_dirs,
+        overrides=merged or None,
+    )
+    started = result.get("server") or {}
+    if result.get("success") or started.get("running"):
+        # A server is up (even if it missed the readiness deadline); the parked record is spent.
+        _remove_server(server_id)
+    else:
+        _update_server(server_id, {"status": PARKED})
+    return result
+
+
+def restart_server(
+    server_id: str,
+    overrides: dict[str, Any] | None = None,
+    project_root: str | Path | None = None,
+    model_dirs: list[str | Path] | None = None,
+) -> dict[str, Any]:
+    """Reload & restart: stop, then start the same profile with optional changed overrides.
+
+    If the new start fails the server stays parked, so Restore can retry.
+    """
+
+    server = _find_server(server_id)
+    if not server:
+        return {"success": False, "error": "No tracked server matched the request."}
+    if server.get("status") != PARKED:
+        released = release_gpu(server_id=server_id)
+        if not released.get("success"):
+            return released
+    return restore_server(server_id, overrides, project_root=project_root, model_dirs=model_dirs)
 
 
 def server_logs(server_id: str, lines: int = 200) -> dict[str, Any]:

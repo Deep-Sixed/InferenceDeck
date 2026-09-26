@@ -86,6 +86,16 @@ This one process serves the web UI and the control API (`/api/*`) and is the onl
 process that changes tracked server state. The Windows and Linux trays talk to it
 at `INFERENCEDECK_URL` (default `http://127.0.0.1:8716`).
 
+Server controls (the same in the web UI and both trays):
+
+| Control | What it does |
+|---|---|
+| **Pause / Resume** | Freezes the server process. The model stays loaded, so VRAM is **not** freed. |
+| **Release GPU / Restore** | Stops the server (freeing VRAM) and keeps its profile and settings; Restore starts it again. |
+| **Reload & restart** | Stops and starts the server with the same settings. |
+| **Context 8K–128K** | Restarts the server (or restores a released one) at that context size. |
+| **Stop** | Stops the server. On a released server it forgets the saved settings. |
+
 For authenticated LAN/tailnet use:
 
 ```bash
