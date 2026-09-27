@@ -56,6 +56,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.inventory())
             elif parsed.path == "/api/profiles":
                 self._json(HTTPStatus.OK, {"profiles": self.control_plane.profiles()})
+            elif parsed.path == "/api/hardware":
+                self._json(HTTPStatus.OK, self.control_plane.hardware())
+            elif parsed.path == "/api/benchmarks":
+                self._json(HTTPStatus.OK, {"benchmarks": self.control_plane.benchmark_history()})
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -88,6 +92,18 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 payload = self.control_plane.suspend(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/resume":
                 payload = self.control_plane.resume(server_id=body.get("server_id"), mode=body.get("mode"))
+            elif parsed.path == "/api/fit":
+                payload = self.control_plane.fit(
+                    str(body.get("mode") or ""),
+                    body.get("overrides"),
+                    target_mib=max(0, min(int(body.get("target_mib", 1024)), 65536)),
+                )
+            elif parsed.path == "/api/benchmark":
+                payload = self.control_plane.benchmark(
+                    str(body.get("mode") or ""),
+                    body.get("overrides"),
+                    completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
+                )
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "not found"})
                 return

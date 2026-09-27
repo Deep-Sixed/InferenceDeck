@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .benchmark import load_benchmark_results, run_profile_benchmark
 from .config import AppConfig
+from .fit import run_fit_test
+from .hardware import detect_system_hardware
 from .inventory import build_inventory
 from .profile_resolver import resolve_profiles
 from .server_manager import (
@@ -56,6 +59,32 @@ class ControlPlane:
 
     def profiles(self) -> list[dict[str, Any]]:
         return [profile.to_dict() for profile in resolve_profiles(self.project_root, self.model_dirs)]
+
+    def hardware(self) -> dict[str, Any]:
+        return detect_system_hardware()
+
+    def fit(self, mode: str, overrides: dict[str, Any] | None = None, *, target_mib: int = 1024) -> dict[str, Any]:
+        return run_fit_test(
+            mode,
+            project_root=self.project_root,
+            model_dirs=self.model_dirs,
+            overrides=overrides,
+            target_mib=target_mib,
+        )
+
+    def benchmark(
+        self, mode: str, overrides: dict[str, Any] | None = None, *, completion_tokens: int = 128
+    ) -> dict[str, Any]:
+        return run_profile_benchmark(
+            mode,
+            project_root=self.project_root,
+            model_dirs=self.model_dirs,
+            overrides=overrides,
+            completion_tokens=completion_tokens,
+        )
+
+    def benchmark_history(self) -> list[dict[str, Any]]:
+        return load_benchmark_results()
 
     def prepare(self, mode: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         return prepare_launch_command(
