@@ -8,7 +8,7 @@ from pathlib import Path
 
 from inferencedeck.config import AppConfig
 from inferencedeck.estimates import estimate_memory_fit, estimate_tokens_per_second
-from inferencedeck.fit import apply_fit_suggestions, build_fit_args, parse_fit_output
+from inferencedeck.fit import apply_fit_suggestions, build_fit_args, parse_fit_output, parse_fitted_args
 from inferencedeck.hardware import _parse_cpuinfo
 from inferencedeck.hf_metadata import infer_query
 from inferencedeck.inventory import build_inventory
@@ -358,6 +358,75 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertIn("--predict", cmd.argv)
         self.assertIn("--no-kv-offload", cmd.argv)
         self.assertIn("--no-op-offload", cmd.argv)
+
+    def test_multi_gpu_lora_rope_and_metadata_flags(self) -> None:
+        cmd = build_llama_server_args(
+            "llama-server",
+            "m.gguf",
+            {
+                "split_mode": "Row",
+                "tensor_split": [3, 1.5],
+                "main_gpu": 1,
+                "rpc_servers": ["10.0.0.2:50052", "10.0.0.3:50052"],
+                "override_kv": ["tokenizer.ggml.add_bos_token=bool:false", "general.name=str:a,b"],
+                "lora": ["style.gguf", {"path": "domain.gguf", "scale": 0.5}],
+                "rope_scaling": "yarn",
+                "rope_scale": 4,
+                "yarn_orig_ctx": 32768,
+                "numa": True,
+            },
+        )
+        argv = cmd.argv
+
+        def value(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        self.assertEqual(value("--split-mode"), "row")
+        self.assertEqual(value("--tensor-split"), "3,1.5")
+        self.assertEqual(value("--main-gpu"), "1")
+        self.assertEqual(value("--rpc"), "10.0.0.2:50052,10.0.0.3:50052")
+        # One flag per override, so a comma inside a str value survives.
+        overrides = [argv[i + 1] for i, token in enumerate(argv) if token == "--override-kv"]
+        self.assertEqual(overrides, ["tokenizer.ggml.add_bos_token=bool:false", "general.name=str:a,b"])
+        self.assertEqual(value("--lora"), "style.gguf")
+        self.assertEqual(value("--lora-scaled"), "domain.gguf:0.5")
+        self.assertEqual(value("--rope-scaling"), "yarn")
+        self.assertEqual(value("--rope-scale"), "4")
+        self.assertEqual(value("--yarn-orig-ctx"), "32768")
+        self.assertEqual(value("--numa"), "distribute")
+        self.assertEqual(cmd.warnings, [])
+
+    def test_comma_string_tensor_split_and_bad_values_warn(self) -> None:
+        cmd = build_llama_server_args("llama-server", "m.gguf", {"tensor_split": "3, 1"})
+        self.assertEqual(cmd.argv[cmd.argv.index("--tensor-split") + 1], "3,1")
+
+        bad = build_llama_server_args(
+            "llama-server",
+            "m.gguf",
+            {
+                "split_mode": "diagonal",
+                "tensor_split": "3,x",
+                "main_gpu": "first",
+                "override_kv": "no-type-here",
+                "lora": [{"path": "a.gguf", "scale": "big"}],
+                "rope_scaling": "cubic",
+                "numa": "everywhere",
+            },
+        )
+        for flag in ("--split-mode", "--tensor-split", "--main-gpu", "--override-kv", "--lora-scaled", "--rope-scaling", "--numa"):
+            self.assertNotIn(flag, bad.argv)
+        self.assertEqual(len(bad.warnings), 7)
+
+    def test_fit_carries_and_parses_multi_gpu_split(self) -> None:
+        args = build_fit_args("llama-fit-params", "m.gguf", {"split_mode": "layer", "tensor_split": [1, 1], "main_gpu": 0})
+        self.assertEqual(args[args.index("--split-mode") + 1], "layer")
+        self.assertEqual(args[args.index("--tensor-split") + 1], "1,1")
+        parsed = parse_fitted_args("-c 8192 -ngl 99 -ts 20,12 -sm layer -mg 1")
+        self.assertEqual(parsed["tensor_split"], "20,12")
+        self.assertEqual(parsed["split_mode"], "layer")
+        self.assertEqual(parsed["main_gpu"], 1)
+        applied = apply_fit_suggestions({"ctx_size": 4096}, parsed)
+        self.assertEqual(applied["tensor_split"], "20,12")
 
     def test_string_gpu_layers_do_not_crash(self) -> None:
         # 'all'/'auto' and float-ish strings are valid manifest values elsewhere
