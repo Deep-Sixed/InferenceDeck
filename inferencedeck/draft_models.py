@@ -5,10 +5,12 @@ import shutil
 import subprocess
 from typing import Any
 
+from .proc import run as run_hidden
+
 
 def _run(args: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str] | None:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        return run_hidden(args, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
 

@@ -14,6 +14,7 @@ from .config import AppConfig
 from .llama_runtimes import resolve_llama_runtime, sibling_tool
 from .paths import candidate_llama_roots, executable_names, is_windows
 from .schema import Environment
+from .proc import run as run_hidden
 
 
 DEFAULT_TIMEOUT_SECONDS = 0.8
@@ -96,7 +97,7 @@ def _binary_version(binary_path: str | None, timeout: float = 2.0) -> str | None
     if not binary_path:
         return None
     try:
-        result = subprocess.run(
+        result = run_hidden(
             [binary_path, "--version"],
             capture_output=True,
             text=True,
@@ -276,7 +277,7 @@ def detect_wsl_llama_cpp() -> Environment:
 
     probe = "command -v llama-server || command -v llama.cpp/build/bin/llama-server || true"
     try:
-        result = subprocess.run(
+        result = run_hidden(
             [wsl, "sh", "-lc", probe],
             capture_output=True,
             text=True,

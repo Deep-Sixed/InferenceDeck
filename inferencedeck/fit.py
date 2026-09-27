@@ -10,6 +10,7 @@ from .estimates import estimate_tokens_per_second
 from .hardware import detect_system_hardware
 from .llama_args import normalize_gpu_layers
 from .server_manager import prepare_launch_command
+from .proc import run as run_hidden
 
 
 MEMORY_RE = re.compile(
@@ -293,7 +294,7 @@ def run_fit_test(
     args = build_fit_args(fit_binary, model_path, prepared["params"], target_mib)
     cwd = str(Path(fit_binary).parent)
     try:
-        result = subprocess.run(
+        result = run_hidden(
             args,
             cwd=cwd,
             capture_output=True,

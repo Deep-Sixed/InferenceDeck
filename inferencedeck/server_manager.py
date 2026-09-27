@@ -18,6 +18,7 @@ from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
+from .proc import run as run_hidden
 
 
 STATE_FILENAME = "servers.json"
@@ -137,21 +138,34 @@ def _mutate_state(change: Callable[[dict[str, Any]], bool | None]) -> None:
             write_state(state)
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Ask the kernel directly; the status poll runs often, so no tasklist.exe per check."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # Exists but belongs to someone we can't query (e.g. another user).
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def pid_is_running(pid: int | None) -> bool:
     if not pid:
         return False
     if is_windows():
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
-        return str(int(pid)) in result.stdout
+        return _windows_pid_alive(int(pid))
     try:
         os.kill(int(pid), 0)
     except OSError:
@@ -168,7 +182,7 @@ def pid_is_running(pid: int | None) -> bool:
     except (OSError, IndexError):
         return True
     try:
-        result = subprocess.run(
+        result = run_hidden(
             ["ps", "-o", "stat=", "-p", str(int(pid))],
             capture_output=True,
             text=True,
@@ -288,7 +302,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
                 pass
         cmd = ["kill", str(pid)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        result = run_hidden(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         still_running = pid_is_running(pid)
         _update_server(
@@ -345,7 +359,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
     # SIGTERM was ignored. Windows taskkill already forced (/F); on POSIX
     # escalate to SIGKILL so the Stop button can't be defeated by a hung server.
     if not is_windows():
-        subprocess.run(["kill", "-9", str(pid)], capture_output=True, text=True, timeout=timeout, check=False)
+        run_hidden(["kill", "-9", str(pid)], capture_output=True, text=True, timeout=timeout, check=False)
         if _wait_gone(pid, 3):
             return _stopped_ok(f"Stopped PID {pid} with SIGKILL after it ignored SIGTERM.")
 
