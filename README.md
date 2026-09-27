@@ -92,9 +92,29 @@ Commands (all print JSON; with no command, `inventory` runs):
 | `servers` | Servers started by InferenceDeck. |
 | `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
 | `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+| `updates [--channel stable\|prerelease] [--refresh]` | Compare each installed runtime's version with its latest upstream release (see below). |
 
 Discovery commands accept `--project-root`, `--model-dir` (repeatable), `--max-files`
 and `--no-manifest`.
+
+### Update checks
+
+`inferencedeck updates` compares installed versions with the latest GitHub release
+for llama.cpp, Ollama, vLLM, vllm.cpp, MLC LLM and MLX. It never downloads or
+replaces anything, and caches results for an hour (`--refresh` skips the cache). The
+channel defaults to `update_channel` in config.
+
+- **vllm.cpp** is read from the release archive's `VERSION` file, else from
+  `vllm-server --version`, else from a running server's `/version`. A `+cuda`-style
+  backend suffix is ignored when comparing.
+- **MLC LLM** is read from the installed `mlc-llm*` wheel in the Python environment
+  that runs `mlc_llm`. Nightly builds (`0.26.dev94`) compare against release tags as
+  PEP 440 orders them. A source checkout that still reports `0.1.dev0` has no real
+  version, so it isn't checked.
+- A project that tags versions without publishing GitHub releases is checked against
+  its highest matching tag instead.
+
+The check isn't shown in the web UI or trays yet.
 
 ## Configuration
 
