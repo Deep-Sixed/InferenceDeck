@@ -11,8 +11,8 @@ from typing import Any
 from unittest import mock
 
 from inferencedeck.auth import AuthState
-from inferencedeck.gateway import anthropic_api, openai_api, router
-from inferencedeck.gateway.engines import OpenAICompatibleEngine
+from inferencedeck.gateway import anthropic_api, ollama_api, openai_api, router
+from inferencedeck.gateway.engines import OllamaEngine, OpenAICompatibleEngine
 from inferencedeck.gateway.ir import GatewayError, StreamEvent, Usage
 from inferencedeck.gateway.router import Target
 from inferencedeck.gateway.server import make_server
@@ -338,6 +338,169 @@ class RouterTests(unittest.TestCase):
             with self.assertRaises(GatewayError) as ctx:
                 router.resolve_target()
         self.assertEqual(ctx.exception.status, 503)
+
+
+
+class OllamaAdapterTests(unittest.TestCase):
+    def test_to_wire_maps_options_images_tools_and_format(self) -> None:
+        request = openai_api.parse_request({
+            "model": "client-name",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "found"},
+            ],
+            "max_tokens": 32, "temperature": 0.2, "top_k": 40, "stop": ["END"],
+            "num_ctx": 8192, "keep_alive": "5m", "parallel_tool_calls": False,
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
+        })
+        wire = ollama_api.to_wire(request, "qwen3:32b")
+        self.assertEqual(wire["model"], "qwen3:32b")
+        self.assertFalse(wire["stream"])
+        self.assertEqual(wire["options"], {"num_predict": 32, "temperature": 0.2, "top_k": 40, "stop": ["END"],
+                                           "num_ctx": 8192})
+        self.assertEqual(wire["keep_alive"], "5m")
+        self.assertNotIn("parallel_tool_calls", json.dumps(wire))
+        self.assertEqual(wire["messages"][0]["images"], ["QUJD"])
+        self.assertEqual(wire["messages"][1]["tool_calls"], [{"function": {"name": "lookup", "arguments": {"q": "x"}}}])
+        self.assertEqual(wire["messages"][2], {"role": "tool", "content": "found", "tool_name": "lookup"})
+        self.assertEqual(wire["tools"][0]["function"]["name"], "lookup")
+        self.assertEqual(wire["format"], {"type": "object"})
+
+    def test_tool_choice_none_withholds_tools_and_image_urls_are_refused(self) -> None:
+        request = openai_api.parse_request({
+            "messages": [{"role": "user", "content": "hi"}], "tool_choice": "none",
+            "tools": [{"type": "function", "function": {"name": "f"}}]})
+        self.assertNotIn("tools", ollama_api.to_wire(request, "m"))
+        request = openai_api.parse_request({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.invalid/cat.png"}}]}]})
+        with self.assertRaises(GatewayError) as ctx:
+            ollama_api.to_wire(request, "m")
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_from_wire_tool_calls_get_ids(self) -> None:
+        result = ollama_api.from_wire({"model": "m", "done": True, "done_reason": "stop",
+                                       "message": {"role": "assistant", "content": "",
+                                                   "tool_calls": [{"function": {"name": "f", "arguments": {"a": 1}}}]},
+                                       "prompt_eval_count": 9, "eval_count": 4}, "m")
+        self.assertEqual(result.finish_reason, "tool_calls")
+        self.assertEqual((result.tool_calls[0].id, json.loads(result.tool_calls[0].arguments)), ("call_0", {"a": 1}))
+        self.assertEqual(result.usage, Usage(9, 4))
+        length = ollama_api.from_wire({"message": {"content": "cut"}, "done_reason": "length"}, "m")
+        self.assertEqual(length.finish_reason, "length")
+
+    def test_ndjson_stream(self) -> None:
+        lines = [
+            b'{"message":{"role":"assistant","content":"Hel"},"done":false}\n',
+            b'{"message":{"role":"assistant","content":"lo"},"done":false}\n',
+            b'{"message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":{}}}]},"done":false}\n',
+            b'{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":5}\n',
+        ]
+        events = list(ollama_api.stream_events(lines))
+        self.assertEqual([e.kind for e in events], ["text", "text", "tool_call", "usage", "finish"])
+        self.assertEqual(events[2].tool_id, "call_0")
+        self.assertEqual(events[-1].finish_reason, "tool_calls")
+        with self.assertRaises(GatewayError):
+            list(ollama_api.stream_events([b'{"error":"model \\"x\\" not found"}\n']))
+
+
+class _FakeOllama(BaseHTTPRequestHandler):
+    received: list[dict[str, Any]] = []
+
+    def log_message(self, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        type(self).received.append({"path": self.path, "body": body})
+        if body.get("model") == "missing":
+            payload = json.dumps({"error": 'model "missing" not found, try pulling it first'}).encode()
+            self.send_response(404); self.send_header("Content-Length", str(len(payload))); self.end_headers()
+            self.wfile.write(payload)
+            return
+        if body.get("stream"):
+            self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.end_headers()
+            for chunk in ({"message": {"role": "assistant", "content": "Hel"}, "done": False},
+                          {"message": {"role": "assistant", "content": "lo"}, "done": False},
+                          {"message": {"role": "assistant", "content": ""}, "done": True, "done_reason": "stop",
+                           "prompt_eval_count": 2, "eval_count": 2}):
+                self.wfile.write((json.dumps(chunk) + "\n").encode())
+            return
+        payload = json.dumps({"model": body["model"], "done": True, "done_reason": "stop",
+                              "message": {"role": "assistant", "content": "Hello"},
+                              "prompt_eval_count": 3, "eval_count": 1}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload))); self.end_headers()
+        self.wfile.write(payload)
+
+
+class OllamaGatewayTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _FakeOllama.received = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllama)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        engine = OllamaEngine(f"http://127.0.0.1:{upstream.server_address[1]}", model="qwen3:32b")
+        self.target = Target(engine, "Remote Ollama", "qwen3:32b")
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""), lambda: self.target)
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        self.base = f"http://127.0.0.1:{gateway.server_address[1]}"
+
+    post = GatewayServerTests.post
+
+    def test_openai_client_to_native_ollama(self) -> None:
+        status, raw = self.post("/v1/chat/completions", {"model": "anything", "max_tokens": 8,
+                                                         "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "Hello")
+        sent = _FakeOllama.received[0]
+        self.assertEqual(sent["path"], "/api/chat")
+        self.assertEqual((sent["body"]["model"], sent["body"]["stream"]), ("qwen3:32b", False))
+        self.assertEqual(sent["body"]["options"], {"num_predict": 8})
+
+    def test_anthropic_streaming_from_ollama(self) -> None:
+        status, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 10, "stream": True,
+                                                 "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        events = _sse_events(raw)
+        self.assertEqual("".join(d["delta"]["text"] for n, d in events if n == "content_block_delta"), "Hello")
+        self.assertEqual(events[-2][1]["usage"]["output_tokens"], 2)
+        self.assertEqual(events[-1][0], "message_stop")
+
+    def test_ollama_error_reaches_client(self) -> None:
+        self.target = Target(OllamaEngine(self.target.engine.api_base), "Remote Ollama", "missing")
+        status, raw = self.post("/v1/chat/completions", {"model": "missing", "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 404)
+        self.assertIn("try pulling it first", json.loads(raw)["error"]["message"])
+
+
+class OllamaRoutingTests(unittest.TestCase):
+    def test_ollama_endpoint_uses_native_engine_at_server_root(self) -> None:
+        for url in ("http://thanatos:11434", "http://thanatos:11434/v1", "http://thanatos:11434/api/"):
+            remote = mock.Mock(valid=True, api_key_env="", key_required=False, display_name="Ollama", summary="",
+                               base_url=url, model="qwen3:32b", provider="ollama")
+            remote.name = "ollama"
+            with mock.patch.object(router, "active_endpoint", return_value=remote):
+                target = router.resolve_target()
+            self.assertIsInstance(target.engine, OllamaEngine)
+            self.assertEqual(target.engine.api_base, "http://thanatos:11434", url)
+
+    def test_ollama_config_without_lane_is_self_hosted(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from inferencedeck.remotes import list_endpoints
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "o.json").write_text(json.dumps({"provider": "ollama", "baseUrl": "http://thanatos:11434"}))
+            cfg = list_endpoints(Path(tmp))[0]
+        self.assertEqual(cfg.lane, "remote_host")
+        self.assertTrue(cfg.valid, cfg.error)
 
 
 if __name__ == "__main__":

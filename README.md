@@ -31,7 +31,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 InferenceDeck supports two endpoint lanes, which say who runs the model:
 
-- `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet.
+- `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet. An endpoint whose `provider` is `llamacpp` or `ollama` defaults to this lane when `lane` is omitted.
 - `true_cloud` — a hosted API such as OpenRouter, where the request leaves your infrastructure.
 
 How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and `100.64.0.0/10` addresses count as Tailscale, and `true_cloud` endpoints default to HTTPS. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
@@ -281,7 +281,17 @@ The translation covers:
 
 For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
 
-The only engine adapter so far is OpenAI-compatible. It covers `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter. The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
+There are two engine adapters:
+
+- **OpenAI-compatible**, for `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter.
+- **Native Ollama** (`/api/chat`), used for endpoints with `"provider": "ollama"`. Its `baseUrl` is the server root, e.g. `http://thanatos:11434`; a URL ending in `/v1` or `/api` also works.
+  - Sampling settings become Ollama `options`, with `max_tokens` sent as `num_predict`.
+  - Other engine fields go into `options` (e.g. `num_ctx`, `repeat_penalty`), except `keep_alive` and `think`, which go at the top level. OpenAI-only fields such as `parallel_tool_calls` are dropped.
+  - `response_format` becomes Ollama's `format` (JSON mode or a JSON schema).
+  - Images must be inline (base64); image URLs are refused with a 400.
+  - Ollama has no `tool_choice`. `none` is honoured by not offering the tools; a forced or required choice is left to the model.
+
+The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
