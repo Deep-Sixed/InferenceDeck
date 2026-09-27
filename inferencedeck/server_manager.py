@@ -16,6 +16,7 @@ from typing import Any
 from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
+from .llama_flags import supported_flags
 from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
@@ -546,6 +547,7 @@ def prepare_launch_command(
         resolved.model["path"],
         params,
         extra_args=app_config.extra_llama_args,
+        flags=supported_flags(llama.binary_path),
     )
     warnings = resolved.warnings + command.warnings
     return {

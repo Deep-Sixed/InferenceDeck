@@ -42,6 +42,7 @@ from typing import Any
 
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
+from .llama_flags import supported_flags
 from .models import discover_models
 from .paths import (
     find_project_root,
@@ -459,7 +460,9 @@ def _build_script_command(
     if runtime == "vllm.cpp":
         command = build_vllm_cpp_server_args(binary, model_path, params, extra_args=config.extra_vllm_cpp_args)
         return command, "--model"
-    command = build_llama_server_args(binary, model_path, params, extra_args=config.extra_llama_args)
+    command = build_llama_server_args(
+        binary, model_path, params, extra_args=config.extra_llama_args, flags=supported_flags(binary)
+    )
     return command, "-m"
 
 

@@ -55,6 +55,15 @@ def _add_optional(args: list[str], flag: str, value: Any) -> None:
 
 
 SPLIT_MODES = {"none", "layer", "row", "tensor"}
+LOAD_MODES = {"auto", "none", "mmap", "mlock", "mmap+mlock", "dio"}
+# How each load mode is spelled on builds from before --load-mode existed.
+LEGACY_LOAD_MODE_ARGS = {
+    "auto": [],
+    "mmap": [],
+    "none": ["--no-mmap"],
+    "mlock": ["--no-mmap", "--mlock"],
+    "mmap+mlock": ["--mlock"],
+}
 NUMA_STRATEGIES = {"distribute", "isolate", "numactl"}
 ROPE_SCALING_TYPES = {"none", "linear", "yarn"}
 KV_OVERRIDE_TYPES = {"int", "float", "bool", "str"}
@@ -171,13 +180,77 @@ def _rope_args(params: dict[str, Any], warnings: list[str]) -> list[str]:
     return args
 
 
+def _load_mode_args(params: dict[str, Any], flags: frozenset[str] | None, warnings: list[str]) -> list[str]:
+    """Model-loading flags: ``--load-mode`` on current builds, else ``--no-mmap``/``--mlock``.
+
+    Both spellings default to mmap, so the default emits nothing and works on any
+    build. ``load_mode`` wins over the ``mmap``/``mlock`` booleans when set.
+    """
+    has_load_mode = flags is not None and "--load-mode" in flags
+    if params.get("load_mode") not in (None, ""):
+        mode = _enum_value(params, "load_mode", LOAD_MODES, warnings)
+        if not mode:
+            return []
+        if has_load_mode:
+            return ["--load-mode", mode]
+        if mode == "dio":
+            warnings.append("load_mode 'dio' needs a llama-server with --load-mode; flag not emitted.")
+            return []
+        return list(LEGACY_LOAD_MODE_ARGS[mode])
+    mmap = bool(params.get("mmap", True))
+    mlock = bool(params.get("mlock", False))
+    if has_load_mode:
+        if mmap and not mlock:
+            return []
+        return ["--load-mode", "mmap+mlock" if mmap and mlock else "mlock" if mlock else "none"]
+    return (["--no-mmap"] if not mmap else []) + (["--mlock"] if mlock else [])
+
+
+def _draft_args(params: dict[str, Any], flags: frozenset[str] | None) -> list[str]:
+    """Speculative-decoding limits, using the ``--spec-draft-*`` names when the build has them.
+
+    ``draft_max``/``draft_min`` are the older profile keys; current llama.cpp rejects
+    ``--draft-max``/``--draft-min`` outright, so they are renamed when it can tell.
+    """
+    args: list[str] = []
+    for spec_key, legacy_key, spec_flag, legacy_flag in (
+        ("spec_draft_n_max", "draft_max", "--spec-draft-n-max", "--draft-max"),
+        ("spec_draft_n_min", "draft_min", "--spec-draft-n-min", "--draft-min"),
+        ("spec_draft_p_min", "draft_p_min", "--spec-draft-p-min", "--draft-p-min"),
+    ):
+        if spec_key in params:
+            args.extend([spec_flag, str(params[spec_key])])
+        elif legacy_key in params:
+            renamed = flags is not None and spec_flag in flags
+            args.extend([spec_flag if renamed else legacy_flag, str(params[legacy_key])])
+    return args
+
+
+def _unsupported_flag_warnings(argv: list[str], flags: frozenset[str] | None, binary: str) -> list[str]:
+    if not flags:
+        return []
+    unknown = sorted({token for token in argv if token.startswith("--") and token not in flags})
+    if not unknown:
+        return []
+    return [
+        f"{Path(binary).name} does not list {', '.join(unknown)} in its --help; "
+        "it will probably refuse to start. Update llama.cpp or remove those settings."
+    ]
+
+
 def build_llama_server_args(
     llama_server: str,
     model_path: str,
     params: dict[str, Any],
     extra_args: list[str] | None = None,
+    flags: frozenset[str] | None = None,
 ) -> LaunchCommand:
-    """Build a modern llama-server argv list from normalized profile params."""
+    """Build a modern llama-server argv list from normalized profile params.
+
+    ``flags`` is what the binary accepts (see ``llama_flags.supported_flags``);
+    with it, renamed flags are spelled the way that build expects. ``None`` means
+    unknown and keeps the older spellings.
+    """
 
     warnings: list[str] = []
     args = [
@@ -235,10 +308,7 @@ def build_llama_server_args(
     device = params.get("device", params.get("cuda_device"))
     if device not in (None, "", "auto"):
         args.extend(["--device", str(device)])
-    if params.get("mmap", True):
-        args.append("--mmap")
-    else:
-        args.append("--no-mmap")
+    args.extend(_load_mode_args(params, flags, warnings))
     if params.get("embedding", False):
         args.append("--embedding")
     numa = params.get("numa")
@@ -260,14 +330,7 @@ def build_llama_server_args(
         args.extend(["--model-draft", draft_model])
         if spec_type:
             args.extend(["--spec-type", spec_type])
-        if "spec_draft_n_max" in params:
-            args.extend(["--spec-draft-n-max", str(params["spec_draft_n_max"])])
-        elif "draft_max" in params:
-            args.extend(["--draft-max", str(params["draft_max"])])
-        if "draft_min" in params:
-            args.extend(["--draft-min", str(params["draft_min"])])
-        if "draft_p_min" in params:
-            args.extend(["--draft-p-min", str(params["draft_p_min"])])
+        args.extend(_draft_args(params, flags))
     elif spec_type:
         warnings.append("spec_type was set but draft_model was missing; speculative flags were not emitted.")
 
@@ -279,6 +342,8 @@ def build_llama_server_args(
         else:
             args.extend(["-ot", str(tensor_overrides)])
 
+    # Checked before extra_args: those are the user's own, verbatim.
+    warnings.extend(_unsupported_flag_warnings(args, flags, llama_server))
     if extra_args:
         args.extend(extra_args)
 

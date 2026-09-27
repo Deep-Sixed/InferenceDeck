@@ -173,6 +173,14 @@ Profile `recommended_params` map to `llama-server` flags:
 | `rope_scaling`, `rope_scale`, `rope_freq_base`, `rope_freq_scale` | `--rope-*` | `"yarn"`, `4` |
 | `yarn_orig_ctx`, `yarn_ext_factor`, `yarn_attn_factor`, `yarn_beta_slow`, `yarn_beta_fast` | `--yarn-*` | `32768` |
 | `numa` | `--numa` | `true` (distribute), `"isolate"`, `"numactl"` |
+| `mmap`, `mlock` | `--load-mode`, or `--no-mmap`/`--mlock` on older builds | `false`, `true` |
+| `load_mode` | `--load-mode` (translated for older builds) | `"mmap+mlock"`, `"dio"` |
+
+llama.cpp renames flags between releases, so InferenceDeck reads each `llama-server`'s
+`--help` once (cached until the binary changes) and spells renamed flags the way that
+build expects: `--load-mode` versus `--no-mmap`/`--mlock`, and `--spec-draft-n-max`/`-n-min`
+versus `--draft-max`/`--draft-min` for the `draft_max`/`draft_min` keys. A flag the build
+doesn't list is reported as a warning before launch.
 
 Invalid values are left out of the command and reported as warnings. These params pick
 hardware and files, so they live in the profile and can't be changed over the control
