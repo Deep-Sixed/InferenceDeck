@@ -34,7 +34,7 @@ InferenceDeck supports two endpoint lanes, which say who runs the model:
 - `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet. An endpoint whose `provider` is `llamacpp` or `ollama` defaults to this lane when `lane` is omitted.
 - `true_cloud` — a hosted API such as OpenRouter, where the request leaves your infrastructure.
 
-How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and `100.64.0.0/10` addresses count as Tailscale, and `true_cloud` endpoints default to HTTPS. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
+How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and tailnet addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) count as Tailscale, `true_cloud` endpoints default to HTTPS, and anything else is left unlabelled. Any other `transport` value makes the endpoint invalid. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
@@ -136,8 +136,8 @@ root and working directory, common home folders (`~/models`, `~/llms`, …), LM 
 model folders and the Hugging Face cache (`HF_HOME`). A whole drive is never scanned.
 
 Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` (or
-`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST` and
-`VLLM_CPP_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
+`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST`,
+`VLLM_CPP_SERVER_URL` and `MLC_LLM_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
 metadata requests when set.
 
 ## Choosing a llama.cpp build
@@ -223,7 +223,8 @@ it serves MLC weight folders (those with an `mlc-chat-config.json`, such as the
 `mlc_model` is a local MLC folder or an `HF://org/repo` id, which `mlc_llm serve`
 downloads into its own cache on first start. InferenceDeck runs the `mlc_llm` command
 from `mlc_llm_path` in config, `MLC_LLM_BIN` or `PATH`, or `python -m mlc_llm` when
-the package is installed in its own Python environment.
+the `mlc-llm` package is installed in InferenceDeck's own Python environment. Discovery
+also probes a running MLC server at `MLC_LLM_SERVER_URL` (default `http://127.0.0.1:8000`).
 
 | Profile param | `mlc_llm serve` argument |
 |---|---|
@@ -258,6 +259,10 @@ Server controls (the same in the web UI and both trays):
 | **Reload & restart** | Stops and starts the server with the same settings. |
 | **Context 8K–128K** | Restarts the server (or restores a released one) at that context size. |
 | **Stop** | Stops the server. On a released server it forgets the saved settings. |
+
+Starts run one at a time. Start is refused when the profile already has a running server
+(unless the caller asks to stop it first) or when another tracked server is using the same
+port.
 
 For authenticated LAN/tailnet use:
 
