@@ -29,6 +29,9 @@ class AppConfig:
     # vllm.cpp's vllm-server; found under runtime_dirs, VLLM_CPP_HOME or PATH when unset.
     vllm_cpp_server_path: str = ""
     extra_vllm_cpp_args: list[str] = field(default_factory=list)
+    # MLC LLM's mlc_llm command; found on PATH or run as python -m mlc_llm when unset.
+    mlc_llm_path: str = ""
+    extra_mlc_llm_args: list[str] = field(default_factory=list)
     update_channel: str = "stable"
     profile_names: dict[str, str] = field(default_factory=dict)
     server_history_limit: int = 5
