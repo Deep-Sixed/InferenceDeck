@@ -174,8 +174,9 @@ archive or `build/examples/` of a source build), or on `PATH`.
 llama.cpp-only settings (`gpu_layers`, `threads`, `cache_type_k`, …) and sampling
 values (vllm-server takes those per request) produce a warning rather than a flag.
 Start, Stop, Pause, Release GPU, Restart, the Context presets and Benchmark work the
-same as for llama.cpp; Start waits up to 180 s for readiness. Fit needs
-`llama-fit-params` and stays llama.cpp-only.
+same as for llama.cpp; Start waits up to 180 s for readiness. Generated launch scripts
+call `vllm-server --model …` for these profiles. Fit needs `llama-fit-params` and
+stays llama.cpp-only.
 
 ## Local control API and web UI
 

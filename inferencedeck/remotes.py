@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .fileio import atomic_write_text, locked
 from .paths import config_dir
 
 LANE_REMOTE_HOST = "remote_host"
@@ -195,29 +196,38 @@ def active_endpoint(directory: Path | None = None) -> RemoteEndpoint | None:
 def _write_enabled(path: Path, enabled: bool) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     data["enabled"] = bool(enabled)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, json.dumps(data, indent=2) + "\n")
+
+
+def _switch_lock(root: Path):
+    # One lock over the whole directory: enabling one endpoint rewrites several files.
+    return locked(root / ".switch.lock")
 
 
 def enable_endpoint(name: str, directory: Path | None = None) -> RemoteEndpoint:
     root = directory or endpoints_dir()
-    configs = list_endpoints(root)
-    target = next((cfg for cfg in configs if cfg.name == name), None)
-    if target is None:
-        raise ValueError(f"Unknown remote endpoint: {name}")
-    if not target.valid:
-        raise ValueError(f"Invalid endpoint {name}: {target.error}")
-    if target.key_required and not target.key_present:
-        raise ValueError(f"{target.display_name}: set ${target.api_key_env} before enabling")
-    for cfg in configs:
-        desired = cfg.name == name
-        if cfg.enabled != desired:
-            _write_enabled(cfg.path, desired)
-    return _parse(target.path)
+    with _switch_lock(root):
+        configs = list_endpoints(root)
+        target = next((cfg for cfg in configs if cfg.name == name), None)
+        if target is None:
+            raise ValueError(f"Unknown remote endpoint: {name}")
+        if not target.valid:
+            raise ValueError(f"Invalid endpoint {name}: {target.error}")
+        if target.key_required and not target.key_present:
+            raise ValueError(f"{target.display_name}: set ${target.api_key_env} before enabling")
+        # Disable the others before enabling the target, so a failure part-way
+        # leaves at most one endpoint enabled, never two.
+        for cfg in configs:
+            if cfg.enabled and cfg.name != name:
+                _write_enabled(cfg.path, False)
+        if not target.enabled:
+            _write_enabled(target.path, True)
+        return _parse(target.path)
 
 
 def disable_all(directory: Path | None = None) -> None:
-    for cfg in list_endpoints(directory):
-        if cfg.enabled:
-            _write_enabled(cfg.path, False)
+    root = directory or endpoints_dir()
+    with _switch_lock(root):
+        for cfg in list_endpoints(root):
+            if cfg.enabled:
+                _write_enabled(cfg.path, False)

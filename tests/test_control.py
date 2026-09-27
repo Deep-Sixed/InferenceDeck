@@ -114,6 +114,7 @@ class PerformanceControlTests(unittest.TestCase):
 
     def test_benchmark_delegates_with_scope(self) -> None:
         plane = ControlPlane(project_root="/tmp/project", model_dirs=["/tmp/models"])
-        with mock.patch("inferencedeck.control.run_profile_benchmark", return_value={"success": True}) as call:
+        with mock.patch("inferencedeck.control.active_endpoint", return_value=None), \
+                mock.patch("inferencedeck.control.run_profile_benchmark", return_value={"success": True}) as call:
             self.assertTrue(plane.benchmark("demo", completion_tokens=64)["success"])
         call.assert_called_once_with("demo", project_root="/tmp/project", model_dirs=["/tmp/models"], overrides=None, completion_tokens=64)

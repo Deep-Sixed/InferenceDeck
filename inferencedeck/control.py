@@ -90,6 +90,10 @@ class ControlPlane:
     def benchmark(
         self, mode: str, overrides: dict[str, Any] | None = None, *, completion_tokens: int = 128
     ) -> dict[str, Any]:
+        # A benchmark may start a local server, so it obeys the same rule as Start.
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
         return run_profile_benchmark(
             mode,
             project_root=self.project_root,
@@ -117,9 +121,7 @@ class ControlPlane:
                 raise ValueError(f"Unknown runtime: {runtime}")
             if not match["compatible"]:
                 raise ValueError(f"{match['label']} can't run on this machine: {match['incompatible_reason']}")
-        config = self._config()
-        config.llama_runtime = runtime
-        config.save()
+        AppConfig.update(lambda config: setattr(config, "llama_runtime", runtime))
         return {"success": True, "runtime": self.runtime()}
 
     def remote_endpoints(self) -> dict[str, Any]:
