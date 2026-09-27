@@ -4,8 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
+from .backends import detect_all
+from .config import AppConfig
 from .inventory import build_inventory
 from .profile_resolver import resolved_inventory, resolve_profiles
+from .runtime_updates import SUPPORTED_CHANNELS, check_runtime_updates
 from .server_manager import list_servers, prepare_launch_command, server_logs, stop_server
 
 
@@ -83,6 +86,19 @@ def logs_command(args: argparse.Namespace) -> int:
     return 0 if result.get("success") else 2
 
 
+def updates_command(args: argparse.Namespace) -> int:
+    config = AppConfig.load()
+    root = Path(args.project_root).expanduser() if args.project_root else None
+    environments = [env.to_dict() for env in detect_all(root, config=config)]
+    payload = check_runtime_updates(
+        environments,
+        channel=args.channel or config.update_channel,
+        force_refresh=args.refresh,
+    )
+    print(json.dumps(payload, indent=2 if args.pretty else None, sort_keys=args.pretty))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m inferencedeck",
@@ -122,6 +138,17 @@ def main(argv: list[str] | None = None) -> int:
     logs_parser.add_argument("--lines", type=int, default=200)
     logs_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     logs_parser.set_defaults(func=logs_command)
+
+    updates_parser = subparsers.add_parser(
+        "updates", help="Compare installed runtime versions with their latest upstream releases."
+    )
+    updates_parser.add_argument("--project-root", help="Optional existing llama.cpp/control-center root.")
+    updates_parser.add_argument(
+        "--channel", choices=SUPPORTED_CHANNELS, help="Release channel (default: update_channel from config)."
+    )
+    updates_parser.add_argument("--refresh", action="store_true", help="Ignore the one-hour cache and ask GitHub again.")
+    updates_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    updates_parser.set_defaults(func=updates_command)
 
     _add_common_args(parser)
     parser.set_defaults(func=inventory_command)
