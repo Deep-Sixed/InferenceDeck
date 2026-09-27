@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -28,6 +29,12 @@ PARKED = "parked"
 RESTORING = "restoring"
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 LOG_DIRNAME = "logs"
+# Large GGUFs on slow disks routinely take over a minute to load; a short
+# deadline marks healthy servers as startup_timeout.
+DEFAULT_READY_TIMEOUT_SECONDS = 120
+MIN_READY_TIMEOUT_SECONDS = 15
+# llama-server /props modality keys mapped to input modalities.
+_PROPS_MODALITIES = (("vision", "image"), ("audio", "audio"), ("video", "video"))
 
 
 def _now() -> str:
@@ -461,23 +468,94 @@ def _remove_server(server_id: str) -> None:
     _mutate_state(change)
 
 
-def _health_url(host: str, port: int) -> str:
+def _probe_base(host: str, port: int) -> str:
     probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
-    return f"http://{probe_host}:{int(port)}/v1/models"
+    return f"http://{probe_host}:{int(port)}"
 
 
-def wait_until_ready(host: str, port: int, pid: int, timeout_seconds: int = 45) -> bool:
-    deadline = time.time() + timeout_seconds
-    url = _health_url(host, port)
+def _probe_status(url: str) -> int | None:
+    """HTTP status for ``url``, or None when nothing answered."""
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except Exception:
+        return None
+
+
+def wait_until_ready(
+    host: str, port: int, pid: int, timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS
+) -> bool:
+    """Wait for the server to report ready.
+
+    llama-server answers /health with 503 while the model loads and 200 once it
+    can serve. Servers without /health (404/405) fall back to /v1/models.
+    """
+    deadline = time.time() + max(int(timeout_seconds), MIN_READY_TIMEOUT_SECONDS)
+    base = _probe_base(host, port)
+    path = "/health"
     while time.time() < deadline:
         if not pid_is_running(pid):
             return False
-        try:
-            with urllib.request.urlopen(url, timeout=1):
-                return True
-        except Exception:
-            time.sleep(1)
+        status = _probe_status(base + path)
+        if status is not None and 200 <= status < 300:
+            return True
+        if path == "/health" and status in {404, 405, 501}:
+            path = "/v1/models"
+            continue
+        time.sleep(1)
     return False
+
+
+def parse_props(props: dict[str, Any]) -> dict[str, Any]:
+    """Capabilities reported by llama-server's GET /props."""
+    settings = props.get("default_generation_settings") or {}
+    slot_ctx = settings.get("n_ctx")
+    total_slots = props.get("total_slots")
+    modalities = props.get("modalities") or {}
+    template_caps = props.get("chat_template_caps")
+    if isinstance(template_caps, dict) and template_caps:
+        # Both are needed for a tool round trip (render tools, read calls back).
+        tools = bool(template_caps.get("supports_tools") and template_caps.get("supports_tool_calls"))
+    else:
+        # Builds older than chat_template_caps: the template itself is the only hint.
+        tools = "tools" in str(props.get("chat_template") or "")
+    caps: dict[str, Any] = {
+        "slot_ctx": int(slot_ctx) if isinstance(slot_ctx, int) and slot_ctx > 0 else None,
+        "total_slots": int(total_slots) if isinstance(total_slots, int) and total_slots > 0 else None,
+        "input_modalities": ["text"] + [name for key, name in _PROPS_MODALITIES if modalities.get(key) is True],
+        "tools": tools,
+    }
+    if props.get("build_info"):
+        caps["build_info"] = str(props["build_info"])
+    return caps
+
+
+def probe_capabilities(host: str, port: int, timeout: float = 3) -> dict[str, Any] | None:
+    """Read /props from a ready llama-server; None if it has no such endpoint."""
+    try:
+        with urllib.request.urlopen(f"{_probe_base(host, port)}/props", timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    return parse_props(payload) if isinstance(payload, dict) else None
+
+
+def _capability_warnings(caps: dict[str, Any], requested_ctx: Any) -> list[str]:
+    slot_ctx = caps.get("slot_ctx")
+    try:
+        requested = int(requested_ctx)
+    except (TypeError, ValueError):
+        return []
+    if slot_ctx and requested > slot_ctx:
+        slots = caps.get("total_slots")
+        split = f" across {slots} parallel slots" if slots and slots > 1 else ""
+        return [
+            f"Requested context {requested} but each request is limited to {slot_ctx} tokens{split}. "
+            "Lower --parallel or use a unified KV cache to give one request the full context."
+        ]
+    return []
 
 
 def _profile_by_mode(mode: str, project_root: str | Path | None, model_dirs: list[str | Path] | None) -> ResolvedProfile | None:
@@ -557,7 +635,7 @@ def start_profile(
     overrides: dict[str, Any] | None = None,
     stop_existing: bool = False,
     wait_ready: bool = True,
-    ready_timeout_seconds: int = 45,
+    ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
     if not prepared.get("success"):
@@ -634,14 +712,19 @@ def start_profile(
 
     if wait_ready:
         ready = wait_until_ready(server["host"], server["port"], proc.pid, ready_timeout_seconds)
-        _update_server(
-            server_id,
-            {
-                "status": "running" if ready else "startup_timeout",
-                "running": pid_is_running(proc.pid),
-                "ready_at": _now() if ready else None,
-            },
-        )
+        patch: dict[str, Any] = {
+            "status": "running" if ready else "startup_timeout",
+            "running": pid_is_running(proc.pid),
+            "ready_at": _now() if ready else None,
+        }
+        if ready:
+            caps = probe_capabilities(server["host"], server["port"])
+            if caps:
+                patch["capabilities"] = caps
+                extra = _capability_warnings(caps, server.get("ctx_size"))
+                if extra:
+                    patch["warnings"] = list(server["warnings"]) + extra
+        _update_server(server_id, patch)
         if not ready:
             return {
                 "success": False,

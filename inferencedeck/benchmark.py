@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import list_servers, start_profile, stop_server
+from .server_manager import DEFAULT_READY_TIMEOUT_SECONDS, list_servers, start_profile, stop_server
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -75,6 +75,45 @@ def _fallback_token_count(text: str) -> int:
     return max(1, round(len(text) / 4))
 
 
+def _round(value: Any, digits: int) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, digits) if number > 0 else None
+
+
+def response_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[str, Any]:
+    """Token counts and speeds for one non-streaming completion response.
+
+    llama-server adds a ``timings`` block that splits prompt processing from
+    generation; its ``predicted_per_second`` is the true decode speed. Without
+    it, the speed falls back to completion tokens over wall-clock time, which
+    also counts prompt processing and HTTP overhead.
+    """
+    usage = payload.get("usage") or {}
+    timings = payload.get("timings") if isinstance(payload.get("timings"), dict) else {}
+    completion = int(timings.get("predicted_n") or usage.get("completion_tokens") or _fallback_token_count(text))
+    prompt = int(timings.get("prompt_n") or usage.get("prompt_tokens") or 0)
+    wall_tps = completion / elapsed if completion else 0.0
+    generation_tps = _round(timings.get("predicted_per_second"), 2)
+    metrics: dict[str, Any] = {
+        "completion_tokens": completion,
+        "prompt_tokens": prompt,
+        "tokens_per_second": generation_tps if generation_tps is not None else round(wall_tps, 2),
+        "tokens_per_second_source": "timings" if generation_tps is not None else "wall_clock",
+        "wall_tokens_per_second": round(wall_tps, 2),
+    }
+    if timings:
+        metrics["prompt_tokens_per_second"] = _round(timings.get("prompt_per_second"), 2)
+        metrics["prompt_ms"] = _round(timings.get("prompt_ms"), 1)
+        metrics["generation_ms"] = _round(timings.get("predicted_ms"), 1)
+        if timings.get("cache_n") is not None:
+            # cache_n counts prompt tokens reused from the KV cache (not re-processed).
+            metrics["cached_prompt_tokens"] = int(timings.get("cache_n") or 0)
+    return metrics
+
+
 def send_chat_prompt(
     mode: str,
     prompt: str,
@@ -118,19 +157,13 @@ def send_chat_prompt(
         return {"success": False, "error": str(exc), "endpoint": f"{base_url}/v1/chat/completions"}
     elapsed = max(time.perf_counter() - started, 0.001)
 
-    usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
-
     return {
         "success": True,
         "reply": text,
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0),
-        "tokens_per_second": round(tokens_per_second, 2),
+        **response_metrics(response_payload, text, elapsed),
     }
 
 
@@ -143,7 +176,7 @@ def run_profile_benchmark(
     completion_tokens: int = 128,
     restart: bool = True,
     stop_after: bool = False,
-    ready_timeout_seconds: int = 90,
+    ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     params = dict(overrides or {})
     params["n_predict"] = int(completion_tokens)
@@ -189,10 +222,8 @@ def run_profile_benchmark(
 
     usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    prompt_count = int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0)
-    total_count = int(usage.get("total_tokens") or (prompt_count + completion_count))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
+    metrics = response_metrics(response_payload, text, elapsed)
+    total_count = int(usage.get("total_tokens") or (metrics["prompt_tokens"] + metrics["completion_tokens"]))
     chars_per_second = len(text) / elapsed if text else 0.0
 
     benchmark = {
@@ -201,10 +232,8 @@ def run_profile_benchmark(
         "server_id": server.get("id"),
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": prompt_count,
+        **metrics,
         "total_tokens": total_count,
-        "tokens_per_second": round(tokens_per_second, 2),
         "chars_per_second": round(chars_per_second, 1),
         "response_chars": len(text),
         "requested_max_tokens": int(completion_tokens),
