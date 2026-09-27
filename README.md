@@ -8,12 +8,12 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 ### Core
 
-- Discover local `llama.cpp`, `vllm.cpp`, MLC LLM, Ollama, LM Studio, vLLM, and MLX runtimes.
+- Discover local `llama.cpp`, `vllm.cpp`, MLC LLM, KoboldCpp, Ollama, LM Studio, vLLM, and MLX runtimes.
 - Discover GGUF models from configured and common model locations.
 - Detect CPU, GPU, system memory, VRAM, and available acceleration backends.
 - Estimate model fit and performance, with `llama-fit-params` integration when available.
 - Resolve and manage portable model profiles.
-- Prepare `llama-server`, `vllm-server` (vllm.cpp) or `mlc_llm serve` (MLC LLM) launch commands and manage servers started by InferenceDeck.
+- Prepare `llama-server`, `vllm-server` (vllm.cpp), `mlc_llm serve` (MLC LLM) or KoboldCpp launch commands and manage servers started by InferenceDeck.
 - Pause/resume tracked servers without losing process state, or release the GPU (stop the server, keep its settings) and restore it later.
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
@@ -110,7 +110,7 @@ and `--no-manifest`.
 ### Update checks
 
 `inferencedeck updates` compares installed versions with the latest GitHub release
-for llama.cpp, Ollama, vLLM, vllm.cpp, MLC LLM and MLX. It never downloads or
+for llama.cpp, Ollama, vLLM, vllm.cpp, MLC LLM, KoboldCpp and MLX. It never downloads or
 replaces anything, and caches results for an hour (`--refresh` skips the cache). The
 channel defaults to `update_channel` in config.
 
@@ -140,7 +140,8 @@ asks GitHub again. Each update links to its GitHub release page.
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
-`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `koboldcpp_path`,
+`extra_koboldcpp_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -251,6 +252,45 @@ As with vllm.cpp, llama.cpp-only settings and sampling values produce a warning.
 Start waits up to 600 s, since the first start may download weights and compile a
 model library. Generated launch scripts call `mlc_llm serve $model …`; Fit stays
 llama.cpp-only.
+
+## Running a profile on KoboldCpp
+
+[KoboldCpp](https://github.com/LostRuins/koboldcpp) is a llama.cpp fork shipped as a
+single executable. It loads the same GGUF files, so a KoboldCpp profile is matched
+against discovered models exactly like a llama.cpp one; set `"runtime": "koboldcpp"`:
+
+```json
+{"mode": "qwen-kobold", "name": "Qwen3 8B (KoboldCpp)",
+ "recommended_params": {"runtime": "koboldcpp", "ctx_size": 16384}}
+```
+
+InferenceDeck runs the executable from `koboldcpp_path` in config, `KOBOLDCPP_BIN`,
+`KOBOLDCPP_HOME` or `runtime_dirs` (the release names `koboldcpp`,
+`koboldcpp-linux-x64`, `koboldcpp-mac-arm64`, `koboldcpp.exe`, `koboldcpp_nocuda.exe`,
+… are all recognized) or `PATH`, or `koboldcpp.py` under Python for a source checkout.
+It always passes `--skiplauncher`, so the Tk launcher never opens.
+
+KoboldCpp picks its own GPU backend (CUDA, Vulkan or CPU, with no-AVX2 and failsafe
+modes for older CPUs), thread counts and GPU layers (autofit) when a profile leaves them
+unset, so a profile needs nothing beyond `runtime` (its context defaults to 16K). llama.cpp-style
+settings map to KoboldCpp's flags:
+
+| Profile param | KoboldCpp flag |
+|---|---|
+| `ctx_size`, `threads`, `threads_batch` | `--contextsize`, `--threads`, `--blasthreads` |
+| `gpu_layers` | `--gpulayers` (`auto` or unset: KoboldCpp's autofit) |
+| `acceleration_backend` `cuda`/`rocm`/`vulkan`/`cpu`, `device` | `--usecuda`/`--usevulkan`/`--usecpu`, with the device's GPU index |
+| `batch_size` | `--batchsize`, rounded down to one KoboldCpp accepts (16-4096, powers of two) |
+| `cache_type_k`/`cache_type_v` | `--quantkv` (one type for both: f16, bf16, q8_0, q5_1, q4_0) |
+| `flash_attn: false`, `kv_offload: false`, `mmap: true` | `--noflashattention`, `--lowvram`, `--usemmap` |
+| `jinja`, `reasoning` | `--jinja_tools`, `--jinjathink true/false` |
+| `draft_model`, `draft_max` | `--draftmodel`, `--draftamount` |
+| `tensor_overrides`, `mmproj`, `n_predict` | `--overridetensors`, `--mmproj`, `--defaultgenamt` |
+
+Settings KoboldCpp has no flag for (`ubatch_size`, `cache_reuse`, …) and sampling values
+produce a warning. Start waits up to 120 s, since one-file builds unpack themselves
+before loading. Generated launch scripts call it with `--model $model …`; update checks
+use `LostRuins/koboldcpp` releases; Fit stays llama.cpp-only.
 
 ## Local control API and web UI
 
