@@ -146,6 +146,18 @@ MANIFEST_PARAM_KEYS = (
     "cache_ram_mib",
     "cache_reuse",
     "slot_prompt_similarity",
+    # vllm.cpp profiles (runtime: vllm.cpp); see vllm_cpp_args.
+    "block_size",
+    "num_blocks",
+    "kv_cache_memory_mib",
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "kv_cache_dtype",
+    "enable_prefix_caching",
+    "scheduling_policy",
+    "tool_call_parser",
+    "reasoning_parser",
+    "speculative_config",
 )
 
 
