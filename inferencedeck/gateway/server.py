@@ -173,6 +173,16 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._guard(api.render_error):
             return
+        # Browsers send text/plain (or form) POSTs cross-origin without a CORS
+        # preflight, so without this any web page could make a loopback gateway
+        # run inference, spending GPU time or a cloud endpoint's API credits.
+        # SDKs always send application/json; requiring it forces a preflight,
+        # which this server never grants.
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, api.render_error(
+                GatewayError(415, "Content-Type must be application/json", "invalid_request")))
+            return
         try:
             body = self._body()
             request: ChatRequest = api.parse(body)

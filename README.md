@@ -38,7 +38,7 @@ How requests reach the endpoint is a separate, optional `transport` field: `tail
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
-Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` is required for `true_cloud` endpoints and optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
+Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` and `model` are required for `true_cloud` endpoints (the model is pinned, so a client's default model name is never billed to your key; pick another model explicitly with `<endpoint>/<model>` through the gateway). `apiKeyEnv` is optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
 
 ### Web/control authentication
 
@@ -408,7 +408,7 @@ The Anthropic API's `thinking` setting is dropped, and its server tools (such as
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
-The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
+The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
 
 ## Development
 
