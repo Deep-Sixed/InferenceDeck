@@ -11,6 +11,7 @@ from typing import Any
 from .paths import cache_dir
 from .fileio import atomic_write_text, locked
 from .server_manager import http_base, list_servers, start_profile, stop_server
+from .telemetry import emit as emit_event
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -223,6 +224,13 @@ def run_profile_benchmark(
         "usage": usage,
     }
     save_benchmark_result(benchmark)
+    emit_event(
+        "benchmark.completed",
+        server,
+        tokens_per_second=benchmark["tokens_per_second"],
+        completion_tokens=completion_count,
+        elapsed_seconds=benchmark["elapsed_seconds"],
+    )
 
     stop_result = None
     if stop_after and server.get("id"):

@@ -213,23 +213,47 @@ endpoints serve it, behind the same authentication as the rest of the API:
 
 | Endpoint | Format | Contents |
 |---|---|---|
-| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; lifecycle counters and the most recent lifecycle events |
+| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; per-server requests and tokens (see below); the latest benchmark per profile; lifecycle counters and the most recent lifecycle events |
 | `GET /metrics` | Prometheus text | The same readings as `inferencedeck_*` metrics, one series per profile |
 
 Lifecycle events are `server.started`, `server.ready`, `server.start_failed`,
 `server.stopped`, `server.stop_failed`, `server.suspended`, `server.resumed`,
-`server.released` and `server.restored`. Their counters live in memory and reset
+`server.released`, `server.restored` and `benchmark.completed`. Their counters live in memory and reset
 when the control process restarts, as Prometheus counters do. Readings are cached
 for two seconds so a UI poll and a scrape share one `nvidia-smi` call. GPU readings
 need `nvidia-smi`, and per-process memory and CPU time need Linux `/proc`. On other
 platforms those fields are left out. They are never reported as zero.
 
+#### Requests and tokens
+
+InferenceDeck doesn't sit between clients and the inference server, so it reads
+request and token counts from the server itself. llama-server is launched with
+`--metrics` (set `"metrics": false` in a profile to turn this off), and each live
+server's `/metrics` counters are read with a one-second timeout. Paused servers
+are skipped. The readings for each server are:
+
+| Field | Meaning |
+|---|---|
+| `requests_active`, `requests_deferred` | Requests being processed, and waiting for a free slot |
+| `prompt_tokens_total`, `tokens_generated_total` | Token counters since the server started |
+| `tokens_per_second` | Generation speed, over the time the server spent generating since the previous reading. Absent while idle, never zero |
+| `prompt_tokens_per_second` | Prompt-processing speed, measured the same way |
+| `throughput_tokens_per_second` | Tokens generated per wall-clock second since the previous reading (zero while idle) |
+| `kv_cache_usage_percent` | Share of the KV cache in use, on llama.cpp builds that report it |
+
+Rates are worked out from how InferenceDeck's own readings of the counters change,
+so another scraper doesn't change them. llama-server resets its
+`llamacpp:prompt_tokens_seconds` and `llamacpp:predicted_tokens_seconds` gauges on
+every scrape, though, so a separate Prometheus job scraping llama-server directly
+sees those two gauges cover shorter windows. The counters it scrapes are unaffected.
+vllm.cpp servers are read the same way if they serve vLLM-style `vllm:*` metrics.
+
 #### History and graphs
 
 `inferencedeck-web` also samples the snapshot every 5 seconds and keeps it for the
 **Telemetry** card in the web UI. That card has one chart per measure: GPU
-utilisation, VRAM, temperature, power and clock; GPU memory per server; CPU and
-RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
+utilisation, VRAM, temperature, power and clock; GPU memory, generation speed,
+prompt-processing speed, active requests and KV cache per server; CPU and RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
 are marked on the charts, with failed starts and stops in red. A data table
 under the charts lists the latest, average and peak value of every series.
 

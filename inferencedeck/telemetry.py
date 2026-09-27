@@ -16,6 +16,7 @@ import os
 import shutil
 import threading
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from . import hardware
 from .paths import is_windows
 
 SNAPSHOT_MAX_AGE_SECONDS = 2.0
+SERVER_METRICS_TIMEOUT_SECONDS = 1.0
 MAX_RECENT_EVENTS = 200
 MIB = 1024 * 1024
 
@@ -252,6 +254,139 @@ def process_stats(pid: int | None) -> dict[str, Any]:
     return stats
 
 
+# Inference servers' own Prometheus counters, mapped to InferenceDeck's names.
+# llama-server serves these with --metrics; the vllm: names are vLLM's, which
+# vllm.cpp may follow.
+SERVER_METRIC_NAMES = {
+    "llamacpp:prompt_tokens_total": "prompt_tokens_total",
+    "llamacpp:prompt_seconds_total": "prompt_seconds_total",
+    "llamacpp:tokens_predicted_total": "tokens_generated_total",
+    "llamacpp:tokens_predicted_seconds_total": "generation_seconds_total",
+    "llamacpp:requests_processing": "requests_active",
+    "llamacpp:requests_deferred": "requests_deferred",
+    "llamacpp:kv_cache_usage_ratio": "kv_cache_usage_ratio",
+    "vllm:prompt_tokens_total": "prompt_tokens_total",
+    "vllm:generation_tokens_total": "tokens_generated_total",
+    "vllm:num_requests_running": "requests_active",
+    "vllm:num_requests_waiting": "requests_deferred",
+    "vllm:gpu_cache_usage_perc": "kv_cache_usage_ratio",
+    "vllm:kv_cache_usage_perc": "kv_cache_usage_ratio",
+}
+
+
+def parse_prometheus_text(text: str) -> dict[str, float]:
+    """Sample values by metric name, summed across label sets. Comments and unparsable lines are skipped."""
+    values: dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "{" in line:
+            name, _, rest = line.partition("{")
+            rest = rest.rpartition("}")[2]  # a label value may itself contain "}"
+        else:
+            name, _, rest = line.partition(" ")
+        fields = rest.split()
+        number = _float_or_none(fields[0]) if fields else None
+        if number is not None and number == number:  # skip NaN
+            values[name] = values.get(name, 0.0) + number
+    return values
+
+
+def fetch_server_metrics(server: dict[str, Any], timeout: float = SERVER_METRICS_TIMEOUT_SECONDS) -> dict[str, float] | None:
+    """The server's own counters, or None when it has no metrics endpoint or doesn't answer in time."""
+    from .server_manager import http_base
+
+    url = f"{http_base(server.get('host'), int(server.get('port') or 0))}/metrics"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            text = response.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    raw = parse_prometheus_text(text)
+    mapped = {ours: raw[theirs] for theirs, ours in SERVER_METRIC_NAMES.items() if theirs in raw}
+    return mapped or None
+
+
+class _RateTracker:
+    """Turns cumulative token counters into rates between consecutive snapshots."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[str, tuple[float, dict[str, float]]] = {}
+
+    def rates(self, server_id: str, now: float, counters: dict[str, float]) -> dict[str, float | None]:
+        with self._lock:
+            previous = self._last.get(server_id)
+            self._last[server_id] = (now, counters)
+        out: dict[str, float | None] = {"tokens_per_second": None, "prompt_tokens_per_second": None, "throughput_tokens_per_second": None}
+        if not previous:
+            return out
+        then, old = previous
+        delta = {k: counters[k] - old[k] for k in counters if k in old}
+        if any(v < 0 for v in delta.values()):
+            return out  # the server restarted and its counters reset
+        # Speed while working: tokens over the time the server spent on them, so
+        # an idle gap doesn't dilute it. Idle means no reading, not zero.
+        for tokens, seconds, key in (
+            ("tokens_generated_total", "generation_seconds_total", "tokens_per_second"),
+            ("prompt_tokens_total", "prompt_seconds_total", "prompt_tokens_per_second"),
+        ):
+            if delta.get(seconds, 0) > 0 and tokens in delta:
+                out[key] = round(delta[tokens] / delta[seconds], 2)
+        wall = now - then
+        if wall > 0 and "tokens_generated_total" in delta:
+            out["throughput_tokens_per_second"] = round(delta["tokens_generated_total"] / wall, 2)
+            if out["tokens_per_second"] is None and "generation_seconds_total" not in counters and delta["tokens_generated_total"] > 0:
+                # No time counter (vLLM-style metrics): wall-clock rate is the best available.
+                out["tokens_per_second"] = out["throughput_tokens_per_second"]
+        return out
+
+    def forget_except(self, server_ids: set[str]) -> None:
+        with self._lock:
+            for key in [k for k in self._last if k not in server_ids]:
+                del self._last[key]
+
+
+_rates = _RateTracker()
+
+
+def inference_stats(server: dict[str, Any], now: float) -> dict[str, Any]:
+    """Request and token readings for one live server; empty when it exposes none."""
+    counters = fetch_server_metrics(server)
+    if counters is None:
+        return {"metrics_available": False}
+    stats: dict[str, Any] = {"metrics_available": True}
+    for key in ("requests_active", "requests_deferred", "prompt_tokens_total", "tokens_generated_total"):
+        if key in counters:
+            stats[key] = int(counters[key])
+    if "kv_cache_usage_ratio" in counters:
+        stats["kv_cache_usage_percent"] = round(100 * counters["kv_cache_usage_ratio"], 1)
+    stats.update(_rates.rates(str(server.get("id")), now, counters))
+    return stats
+
+
+def latest_benchmarks() -> list[dict[str, Any]]:
+    """The most recent benchmark per profile."""
+    from .benchmark import load_benchmark_results
+
+    latest: dict[str, dict[str, Any]] = {}
+    for result in load_benchmark_results():
+        mode = result.get("mode")
+        if mode and str(result.get("created_at") or "") >= str(latest.get(mode, {}).get("created_at") or ""):
+            latest[mode] = result
+    return [
+        {
+            "profile": mode,
+            "tokens_per_second": r.get("tokens_per_second"),
+            "completion_tokens": r.get("completion_tokens"),
+            "elapsed_seconds": r.get("elapsed_seconds"),
+            "created_at": r.get("created_at"),
+        }
+        for mode, r in sorted(latest.items())
+    ]
+
+
 def _server_entry(server: dict[str, Any], now: float, gpu_by_pid: dict[int, int]) -> dict[str, Any]:
     started, ready = _parse_iso(server.get("started_at")), _parse_iso(server.get("ready_at"))
     running = bool(server.get("running")) and server.get("status") not in ("parked", "restoring")
@@ -270,6 +405,9 @@ def _server_entry(server: dict[str, Any], now: float, gpu_by_pid: dict[int, int]
         "gpu_memory_bytes": gpu_by_pid.get(int(pid)) if pid else None,
     }
     entry.update(process_stats(pid) if running else {})
+    # A paused (SIGSTOPped) server can't answer; asking would only wait out the timeout.
+    if running and not entry["suspended"] and server.get("port"):
+        entry.update(inference_stats(server, now))
     return entry
 
 
@@ -289,6 +427,7 @@ def collect_snapshot(list_servers: Callable[[], list[dict[str, Any]]] | None = N
     now = time.time()
     gpus, gpu_by_pid = _safe(nvidia_gpu_samples, ([], {}))
     servers = _safe(list_servers, [])
+    _rates.forget_except({str(s.get("id")) for s in servers})
     return {
         "version": 1,
         "timestamp": _now_iso(),
@@ -300,6 +439,7 @@ def collect_snapshot(list_servers: Callable[[], list[dict[str, Any]]] | None = N
         },
         "gpus": gpus,
         "servers": [_safe(lambda s=s: _server_entry(s, now, gpu_by_pid), {"server_id": s.get("id")}) for s in servers],
+        "benchmarks": _safe(latest_benchmarks, []),
         "lifecycle": {"counters": REGISTRY.counters(), "recent_events": REGISTRY.recent_events()},
     }
 
@@ -386,6 +526,16 @@ def render_prometheus(snap: dict[str, Any]) -> str:
         out.add("inferencedeck_server_resident_memory_bytes", "gauge", "Server process resident memory.", server.get("rss_bytes"), labels)
         out.add("inferencedeck_server_cpu_seconds_total", "counter", "Server process CPU time.", server.get("cpu_seconds"), labels)
         out.add("inferencedeck_server_gpu_memory_bytes", "gauge", "GPU memory held by the server process.", server.get("gpu_memory_bytes"), labels)
+        out.add("inferencedeck_server_requests_active", "gauge", "Requests the server is processing.", server.get("requests_active"), labels)
+        out.add("inferencedeck_server_requests_deferred", "gauge", "Requests waiting for a free slot.", server.get("requests_deferred"), labels)
+        out.add("inferencedeck_server_prompt_tokens_total", "counter", "Prompt tokens processed since the server started.", server.get("prompt_tokens_total"), labels)
+        out.add("inferencedeck_server_generated_tokens_total", "counter", "Tokens generated since the server started.", server.get("tokens_generated_total"), labels)
+        out.add("inferencedeck_server_generation_tokens_per_second", "gauge", "Generation speed while generating, since the previous reading.", server.get("tokens_per_second"), labels)
+        out.add("inferencedeck_server_prompt_tokens_per_second", "gauge", "Prompt processing speed while processing, since the previous reading.", server.get("prompt_tokens_per_second"), labels)
+        out.add("inferencedeck_server_kv_cache_usage_ratio", "gauge", "Share of the KV cache in use.", None if server.get("kv_cache_usage_percent") is None else server["kv_cache_usage_percent"] / 100, labels)
+
+    for bench in snap.get("benchmarks") or []:
+        out.add("inferencedeck_benchmark_tokens_per_second", "gauge", "Generation speed from the profile's most recent benchmark.", bench.get("tokens_per_second"), {"profile": bench.get("profile")})
 
     for counter in (snap.get("lifecycle") or {}).get("counters") or []:
         out.add(
