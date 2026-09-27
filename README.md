@@ -49,10 +49,19 @@ Environment variables:
 - `INFERENCEDECK_USER` — login name, default `admin`.
 - `INFERENCEDECK_TOKEN` — shared password/token.
 - `INFERENCEDECK_TOKEN_FILE` — file containing the shared password/token.
+- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated addresses of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes); behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. The header is ignored from any other address, so clients can't use it to dodge the throttle.
 
-Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie. Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
+Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie (also `Secure` when served over HTTPS). Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
 
 Do not bind the web/control service to a LAN or tailnet address without setting a token; InferenceDeck will fail closed rather than expose unauthenticated process controls.
+
+Over plain HTTP the token and session cookie cross the network unencrypted. For a LAN bind, serve HTTPS (a tailnet already encrypts traffic between its devices):
+
+```bash
+inferencedeck-web --host 0.0.0.0 --certfile cert.pem --keyfile key.pem
+```
+
+The trays verify the certificate, so use one they trust (for example a Tailscale or internal-CA certificate) and point `INFERENCEDECK_URL` at `https://`.
 
 ### Deliberately not owned
 
