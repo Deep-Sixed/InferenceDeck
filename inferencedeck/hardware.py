@@ -858,8 +858,12 @@ def detect_system_hardware() -> dict[str, Any]:
     if memory.get("total_bytes") is None:
         warnings.append("System memory size could not be detected on this platform.")
 
+    from .cpu_features import detect_cpu_features
+
+    cpu = detect_cpu()
+    cpu["isa"] = detect_cpu_features().to_dict()
     return {
-        "cpu": detect_cpu(),
+        "cpu": cpu,
         "memory": memory,
         "gpus": gpus,
         "primary_gpu": primary_gpu,

@@ -21,6 +21,9 @@ class AppConfig:
     default_backend: str = "llama.cpp"
     runtime_dirs: list[str] = field(default_factory=list)
     llama_server_path: str = ""
+    # "auto" picks the best llama.cpp build this CPU can run; a runtime id
+    # (e.g. "standard", "cuda-avx1") or path pins one, if it is compatible.
+    llama_runtime: str = "auto"
     llama_fit_params_path: str = ""
     extra_llama_args: list[str] = field(default_factory=list)
     update_channel: str = "stable"
