@@ -360,7 +360,7 @@ The Anthropic API's `thinking` setting is dropped, and its server tools (such as
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
-The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
+The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like the control API, and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle.
 
 ## Development
 
