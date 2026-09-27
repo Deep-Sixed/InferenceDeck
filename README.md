@@ -206,6 +206,35 @@ inferencedeck-web --host 0.0.0.0 --port 8716
 
 The example above is illustrative; do not commit the token to the repository or a config file.
 
+### Telemetry
+
+The control process collects telemetry locally and never sends it anywhere. Two
+endpoints serve it, behind the same authentication as the rest of the API:
+
+| Endpoint | Format | Contents |
+|---|---|---|
+| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; lifecycle counters and the most recent lifecycle events |
+| `GET /metrics` | Prometheus text | The same readings as `inferencedeck_*` metrics, one series per profile |
+
+Lifecycle events are `server.started`, `server.ready`, `server.start_failed`,
+`server.stopped`, `server.stop_failed`, `server.suspended`, `server.resumed`,
+`server.released` and `server.restored`. Their counters live in memory and reset
+when the control process restarts, as Prometheus counters do. Readings are cached
+for two seconds so a UI poll and a scrape share one `nvidia-smi` call. GPU readings
+need `nvidia-smi`, and per-process memory and CPU time need Linux `/proc`. On other
+platforms those fields are left out. They are never reported as zero.
+
+Scrape it with Prometheus (the token goes in a bearer header, which Prometheus sends natively):
+
+```yaml
+scrape_configs:
+  - job_name: inferencedeck
+    static_configs:
+      - targets: ["127.0.0.1:8716"]
+    authorization:
+      credentials_file: /etc/prometheus/inferencedeck-token   # omit when auth is off
+```
+
 ## Development
 
 ```bash

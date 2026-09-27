@@ -17,6 +17,7 @@ from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState
 from .control import ControlPlane
 
 MAX_BODY_BYTES = 1024 * 1024
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
@@ -65,7 +66,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         if wait:
             self._throttled(wait)
             return False
-        if self.headers.get("X-Auth-Token"):
+        if self.headers.get("X-Auth-Token") or self.headers.get("Authorization"):
             if self.auth_state.supplied_token_ok(self.headers):
                 return True
             # A wrong token is a failed guess, same as a wrong login password.
@@ -91,6 +92,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
+
+    def _text(self, status: int, body: str, content_type: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _body(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length", "0")
@@ -139,6 +149,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/runtime":
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
+            elif parsed.path == "/api/telemetry":
+                self._json(HTTPStatus.OK, self.control_plane.telemetry())
+            elif parsed.path == "/metrics":
+                self._text(HTTPStatus.OK, self.control_plane.metrics(), PROMETHEUS_CONTENT_TYPE)
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:

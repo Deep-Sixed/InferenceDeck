@@ -12,6 +12,7 @@ from .hardware import detect_system_hardware
 from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
+from .telemetry import render_prometheus, snapshot as telemetry_snapshot
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
     CONTEXT_PRESETS,
@@ -77,6 +78,14 @@ class ControlPlane:
 
     def hardware(self) -> dict[str, Any]:
         return detect_system_hardware()
+
+    def telemetry(self) -> dict[str, Any]:
+        """Live system, GPU and per-server readings plus lifecycle counters. Collected locally; never sent anywhere."""
+        return telemetry_snapshot()
+
+    def metrics(self) -> str:
+        """The telemetry snapshot in Prometheus text exposition format."""
+        return render_prometheus(telemetry_snapshot())
 
     def fit(self, mode: str, overrides: dict[str, Any] | None = None, *, target_mib: int = 1024) -> dict[str, Any]:
         return run_fit_test(
