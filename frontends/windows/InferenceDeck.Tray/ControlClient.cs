@@ -15,6 +15,7 @@ internal sealed record ServerState(
     int? Port);
 
 internal sealed record ProfileState(string Mode, string Name, bool Launchable, string? ModelName);
+internal sealed record RemoteState(string Name, string DisplayName, string Provider, string Lane, bool Enabled, bool Selectable, string ApiKeyEnv);
 
 internal sealed class ControlClient
 {
@@ -23,6 +24,8 @@ internal sealed class ControlClient
     public ControlClient(string baseUrl)
     {
         _http = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"), Timeout = TimeSpan.FromSeconds(5) };
+        var token = Environment.GetEnvironmentVariable("INFERENCEDECK_TOKEN");
+        if (!string.IsNullOrWhiteSpace(token)) _http.DefaultRequestHeaders.Add("X-Auth-Token", token);
     }
 
     public async Task<IReadOnlyList<ServerState>> GetServersAsync()
@@ -53,6 +56,19 @@ internal sealed class ControlClient
         }
         return values;
     }
+
+    public async Task<IReadOnlyList<RemoteState>> GetRemotesAsync()
+    {
+        using var doc = await GetJsonAsync("api/remotes");
+        var values = new List<RemoteState>();
+        if (!doc.RootElement.TryGetProperty("endpoints", out var endpoints)) return values;
+        foreach (var item in endpoints.EnumerateArray())
+            values.Add(new RemoteState(Text(item,"name"), Text(item,"display_name"), Text(item,"provider"), Text(item,"lane"), Bool(item,"enabled"), Bool(item,"selectable"), Text(item,"api_key_env")));
+        return values;
+    }
+
+    public Task<JsonDocument> EnableRemoteAsync(string name) => PostAsync("api/remote", new { action = "enable", name });
+    public Task<JsonDocument> DisableRemotesAsync() => PostAsync("api/remote", new { action = "disable" });
 
     public Task<JsonDocument> StartAsync(string mode) => PostAsync("api/start", new { mode });
     public Task<JsonDocument> StopAsync(string serverId) => PostAsync("api/stop", new { server_id = serverId });

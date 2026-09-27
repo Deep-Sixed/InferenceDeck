@@ -85,6 +85,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.hardware())
             elif parsed.path == "/api/benchmarks":
                 self._json(HTTPStatus.OK, {"benchmarks": self.control_plane.benchmark_history()})
+            elif parsed.path == "/api/remotes":
+                self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -146,6 +148,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     body.get("overrides"),
                     completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
                 )
+            elif parsed.path == "/api/remote":
+                action = str(body.get("action") or "")
+                if action == "enable":
+                    payload = self.control_plane.enable_remote(str(body.get("name") or ""))
+                elif action == "disable":
+                    payload = self.control_plane.disable_remotes()
+                else:
+                    payload = {"success": False, "error": "action must be enable or disable"}
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "not found"})
                 return

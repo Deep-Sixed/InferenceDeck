@@ -10,6 +10,7 @@ from .fit import run_fit_test
 from .hardware import detect_system_hardware
 from .inventory import build_inventory
 from .profile_resolver import resolve_profiles
+from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
     list_servers,
     prepare_launch_command,
@@ -40,10 +41,12 @@ class ControlPlane:
     def status(self) -> dict[str, Any]:
         servers = list_servers()
         running = [server for server in servers if server.get("running")]
+        remote = active_endpoint()
         return {
             "version": 1,
             "running_count": len(running),
             "servers": servers,
+            "remote_active": remote.to_dict() if remote else None,
             "capabilities": {
                 "start": True,
                 "stop": True,
@@ -86,6 +89,22 @@ class ControlPlane:
     def benchmark_history(self) -> list[dict[str, Any]]:
         return load_benchmark_results()
 
+    def remote_endpoints(self) -> dict[str, Any]:
+        endpoints = list_endpoints()
+        active = next((cfg for cfg in endpoints if cfg.enabled), None)
+        return {
+            "active": active.to_dict() if active else None,
+            "endpoints": [cfg.to_dict() for cfg in endpoints],
+        }
+
+    def enable_remote(self, name: str) -> dict[str, Any]:
+        cfg = enable_endpoint(name)
+        return {"success": True, "active": cfg.to_dict()}
+
+    def disable_remotes(self) -> dict[str, Any]:
+        disable_all()
+        return {"success": True, "active": None}
+
     def prepare(self, mode: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         return prepare_launch_command(
             mode,
@@ -96,6 +115,13 @@ class ControlPlane:
         )
 
     def start(self, mode: str, overrides: dict[str, Any] | None = None, *, stop_existing: bool = False) -> dict[str, Any]:
+        remote = active_endpoint()
+        if remote is not None:
+            return {
+                "success": False,
+                "error": f"Remote endpoint '{remote.display_name}' is active; disable it before starting a local profile.",
+                "remote": remote.to_dict(),
+            }
         return start_profile(
             mode,
             project_root=self.project_root,
