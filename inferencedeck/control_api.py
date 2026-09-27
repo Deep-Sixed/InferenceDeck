@@ -193,6 +193,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return
             if not self._require_auth():
                 return
+            # Only for start/restore/restart: what to do when the new server would not
+            # fit in GPU memory next to the running ones (see gpu_budget.py).
+            vram_flags = {key: True for key in ("release_conflicts", "force") if body.get(key) is True}
             if parsed.path == "/api/prepare":
                 mode = str(body.get("mode") or "")
                 payload = self.control_plane.prepare(mode, validate_overrides(body.get("overrides")))
@@ -202,7 +205,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     mode,
                     validate_overrides(body.get("overrides")),
                     stop_existing=bool(body.get("stop_existing", False)),
+                    **vram_flags,
                 )
+            elif parsed.path == "/api/plan":
+                payload = self.control_plane.plan(str(body.get("mode") or ""), validate_overrides(body.get("overrides")))
             elif parsed.path == "/api/stop":
                 payload = self.control_plane.stop(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/suspend":
@@ -218,7 +224,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     # the saved spec is reused as it was.
                     extra = validate_overrides({"ctx_size": body["ctx_size"]}) if body.get("ctx_size") is not None else None
                     action = self.control_plane.restore if parsed.path == "/api/restore" else self.control_plane.restart
-                    payload = action(server_id, extra)
+                    payload = action(server_id, extra, **vram_flags)
             elif parsed.path == "/api/idle":
                 server_id = str(body.get("server_id") or "")
                 if not server_id:
@@ -254,7 +260,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "not found"})
                 return
-            code = HTTPStatus.OK if payload.get("success", True) else HTTPStatus.BAD_REQUEST
+            if payload.get("success", True):
+                code = HTTPStatus.OK
+            elif payload.get("reason") == "vram_conflict":
+                code = HTTPStatus.CONFLICT
+            else:
+                code = HTTPStatus.BAD_REQUEST
             self._json(code, payload)
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})

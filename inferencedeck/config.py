@@ -38,6 +38,10 @@ class AppConfig:
     # many seconds without requests; 0 turns it off. A profile param or launch
     # override named idle_release_seconds sets it for one server.
     idle_release_seconds: int = 0
+    # Starting a server that fits the GPU on its own but not next to the ones
+    # already running: "block" refuses (unless told to release them or forced),
+    # "warn" starts with a warning, "off" skips the check. See gpu_budget.py.
+    concurrent_vram_check: str = "block"
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

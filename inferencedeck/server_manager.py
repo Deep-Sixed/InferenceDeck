@@ -16,6 +16,8 @@ from typing import Any
 
 from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
 from .config import AppConfig
+from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
+from .hardware import detect_system_hardware
 from .llama_args import LaunchCommand, build_llama_server_args
 from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
@@ -661,6 +663,32 @@ def _prepare_vllm_cpp(
     }
 
 
+def _vram_plan(prepared: dict[str, Any], exclude: set[str]) -> dict[str, Any]:
+    """How the prepared launch fits next to the tracked servers (see gpu_budget)."""
+
+    model = (prepared.get("profile") or {}).get("model")
+    need = estimate_server_vram_mib(prepared.get("params") or {}, model)
+    hardware = detect_system_hardware()
+    return plan_start(need, hardware, list_servers(), live_free=live_free_mib(hardware), exclude=exclude)
+
+
+def plan_launch(
+    mode: str,
+    project_root: str | Path | None = None,
+    model_dirs: list[str | Path] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Would starting ``mode`` now fit in GPU memory? Changes nothing."""
+
+    prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
+    if not prepared.get("success"):
+        return prepared
+    if prepared.get("runtime", "llama.cpp") != "llama.cpp":
+        return {"success": True, "vram_plan": {"status": "unknown", "message": "Only llama.cpp launches are checked."}}
+    same_mode = {str(s.get("id")) for s in list_servers() if s.get("mode") == mode}
+    return {"success": True, "vram_plan": _vram_plan(prepared, same_mode)}
+
+
 def start_profile(
     mode: str,
     project_root: str | Path | None = None,
@@ -669,7 +697,18 @@ def start_profile(
     stop_existing: bool = False,
     wait_ready: bool = True,
     ready_timeout_seconds: int | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
+    """Start ``mode``'s server.
+
+    If it would fit in GPU memory on its own but not next to the servers
+    already running, it is refused (``AppConfig.concurrent_vram_check``) unless
+    ``release_conflicts`` releases those servers first or ``force`` starts it
+    anyway.
+    """
+
     prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
     if not prepared.get("success"):
         return prepared
@@ -677,13 +716,43 @@ def start_profile(
         ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", DEFAULT_READY_TIMEOUT_SECONDS)
 
     existing = _find_server(mode=mode)
+    if existing and existing.get("running") and not stop_existing:
+        return {
+            "success": False,
+            "error": f"Profile '{mode}' already has a tracked running server.",
+            "server": existing,
+        }
+
+    vram_plan: dict[str, Any] | None = None
+    check_mode = str(AppConfig.load().concurrent_vram_check or "block").lower()
+    if check_mode != "off" and prepared.get("runtime", "llama.cpp") == "llama.cpp":
+        # A server of this mode that stop_existing replaces frees its memory first.
+        replaced = {str(s.get("id")) for s in list_servers() if s.get("mode") == mode} if stop_existing else set()
+        vram_plan = _vram_plan(prepared, replaced)
+        status = vram_plan.get("status")
+        if status == "conflict" and not force:
+            if release_conflicts:
+                for server_id in vram_plan["release"]:
+                    released = release_gpu(server_id=server_id)
+                    if not released.get("success"):
+                        return {
+                            "success": False,
+                            "error": f"Could not release {server_id} to make room: {released.get('error')}",
+                            "vram_plan": vram_plan,
+                        }
+                vram_plan["released"] = list(vram_plan["release"])
+            elif check_mode == "block":
+                return {
+                    "success": False,
+                    "error": vram_plan["message"],
+                    "reason": "vram_conflict",
+                    "vram_plan": vram_plan,
+                }
+        if status in ("tight", "too_big") or (status == "conflict" and (force or check_mode == "warn")):
+            prepared["warnings"] = list(prepared.get("warnings") or []) + [vram_plan["message"]]
+        prepared["warnings"] = list(prepared.get("warnings") or []) + list(vram_plan.get("warnings") or [])
+
     if existing and existing.get("running"):
-        if not stop_existing:
-            return {
-                "success": False,
-                "error": f"Profile '{mode}' already has a tracked running server.",
-                "server": existing,
-            }
         stop_result = stop_server(mode=mode)
         if not stop_result.get("success"):
             return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
@@ -745,6 +814,8 @@ def start_profile(
         "idle_release_seconds": params.get("idle_release_seconds"),
         # Sampling/template defaults baked into the launch flags; requests may override them.
         "request_defaults": prepared.get("request_defaults"),
+        # What gpu_budget counts for this server when the next one starts.
+        "estimated_vram_mib": (vram_plan or {}).get("need_mib"),
     }
     _upsert_server(server)
     app_config = AppConfig.load()
@@ -773,7 +844,7 @@ def start_profile(
                 "stderr_tail": tail_file(stderr_path),
             }
 
-    return {"success": True, "server": _find_server(server_id), "prepared": prepared}
+    return {"success": True, "server": _find_server(server_id), "prepared": prepared, "vram_plan": vram_plan}
 
 
 def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
@@ -844,8 +915,14 @@ def restore_server(
     overrides: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
     model_dirs: list[str | Path] | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Start a parked server again from its saved spec, optionally with changed overrides."""
+    """Start a parked server again from its saved spec, optionally with changed overrides.
+
+    ``release_conflicts`` and ``force`` are passed to start_profile's GPU memory check.
+    """
 
     claimed: dict[str, Any] = {}
 
@@ -868,6 +945,8 @@ def restore_server(
         project_root=project_root,
         model_dirs=model_dirs,
         overrides=merged or None,
+        release_conflicts=release_conflicts,
+        force=force,
     )
     started = result.get("server") or {}
     if result.get("success") or started.get("running"):
@@ -883,6 +962,9 @@ def restart_server(
     overrides: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
     model_dirs: list[str | Path] | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Reload & restart: stop, then start the same profile with optional changed overrides.
 
@@ -896,7 +978,10 @@ def restart_server(
         released = release_gpu(server_id=server_id)
         if not released.get("success"):
             return released
-    return restore_server(server_id, overrides, project_root=project_root, model_dirs=model_dirs)
+    return restore_server(
+        server_id, overrides, project_root=project_root, model_dirs=model_dirs,
+        release_conflicts=release_conflicts, force=force,
+    )
 
 
 def server_logs(server_id: str, lines: int = 200) -> dict[str, Any]:

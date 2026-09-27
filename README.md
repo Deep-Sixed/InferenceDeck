@@ -105,7 +105,7 @@ and `--no-manifest`.
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
-`extra_vllm_cpp_args`, `default_host`, `default_port` and `idle_release_seconds` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_vllm_cpp_args`, `default_host`, `default_port`, `idle_release_seconds` and `concurrent_vram_check` (see `inferencedeck/config.py` for the full list and defaults).
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -209,6 +209,29 @@ llama-server `/slots` every 15 seconds. A slot that is processing, or one that t
 new task since the last poll, counts as activity. A server whose `/slots` cannot be
 read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
 which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
+
+### Starting a server next to running ones
+
+Before a llama.cpp server starts (Start, Restore, Reload & restart, Benchmark), InferenceDeck
+checks that it fits in GPU memory next to the servers already running. It estimates the new
+server's VRAM with the same estimator as the fit badges, and compares it with:
+
+- **free VRAM right now**, from `nvidia-smi` (or available memory on Apple silicon), which
+  already counts running servers; or, when that isn't available,
+- **total VRAM minus the estimates of the tracked servers that are running** (paused ones
+  included, since they keep their VRAM; released ones are not counted).
+
+If the model would fit on its own but not alongside what is running, the start is refused
+(HTTP 409, `"reason": "vram_conflict"`) with a `vram_plan` naming the fewest servers to
+release, biggest first. The web UI then offers to release them and continue (Restore brings
+them back) or to start anyway. Over the API, send `"release_conflicts": true` or
+`"force": true` with `/api/start`, `/api/restore` or `/api/restart`. `POST /api/plan` with a
+`mode` reports the plan without starting anything.
+
+A tight fit, or a model too big for the GPU even alone, starts with a warning as before;
+the Fit tools are the place to shrink it. Set `concurrent_vram_check` in the app config to
+`"warn"` to never refuse, or `"off"` to skip the check. Only the primary GPU is checked, and
+vllm.cpp launches are not checked.
 
 ### Request defaults and sampling presets
 

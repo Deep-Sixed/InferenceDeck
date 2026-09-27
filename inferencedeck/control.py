@@ -17,6 +17,7 @@ from .sampling import sampling_presets
 from .server_manager import (
     CONTEXT_PRESETS,
     list_servers,
+    plan_launch,
     prepare_launch_command,
     release_gpu,
     restart_server,
@@ -162,7 +163,15 @@ class ControlPlane:
             "remote": remote.to_dict(),
         }
 
-    def start(self, mode: str, overrides: dict[str, Any] | None = None, *, stop_existing: bool = False) -> dict[str, Any]:
+    def start(
+        self,
+        mode: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        stop_existing: bool = False,
+        release_conflicts: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
@@ -172,7 +181,12 @@ class ControlPlane:
             model_dirs=self.model_dirs,
             overrides=overrides,
             stop_existing=stop_existing,
+            release_conflicts=release_conflicts,
+            force=force,
         )
+
+    def plan(self, mode: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        return plan_launch(mode, project_root=self.project_root, model_dirs=self.model_dirs, overrides=overrides)
 
     def stop(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
         return stop_server(server_id=server_id, mode=mode)
@@ -186,17 +200,27 @@ class ControlPlane:
     def release_gpu(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
         return release_gpu(server_id=server_id, mode=mode)
 
-    def restore(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    def restore(
+        self, server_id: str, overrides: dict[str, Any] | None = None, *, release_conflicts: bool = False, force: bool = False
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
-        return restore_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+        return restore_server(
+            server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs,
+            release_conflicts=release_conflicts, force=force,
+        )
 
-    def restart(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    def restart(
+        self, server_id: str, overrides: dict[str, Any] | None = None, *, release_conflicts: bool = False, force: bool = False
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
-        return restart_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+        return restart_server(
+            server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs,
+            release_conflicts=release_conflicts, force=force,
+        )
 
     def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
         return set_idle_release(server_id, seconds)
