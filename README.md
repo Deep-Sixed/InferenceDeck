@@ -211,6 +211,32 @@ new task since the last poll, counts as activity. A server whose `/slots` cannot
 read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
 which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
 
+### Model capabilities
+
+Profiles (`GET /api/profiles`) and tracked servers carry a `capabilities` object:
+`input` (`text`, `image`, `audio`), `output` (`text`, `embedding` or `score`), `tools`,
+`embedding`, `reranker` and `context_max` (the context the model was trained for), with
+`sources` saying where each came from. Filter profiles with
+`GET /api/profiles?capability=tools` (or `image`, `audio`, `embedding`, `reranker`).
+
+- **GGUF header** (read once and cached, never while listing): a tool-calling chat
+  template, the trained context length, and the pooling type, which marks embedding
+  and reranking models. Until a model has been started or fitted once, the profile list
+  shows these as unknown.
+- **The launch:** image/audio input only when a projector is passed. Set
+  `"vision": true` on the profile (or as a launch override) to pass the `mmproj-*.gguf`
+  found next to the model as `--mmproj`, or name one with `"mmproj"`. The web UI notes
+  when a projector is found but not enabled. The projector's size is included in the GPU
+  memory check. `"reranking": true` adds `--reranking` for reranker models (`"embedding":
+  true` already adds `--embedding`).
+- **The profile:** a `capabilities` object in the profile's params overrides any
+  field, e.g. `{"capabilities": {"tools": false, "context_max": 32768}}`.
+- **The running server:** once llama-server is ready, what its `/props` reports
+  (modalities, tool support, per-request context) replaces the guesses.
+
+Generated launch scripts now use the same launch params as Start, so they also pick up the
+profile's sampling preset and projector.
+
 ### Live logs
 
 Each tracked server has a **Logs** button in the web UI that opens a live view of its

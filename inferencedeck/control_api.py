@@ -211,7 +211,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/inventory":
                 self._json(HTTPStatus.OK, self.control_plane.inventory())
             elif parsed.path == "/api/profiles":
-                self._json(HTTPStatus.OK, {"profiles": self.control_plane.profiles()})
+                capability = (query.get("capability") or [""])[0]
+                try:
+                    profiles = self.control_plane.profiles(capability) if capability else self.control_plane.profiles()
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, {"profiles": profiles})
             elif parsed.path == "/api/hardware":
                 self._json(HTTPStatus.OK, self.control_plane.hardware())
             elif parsed.path == "/api/benchmarks":

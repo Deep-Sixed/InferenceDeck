@@ -42,6 +42,8 @@ ALLOWED_OVERRIDES: dict[str, tuple[str, float, float]] = {
     "repeat_last_n": ("int", -1, 1_000_000),
     # A sampling preset from sampling.py (or "none"); explicit overrides still win.
     "sampling_preset": ("preset", 0, 0),
+    # Pass the projector found next to the model (--mmproj) for image/audio input.
+    "vision": ("bool", 0, 0),
 }
 
 

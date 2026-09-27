@@ -22,6 +22,7 @@ The outcome is one of:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .estimates import estimate_memory_fit
@@ -40,7 +41,16 @@ def estimate_server_vram_mib(params: dict[str, Any], model: dict[str, Any] | Non
     except Exception:
         return None
     used = (estimate.get("estimated") or {}).get("accelerator_used_mib")
-    return int(used) if used is not None else None
+    if used is None:
+        return None
+    projector = str(params.get("mmproj") or "").strip()
+    if projector and used > 0:
+        # The vision/audio projector (--mmproj) is loaded onto the GPU as well.
+        try:
+            used += os.path.getsize(projector) // MIB
+        except OSError:
+            pass
+    return int(used)
 
 
 def live_free_mib(hardware: dict[str, Any]) -> int | None:

@@ -111,6 +111,17 @@ class LiveFreeTests(unittest.TestCase):
         cpu = gpu_budget.estimate_server_vram_mib({"gpu_layers": 0, "ctx_size": 8192}, model)
         self.assertGreater(full, 8000)
         self.assertEqual(cpu, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            projector = Path(tmp) / "mmproj.gguf"
+            projector.write_bytes(b"\0" * (3 * 1024 * 1024))
+            with_projector = gpu_budget.estimate_server_vram_mib(
+                {"gpu_layers": 999, "ctx_size": 8192, "mmproj": str(projector)}, model
+            )
+            cpu_with_projector = gpu_budget.estimate_server_vram_mib(
+                {"gpu_layers": 0, "ctx_size": 8192, "mmproj": str(projector)}, model
+            )
+        self.assertEqual(with_projector, full + 3)
+        self.assertEqual(cpu_with_projector, 0)
 
 
 class StartProfileVramTests(unittest.TestCase):

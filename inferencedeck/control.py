@@ -6,6 +6,7 @@ from typing import Any
 
 from .backends import detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
+from .capabilities import filter_profiles, profile_capabilities
 from .config import AppConfig
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
@@ -79,8 +80,15 @@ class ControlPlane:
     def inventory(self) -> dict[str, Any]:
         return build_inventory(project_root=self.project_root, model_dirs=self.model_dirs)
 
-    def profiles(self) -> list[dict[str, Any]]:
-        return [profile.to_dict() for profile in resolve_profiles(self.project_root, self.model_dirs)]
+    def profiles(self, capability: str | None = None) -> list[dict[str, Any]]:
+        """Resolved profiles with their capabilities; ``capability`` filters (see capabilities.QUERIES)."""
+        profiles = []
+        for resolved in resolve_profiles(self.project_root, self.model_dirs):
+            item = resolved.to_dict()
+            # Cache-only: listing profiles must never block on reading GGUF headers.
+            item["capabilities"] = profile_capabilities(resolved.model, resolved.params, probe=False)
+            profiles.append(item)
+        return filter_profiles(profiles, capability) if capability else profiles
 
     def hardware(self) -> dict[str, Any]:
         return detect_system_hardware()

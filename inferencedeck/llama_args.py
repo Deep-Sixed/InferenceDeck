@@ -145,6 +145,12 @@ def build_llama_server_args(
         args.append("--no-mmap")
     if params.get("embedding", False):
         args.append("--embedding")
+    if params.get("reranking", False):
+        args.append("--reranking")
+    # Multimodal projector: without it llama-server cannot take image/audio input.
+    mmproj = str(params.get("mmproj") or "").strip()
+    if mmproj:
+        args.extend(["--mmproj", mmproj])
 
     draft_model = str(params.get("draft_model", "")).strip()
     spec_type = str(params.get("spec_type", "")).strip()

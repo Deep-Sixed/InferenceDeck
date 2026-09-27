@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
+from .capabilities import profile_capabilities, resolve_projector, with_served
 from .config import AppConfig
 from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
 from .hardware import detect_system_hardware
@@ -604,6 +605,10 @@ def prepare_launch_command(
         }
 
     params, preset_warnings = layer_sampling_preset(dict(resolved.params), overrides)
+    projector, projector_warnings = resolve_projector(resolved.model, params)
+    if projector:
+        params["mmproj"] = projector
+    preset_warnings = preset_warnings + projector_warnings
     params.setdefault("host", app_config.default_host)
     params.setdefault("port", app_config.default_port)
 
@@ -646,6 +651,7 @@ def prepare_launch_command(
         "command": command.to_dict(),
         "params": params,
         "request_defaults": request_defaults(params),
+        "capabilities": profile_capabilities(resolved.model, params, probe=True),
         "warnings": warnings,
     }
 
@@ -669,6 +675,7 @@ def _prepare_vllm_cpp(
         "environment": env.to_dict(),
         "command": command.to_dict(),
         "params": params,
+        "capabilities": profile_capabilities(resolved.model, params, probe=True),
         "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
     }
 
@@ -826,6 +833,8 @@ def start_profile(
         "request_defaults": prepared.get("request_defaults"),
         # What gpu_budget counts for this server when the next one starts.
         "estimated_vram_mib": (vram_plan or {}).get("need_mib"),
+        # What the model can do; /props refines it once the server is ready.
+        "capabilities": prepared.get("capabilities"),
     }
     _upsert_server(server)
     app_config = AppConfig.load()
@@ -841,7 +850,7 @@ def start_profile(
         if ready:
             caps = probe_capabilities(server["host"], server["port"])
             if caps:
-                patch["capabilities"] = caps
+                patch["capabilities"] = with_served(server.get("capabilities"), caps)
                 extra = _capability_warnings(caps, server.get("ctx_size"))
                 if extra:
                     patch["warnings"] = list(server["warnings"]) + extra
