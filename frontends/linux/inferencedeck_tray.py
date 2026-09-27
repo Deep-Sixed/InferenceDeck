@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -20,17 +21,47 @@ from gi.repository import GLib, Gtk, Notify  # noqa: E402
 
 # inferencedeck-web serves both the API and the UI; it is the one process that owns server state.
 BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("/")
-TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 SYNC_SECONDS = 5
-# start waits for the model to load before replying: up to 180 s server-side
-# for vllm.cpp (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
+# After a 401, sync less and less often (60 s doubling to 10 min): a stale token
+# then makes at most 3 failed attempts in the server's 5-minute window and never
+# trips the lockout that would also block the browser on this machine.
+AUTH_RETRY_SECONDS = 60
+AUTH_RETRY_MAX_SECONDS = 600
+# start waits for the model to load before replying: up to 600 s server-side
+# for MLC LLM (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
 # for finding and launching the runtime.
-START_TIMEOUT_SECONDS = 240
+START_TIMEOUT_SECONDS = 660
 # stop allows 5 s for a clean exit plus 3 s after SIGKILL server-side.
 STOP_TIMEOUT_SECONDS = 20
 # restart stops and then starts, so it can take both.
 RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
+# Update checks detect every runtime and may ask GitHub about each one (the
+# server caches answers for an hour): at startup and hourly, not every sync.
+UPDATE_CHECK_SECONDS = 3600
+UPDATE_TIMEOUT_SECONDS = 120
+
+
+class Unauthorized(RuntimeError):
+    """The control API rejected our token (or we have none)."""
+
+
+def configured_token() -> str:
+    """INFERENCEDECK_TOKEN, else INFERENCEDECK_TOKEN_FILE, as the server reads them.
+
+    Read per request, so a rotated token file is picked up without a restart.
+    """
+    direct = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
+    if direct:
+        return direct
+    token_file = os.environ.get("INFERENCEDECK_TOKEN_FILE", "").strip()
+    if not token_file:
+        return ""
+    try:
+        with open(os.path.expanduser(token_file), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 class ApiClient:
@@ -39,8 +70,9 @@ class ApiClient:
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if TOKEN:
-            headers["X-Auth-Token"] = TOKEN
+        token = configured_token()
+        if token:
+            headers["X-Auth-Token"] = token
         request = urllib.request.Request(
             BASE_URL + path,
             data=data,
@@ -51,6 +83,8 @@ class ApiClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise Unauthorized("unauthorized") from None
             # Surface the API's own error message instead of "HTTP Error 400".
             try:
                 payload = json.loads(exc.read().decode("utf-8"))
@@ -84,6 +118,9 @@ class ApiClient:
 
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self._request("/api/remote", {"action": action, "name": name})
+
+    def updates(self, refresh: bool = False) -> dict[str, Any]:
+        return self._request("/api/updates" + ("?refresh=1" if refresh else ""), timeout=UPDATE_TIMEOUT_SECONDS)
 
 
 def _is_parked(server: dict[str, Any]) -> bool:
@@ -120,6 +157,10 @@ class TrayApplication:
         self.context_item.set_submenu(context_menu)
         self.stop_item = Gtk.MenuItem(label="Stop server")
         self.command_item = Gtk.MenuItem(label="Show active command")
+        self.updates_item = Gtk.MenuItem(label="Runtime updates: checking…")
+        self.updates_menu = Gtk.Menu()
+        self.updates_item.set_submenu(self.updates_menu)
+        self.updates: dict[str, Any] | None = None
         self._syncing = False
 
         menu = Gtk.Menu()
@@ -131,6 +172,7 @@ class TrayApplication:
         web.connect("activate", lambda *_: self._open_web())
         menu.append(web)
         menu.append(self.command_item)
+        menu.append(self.updates_item)
         menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Exit tray")
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
@@ -146,6 +188,7 @@ class TrayApplication:
         self.command_item.connect("activate", lambda *_: self._show_command())
         self.profiles_menu.connect("show", self._populate_profiles)
         self.remotes_menu.connect("show", self._populate_remotes)
+        self.updates_menu.connect("show", self._populate_updates)
 
         self.indicator = AppIndicator.Indicator.new(
             "inferencedeck", "cpu", AppIndicator.IndicatorCategory.APPLICATION_STATUS
@@ -154,8 +197,12 @@ class TrayApplication:
         self.indicator.set_menu(menu)
         self.indicator.set_title("InferenceDeck")
         Notify.init("InferenceDeck")
+        self._auth_delay = 0
+        self._next_sync = 0.0
         GLib.timeout_add_seconds(SYNC_SECONDS, self._tick)
+        GLib.timeout_add_seconds(UPDATE_CHECK_SECONDS, self._update_tick)
         self.refresh()
+        self._check_updates()
 
     def _notify(self, message: str, error: bool = False) -> None:
         n = Notify.Notification.new("InferenceDeck", message, "cpu")
@@ -206,16 +253,24 @@ class TrayApplication:
             self.stop_item.set_sensitive(bool(self.active))
             self.command_item.set_sensitive(alive)
             self.profiles_item.set_sensitive(not self.remote_active)
+            self._auth_delay = 0
         except Exception as exc:
-            self.status_item.set_label("Control API unavailable")
-            self.indicator.set_title("InferenceDeck — API unavailable")
+            if isinstance(exc, Unauthorized):
+                self._auth_delay = min(self._auth_delay * 2, AUTH_RETRY_MAX_SECONDS) if self._auth_delay else AUTH_RETRY_SECONDS
+                self._next_sync = time.monotonic() + self._auth_delay
+                self.status_item.set_label("Not signed in — check INFERENCEDECK_TOKEN or INFERENCEDECK_TOKEN_FILE")
+                self.indicator.set_title("InferenceDeck — not signed in")
+            else:
+                self.status_item.set_label("Control API unavailable")
+                self.indicator.set_title("InferenceDeck — API unavailable")
             for item in [self.suspend_item, self.resume_item, self.release_item, self.restore_item,
                          self.restart_item, self.context_item, self.stop_item, self.command_item]:
                 item.set_sensitive(False)
             sys.stderr.write(f"inferencedeck tray refresh: {exc}\n")
 
     def _tick(self) -> bool:
-        self.refresh()
+        if time.monotonic() >= self._next_sync:  # backing off after a 401
+            self.refresh()
         return True
 
     def _clear(self, menu: Gtk.Menu) -> None:
@@ -244,7 +299,10 @@ class TrayApplication:
             endpoints = self.api.remotes().get("endpoints", [])
             for remote in endpoints:
                 suffix = " — active" if remote.get("enabled") else ("" if remote.get("selectable") else f" — set ${remote.get('api_key_env')}")
-                item = Gtk.CheckMenuItem(label=f"{remote.get('display_name') or remote.get('name')}{suffix}")
+                name = remote.get('display_name') or remote.get('name')
+                summary = remote.get('summary')
+                label = f"{name} ({summary})" if summary else f"{name}"
+                item = Gtk.CheckMenuItem(label=f"{label}{suffix}")
                 item.set_active(bool(remote.get("enabled")))
                 item.set_sensitive(bool(remote.get("enabled") or remote.get("selectable")))
                 item.connect("activate", self._toggle_remote, remote)
@@ -256,6 +314,64 @@ class TrayApplication:
         except Exception as exc:
             item = Gtk.MenuItem(label=str(exc)); item.set_sensitive(False); self.remotes_menu.append(item)
         self.remotes_menu.show_all()
+
+    def _update_tick(self) -> bool:
+        self._check_updates()
+        return True
+
+    def _check_updates(self, refresh: bool = False) -> None:
+        # Detection and GitHub calls take seconds; keep the GTK loop responsive.
+        def worker() -> None:
+            payload, error = None, ""
+            try:
+                payload = self.api.updates(refresh=refresh)
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(self._updates_done, payload, error, refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _updates_done(self, payload: dict[str, Any] | None, error: str, refresh: bool) -> bool:
+        if error:
+            self.updates_item.set_label("Runtime updates: check failed")
+            if refresh:
+                self._notify(f"Update check failed: {error}", True)
+            return False
+        self.updates = payload
+        available = [u for u in (payload or {}).get("updates") or [] if u.get("update_available")]
+        if available:
+            label = f"Runtime updates: {len(available)} available"
+        elif (payload or {}).get("updates"):
+            label = "Runtime updates: up to date"
+        else:
+            label = "Runtime updates: nothing to check"
+        self.updates_item.set_label(label)
+        if refresh:
+            self._notify(f"{len(available)} runtime update(s) available." if available else "All runtimes are up to date.")
+        return False
+
+    def _populate_updates(self, *_args) -> None:
+        self._clear(self.updates_menu)
+        for update in (self.updates or {}).get("updates") or []:
+            if not update.get("update_available"):
+                continue
+            url = str(update.get("release_url") or "")
+            item = Gtk.MenuItem(label=f"{update.get('runtime_name')} {update.get('current_version')} → {update.get('latest_version')}")
+            # Only ever open GitHub release pages from the tray.
+            item.set_sensitive(url.startswith("https://github.com/"))
+            item.connect("activate", self._open_url, url)
+            self.updates_menu.append(item)
+        self.updates_menu.append(Gtk.SeparatorMenuItem())
+        check = Gtk.MenuItem(label="Check now")
+        check.connect("activate", lambda *_: self._check_updates(refresh=True))
+        self.updates_menu.append(check)
+        self.updates_menu.show_all()
+
+    def _open_url(self, _widget, url: str) -> None:
+        try:
+            subprocess.Popen(["xdg-open", url], start_new_session=True)
+        except Exception as exc:
+            self._notify(str(exc), True)
 
     def _start_profile(self, _widget, mode: str) -> None:
         self._notify(f"Starting {mode}…")
