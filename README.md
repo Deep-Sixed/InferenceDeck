@@ -195,6 +195,12 @@ hardware and files, so they live in the profile and can't be changed over the co
 API. The fit test passes the split to `llama-fit-params` and applies the `-ts`/`-sm`/`-mg`
 it suggests.
 
+The memory-fit estimate and Smart Tune size a split across every GPU it uses: all
+discrete GPUs on the primary GPU's backend by default (llama.cpp's own default), only
+`main_gpu` with `split_mode: "none"`, the listed ones with `device: "CUDA0,CUDA1"`, and
+with `tensor_split` the card that fills first bounds the total. Each GPU is charged its
+own runtime overhead and keeps its own headroom.
+
 ## Running a profile on vllm.cpp
 
 [vllm.cpp](https://github.com/mudler/vllm.cpp) is a standalone C++ engine (no Python)

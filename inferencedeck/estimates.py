@@ -647,6 +647,83 @@ def _status_label(status: str) -> str:
     }.get(status, "Unknown")
 
 
+def _gpu_capacity_mib(gpu: dict[str, Any]) -> float | None:
+    return _mib(gpu.get("vram_free_bytes") or gpu.get("vram_total_bytes"))
+
+
+def _split_shares(raw: Any, count: int) -> list[float] | None:
+    """Normalized ``tensor_split`` proportions for ``count`` GPUs, or None (llama.cpp's default)."""
+    if raw in (None, "", []):
+        return None
+    parts = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    try:
+        values = [float(part) for part in parts if str(part).strip()]
+    except (TypeError, ValueError):
+        return None
+    values = (values + [0.0] * count)[:count]
+    total = sum(v for v in values if v > 0)
+    if total <= 0:
+        return None
+    return [max(v, 0.0) / total for v in values]
+
+
+def _accelerator_pool(params: dict[str, Any], hardware: dict[str, Any]) -> dict[str, Any]:
+    """The GPUs a launch will spread the model over, and how much that split can hold.
+
+    llama.cpp splits layers across every visible GPU by default, in proportion to
+    free memory, so capacity is the sum. ``split_mode: none`` keeps to ``main_gpu``;
+    ``device`` (e.g. ``CUDA0,CUDA1``) picks GPUs by index; ``tensor_split`` fixes the
+    shares, and then the GPU that fills first bounds the total: min(capacity / share).
+    Only discrete GPUs on the primary GPU's backend count.
+    """
+    primary = hardware.get("primary_gpu") or {}
+    backend = primary.get("acceleration_backend")
+    pool = [
+        gpu for gpu in (hardware.get("gpus") or [primary])
+        if gpu and not gpu.get("integrated") and gpu.get("acceleration_backend") == backend and _gpu_capacity_mib(gpu)
+    ]
+    single = {"gpus": [primary] if primary else [], "capacity_mib": _gpu_capacity_mib(primary) if primary else None}
+    if len(pool) < 2:
+        return single
+
+    device = str(params.get("device", params.get("cuda_device")) or "").strip().lower()
+    if device and device != "auto":
+        indices = [int(m.group(1)) for m in (re.search(r"(\d+)$", part.strip()) for part in device.split(",")) if m]
+        selected = [pool[i] for i in dict.fromkeys(indices) if 0 <= i < len(pool)]
+        if not selected:
+            return single
+        pool = selected
+    if str(params.get("split_mode") or "").strip().lower() == "none":
+        try:
+            main = int(params.get("main_gpu") or 0)
+        except (TypeError, ValueError):
+            main = 0
+        pool = [pool[main] if 0 <= main < len(pool) else pool[0]]
+    if len(pool) < 2:
+        return {"gpus": pool, "capacity_mib": _gpu_capacity_mib(pool[0])}
+
+    capacities = [_gpu_capacity_mib(gpu) or 0.0 for gpu in pool]
+    shares = _split_shares(params.get("tensor_split"), len(pool))
+    if shares:
+        used = [(cap, share) for cap, share in zip(capacities, shares) if share > 0]
+        pool = [gpu for gpu, share in zip(pool, shares) if share > 0]
+        capacity = min(cap / share for cap, share in used)
+    else:
+        capacity = sum(capacities)
+    return {"gpus": pool, "capacity_mib": capacity}
+
+
+def _accelerator_label(gpus: list[dict[str, Any]]) -> str | None:
+    names = [str(gpu.get("name") or "GPU") for gpu in gpus]
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    if len(set(names)) == 1:
+        return f"{len(names)}x {names[0]}"
+    return " + ".join(names)
+
+
 def estimate_memory_fit(
     params: dict[str, Any],
     model: dict[str, Any] | None = None,
@@ -699,17 +776,21 @@ def estimate_memory_fit(
     if not mmap and model_size_mib:
         host_model_mib += model_size_mib * 0.35
 
+    pool = _accelerator_pool(params, hardware)
+    # Each GPU in a split carries its own runtime context and compute buffers.
+    gpu_count = max(1, len(pool["gpus"]))
+
     accelerator_used_mib = 0.0
     if layer_fraction > 0:
         accelerator_used_mib += accelerator_model_mib
-        accelerator_used_mib += _CUDA_CONTEXT_OVERHEAD_MIB
+        accelerator_used_mib += _CUDA_CONTEXT_OVERHEAD_MIB * gpu_count
     if kv_offload and layer_fraction > 0:
         # KV lives with its layer: only the offloaded layers' share sits in VRAM.
         accelerator_used_mib += kv_cache_mib * layer_fraction
     if op_offload and layer_fraction > 0:
-        accelerator_used_mib += compute_mib
+        accelerator_used_mib += compute_mib * gpu_count
     elif layer_fraction > 0:
-        accelerator_used_mib += compute_mib * 0.35
+        accelerator_used_mib += compute_mib * 0.35 * gpu_count
 
     host_used_mib = host_model_mib
     if not kv_offload or layer_fraction <= 0:
@@ -726,7 +807,7 @@ def estimate_memory_fit(
     primary_gpu = hardware.get("primary_gpu") or {}
     memory = hardware.get("memory") or {}
     unified_memory = bool(memory.get("unified") or primary_gpu.get("unified_memory"))
-    accelerator_capacity_mib = _mib(primary_gpu.get("vram_free_bytes") or primary_gpu.get("vram_total_bytes"))
+    accelerator_capacity_mib = pool["capacity_mib"]
     if unified_memory and not accelerator_capacity_mib:
         accelerator_capacity_mib = _mib(memory.get("available_bytes") or memory.get("total_bytes"))
     ram_capacity_mib = _mib(memory.get("available_bytes") or memory.get("total_bytes"))
@@ -736,14 +817,15 @@ def estimate_memory_fit(
     )
     ram_headroom_mib = ram_capacity_mib - host_used_mib if ram_capacity_mib is not None else None
 
-    accelerator_status = _status_from_headroom(accelerator_headroom_mib, accelerator_capacity_mib, target_mib)
+    # The headroom target is per GPU: every card in a split must keep its own.
+    accelerator_status = _status_from_headroom(accelerator_headroom_mib, accelerator_capacity_mib, target_mib * gpu_count)
     ram_status = _status_from_headroom(ram_headroom_mib, ram_capacity_mib, max(2048.0, target_mib))
     relevant = [accelerator_status]
     if host_used_mib > 512 or not kv_offload or layer_fraction < 1.0:
         relevant.append(ram_status)
     status = _worst_status(relevant)
 
-    accelerator_name = primary_gpu.get("name") or ("Unified memory" if unified_memory else "Accelerator")
+    accelerator_name = _accelerator_label(pool["gpus"]) or ("Unified memory" if unified_memory else "Accelerator")
     warnings: list[str] = []
     if not model:
         warnings.append("No matched model was available; fit estimate uses generic model assumptions.")
@@ -763,6 +845,7 @@ def estimate_memory_fit(
         "accelerator_status": accelerator_status,
         "ram_status": ram_status,
         "accelerator_name": accelerator_name,
+        "accelerator_count": gpu_count if layer_fraction > 0 else 0,
         "backend": primary_gpu.get("acceleration_backend") or primary_gpu.get("backend"),
         "uses_ram_offload": host_used_mib > 512 or not kv_offload or layer_fraction < 1.0,
         "model_size_mib": _round_mib(model_size_mib) or None,
