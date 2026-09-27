@@ -98,6 +98,33 @@ def _mutate_state(change: Callable[[dict[str, Any]], bool | None]) -> None:
             write_state(state)
 
 
+# Serializes start_profile's check-then-launch. Separate from the state lock,
+# which is only held briefly, so status polls never wait on a server start.
+_LAUNCH_LOCK = threading.Lock()
+
+
+@contextmanager
+def launch_lock() -> Iterator[None]:
+    with _LAUNCH_LOCK:
+        with open(state_path().with_name("launch.lock"), "a+b") as fh:
+            _lock_file(fh)
+            try:
+                yield
+            finally:
+                _unlock_file(fh)
+
+
+WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
+
+
+def _same_listener(server: dict[str, Any], host: str, port: int) -> bool:
+    """Whether ``server`` listens where a new server on host:port would."""
+    if int(server.get("port") or 0) != port:
+        return False
+    other = str(server.get("host") or "")
+    return other == host or other in WILDCARD_HOSTS or host in WILDCARD_HOSTS
+
+
 def _windows_pid_alive(pid: int) -> bool:
     """Ask the kernel directly; the status poll runs often, so no tasklist.exe per check."""
     import ctypes
@@ -119,6 +146,69 @@ def _windows_pid_alive(pid: int) -> bool:
         return code.value == STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _windows_creation_time(pid: int) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        created = times[0]
+        return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_identity(pid: int | None) -> str | None:
+    """A token that tells this process apart from a later one given the same PID.
+
+    It is the process start time (plus the boot id on Linux, whose start time
+    counts from boot). None when it can't be read; callers then fall back to
+    the PID alone.
+    """
+    if not pid:
+        return None
+    pid = int(pid)
+    try:
+        if is_windows():
+            return _windows_creation_time(pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii") as f:
+                # Field 22 (starttime); fields are counted after the ")" that ends comm.
+                start = f.read().rpartition(")")[2].split()[19]
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+                return f"{f.read().strip()}:{start}"
+        except FileNotFoundError:
+            pass
+        result = run_hidden(
+            ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False
+        )
+        return result.stdout.strip() or None
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _is_same_process(pid: int | None, identity: str | None) -> bool:
+    """False only when ``pid`` now provably belongs to a different process than ``identity``."""
+    if not identity:
+        return True  # records written before identities were kept
+    current = process_identity(pid)
+    return current is None or current == identity
+
+
+def server_alive(server: dict[str, Any]) -> bool:
+    """The record's process is still running, and it is the process we started."""
+    pid = server.get("pid")
+    return pid_is_running(pid) and _is_same_process(pid, server.get("pid_identity"))
 
 
 def pid_is_running(pid: int | None) -> bool:
@@ -185,7 +275,7 @@ def list_servers() -> list[dict[str, Any]]:
     servers = []
     for server in state.get("servers", []):
         item = dict(server)
-        item["running"] = pid_is_running(item.get("pid"))
+        item["running"] = server_alive(item)
         servers.append(item)
     return servers
 
@@ -195,7 +285,7 @@ def prune_stale_servers() -> None:
 
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
-        kept = [s for s in servers if pid_is_running(s.get("pid")) or not s.get("pid")]
+        kept = [s for s in servers if server_alive(s) or not s.get("pid")]
         state["servers"] = kept
         return len(kept) != len(servers)
 
@@ -208,7 +298,7 @@ def trim_server_history(limit: int = 5) -> None:
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
         # Parked records are not history: they are how Restore finds the server.
-        running = [pid_is_running(s.get("pid")) or s.get("status") in (PARKED, RESTORING) for s in servers]
+        running = [server_alive(s) or s.get("status") in (PARKED, RESTORING) for s in servers]
         idle = [i for i, alive in enumerate(running) if not alive]
         excess = len(servers) - max(limit, running.count(True))
         if excess <= 0 or not idle:
@@ -244,7 +334,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
     if not raw_pid:
         return {"success": True, "message": "Tracked server has no PID to stop."}
     pid = int(raw_pid)
-    if not pid_is_running(pid):
+    if not server_alive(server):
         _update_server(server["id"], {"status": "stopped", "running": False, "suspended": False, "stopped_at": _now()})
         return {"success": True, "message": f"Tracked PID {pid} is no longer running."}
 
@@ -341,8 +431,8 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
 
 
 
-def _set_process_suspended(pid: int, suspended: bool) -> tuple[bool, str]:
-    if not pid_is_running(pid):
+def _set_process_suspended(pid: int, suspended: bool, identity: str | None = None) -> tuple[bool, str]:
+    if not pid_is_running(pid) or not _is_same_process(pid, identity):
         return False, f"PID {pid} is not running."
     if is_windows():
         import ctypes
@@ -372,7 +462,7 @@ def suspend_server(server_id: str | None = None, mode: str | None = None) -> dic
     if not server:
         return {"success": False, "error": "No tracked server matched the request."}
     pid = int(server.get("pid") or 0)
-    success, message = _set_process_suspended(pid, True)
+    success, message = _set_process_suspended(pid, True, server.get("pid_identity"))
     if success:
         _update_server(server["id"], {"status": "suspended", "running": True, "suspended": True})
     return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
@@ -383,7 +473,7 @@ def resume_server(server_id: str | None = None, mode: str | None = None) -> dict
     if not server:
         return {"success": False, "error": "No tracked server matched the request."}
     pid = int(server.get("pid") or 0)
-    success, message = _set_process_suspended(pid, False)
+    success, message = _set_process_suspended(pid, False, server.get("pid_identity"))
     if success:
         _update_server(server["id"], {"status": "running", "running": True, "suspended": False})
     return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
@@ -594,73 +684,89 @@ def start_profile(
     if ready_timeout_seconds is None:
         ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", 45)
 
-    existing = _find_server(mode=mode)
-    if existing and existing.get("running"):
-        if not stop_existing:
+    # Held from the "already running?" check until the new server is recorded,
+    # so two Start requests (double-click, tray + browser, CLI + daemon) can't
+    # both pass the check and launch two servers on one port.
+    with launch_lock():
+        existing = _find_server(mode=mode)
+        if existing and existing.get("running"):
+            if not stop_existing:
+                return {
+                    "success": False,
+                    "error": f"Profile '{mode}' already has a tracked running server.",
+                    "server": existing,
+                }
+            stop_result = stop_server(mode=mode)
+            if not stop_result.get("success"):
+                return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
+
+        params = prepared["params"]
+        host, port = str(params.get("host", "127.0.0.1")), int(params.get("port", 8080))
+        clash = next((s for s in list_servers() if s.get("running") and _same_listener(s, host, port)), None)
+        if clash:
             return {
                 "success": False,
-                "error": f"Profile '{mode}' already has a tracked running server.",
-                "server": existing,
+                "error": f"Port {port} is already used by tracked server '{clash.get('mode') or clash.get('id')}'.",
+                "server": clash,
             }
-        stop_result = stop_server(mode=mode)
-        if not stop_result.get("success"):
-            return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
 
-    command = LaunchCommand(
-        argv=prepared["command"]["argv"],
-        cwd=prepared["command"]["cwd"],
-        warnings=prepared["command"].get("warnings", []),
-    )
-    mode_slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in mode).strip("-") or "server"
-    stdout_path = log_dir() / f"{mode_slug}-stdout.log"
-    stderr_path = log_dir() / f"{mode_slug}-stderr.log"
-    stdout_handle = stdout_path.open("w", encoding="utf-8", errors="replace")
-    stderr_handle = stderr_path.open("w", encoding="utf-8", errors="replace")
-    try:
-        proc = subprocess.Popen(
-            command.argv,
-            cwd=command.cwd,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            # Detach so the managed server outlives the control center: a
-            # terminal/process-group signal (Ctrl-C, systemd stop) to us must
-            # not take down the servers we track in state. setsid on POSIX,
-            # ignored on Windows (CREATE_NO_WINDOW already detaches the console).
-            start_new_session=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        command = LaunchCommand(
+            argv=prepared["command"]["argv"],
+            cwd=prepared["command"]["cwd"],
+            warnings=prepared["command"].get("warnings", []),
         )
-    except Exception as exc:
-        stdout_handle.close()
-        stderr_handle.close()
-        return {"success": False, "error": str(exc), "prepared": prepared}
-    finally:
-        stdout_handle.close()
-        stderr_handle.close()
+        mode_slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in mode).strip("-") or "server"
+        stdout_path = log_dir() / f"{mode_slug}-stdout.log"
+        stderr_path = log_dir() / f"{mode_slug}-stderr.log"
+        stdout_handle = stdout_path.open("w", encoding="utf-8", errors="replace")
+        stderr_handle = stderr_path.open("w", encoding="utf-8", errors="replace")
+        try:
+            proc = subprocess.Popen(
+                command.argv,
+                cwd=command.cwd,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                stdin=subprocess.DEVNULL,
+                shell=False,
+                # Detach so the managed server outlives the control center: a
+                # terminal/process-group signal (Ctrl-C, systemd stop) to us must
+                # not take down the servers we track in state. setsid on POSIX,
+                # ignored on Windows (CREATE_NO_WINDOW already detaches the console).
+                start_new_session=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            stdout_handle.close()
+            stderr_handle.close()
+            return {"success": False, "error": str(exc), "prepared": prepared}
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
 
-    params = prepared["params"]
-    server_id = f"{mode}-{proc.pid}"
-    server = {
-        "id": server_id,
-        "mode": mode,
-        "runtime": prepared.get("runtime") or "llama.cpp",
-        "pid": proc.pid,
-        "status": "starting",
-        "running": True,
-        "host": str(params.get("host", "127.0.0.1")),
-        "port": int(params.get("port", 8080)),
-        "model_path": prepared["profile"]["model"]["path"] if prepared["profile"].get("model") else None,
-        "command_line": command.command_line,
-        "stdout_log": str(stdout_path),
-        "stderr_log": str(stderr_path),
-        "started_at": _now(),
-        "warnings": prepared.get("warnings", []),
-        # What Release GPU / Restart need to bring this server back as it was.
-        "overrides": dict(overrides or {}),
-        "ctx_size": params.get("ctx_size"),
-    }
-    _upsert_server(server)
+        server_id = f"{mode}-{proc.pid}"
+        server = {
+            "id": server_id,
+            "mode": mode,
+            "runtime": prepared.get("runtime") or "llama.cpp",
+            "pid": proc.pid,
+            # Start time of this process, so a later process reusing the PID is
+            # never mistaken for it (and never stopped or paused by us).
+            "pid_identity": process_identity(proc.pid),
+            "status": "starting",
+            "running": True,
+            "host": host,
+            "port": port,
+            "model_path": prepared["profile"]["model"]["path"] if prepared["profile"].get("model") else None,
+            "command_line": command.command_line,
+            "stdout_log": str(stdout_path),
+            "stderr_log": str(stderr_path),
+            "started_at": _now(),
+            "warnings": prepared.get("warnings", []),
+            # What Release GPU / Restart need to bring this server back as it was.
+            "overrides": dict(overrides or {}),
+            "ctx_size": params.get("ctx_size"),
+        }
+        _upsert_server(server)
     app_config = AppConfig.load()
     trim_server_history(app_config.server_history_limit)
 
@@ -699,6 +805,7 @@ def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[s
     parked = {
         **{k: v for k, v in server.items() if k != "running"},
         "pid": None,
+        "pid_identity": None,
         "status": PARKED,
         "suspended": False,
         "parked_at": _now(),
