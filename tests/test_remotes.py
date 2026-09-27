@@ -54,3 +54,12 @@ class RemoteEndpointTests(unittest.TestCase):
             result = ControlPlane().start("local")
         self.assertFalse(result["success"])
         self.assertIn("disable", result["error"])
+
+    def test_benchmark_refuses_when_remote_active(self) -> None:
+        fake = mock.Mock(display_name="Remote", to_dict=lambda: {"name": "remote"})
+        with mock.patch("inferencedeck.control.active_endpoint", return_value=fake), \
+                mock.patch("inferencedeck.control.run_profile_benchmark") as run:
+            result = ControlPlane().benchmark("local")
+        self.assertFalse(result["success"])
+        self.assertIn("disable", result["error"])
+        run.assert_not_called()

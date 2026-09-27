@@ -9,7 +9,8 @@ from .paths import find_project_root
 from .schema import ModelProfile
 
 
-MODEL_ASSIGNMENT_RE = re.compile(r"(?im)^\s*\$model\s*=\s*['\"]([^'\"]+)['\"]")
+# Single-quoted PowerShell strings escape ' as ''; double-quoted ones are taken as-is.
+MODEL_ASSIGNMENT_RE = re.compile(r"(?im)^\s*\$model\s*=\s*(?:'((?:[^'\n]|'')+)'|\"([^\"\n]+)\")")
 MODEL_ARG_RE = re.compile(r"(?im)(?:^|\s)-m['\"]?\s*,?\s*['\"]([^'\"]+\.gguf)['\"]")
 WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
@@ -41,10 +42,12 @@ def _parse_model_path(script_path: Path | None) -> str | None:
         content = script_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    for pattern in [MODEL_ASSIGNMENT_RE, MODEL_ARG_RE]:
-        match = pattern.search(content)
-        if match:
-            return match.group(1)
+    match = MODEL_ASSIGNMENT_RE.search(content)
+    if match:
+        return match.group(1).replace("''", "'") if match.group(1) is not None else match.group(2)
+    match = MODEL_ARG_RE.search(content)
+    if match:
+        return match.group(1)
     return None
 
 

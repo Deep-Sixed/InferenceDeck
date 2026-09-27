@@ -174,24 +174,39 @@ def run_profile_benchmark(
     overrides: dict[str, Any] | None = None,
     prompt: str | None = None,
     completion_tokens: int = 128,
-    restart: bool = True,
+    restart: bool = False,
     stop_after: bool = False,
+    # None: wait as long as this profile's runtime needs to load (see
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp takes far longer than llama.cpp).
     ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    """Time one chat completion against the profile's server.
+
+    A server already running for ``mode`` is benchmarked as it is; one is only
+    started (with ``overrides``) when none is running or ``restart`` is set.
+    The completion length is capped per request via ``max_tokens``, never as a
+    server flag, so the server is left as the user configured it.
+    """
+
     params = dict(overrides or {})
-    params["n_predict"] = int(completion_tokens)
-    start = start_profile(
-        mode=mode,
-        project_root=project_root,
-        model_dirs=model_dirs,
-        overrides=params,
-        stop_existing=restart,
-        wait_ready=True,
-        ready_timeout_seconds=ready_timeout_seconds,
-    )
-    server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
-    if not server:
-        return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    server = None if restart else _server_for_mode(mode)
+    start = None
+    if server is None:
+        start = start_profile(
+            mode=mode,
+            project_root=project_root,
+            model_dirs=model_dirs,
+            overrides=params or None,
+            stop_existing=restart,
+            wait_ready=True,
+            ready_timeout_seconds=ready_timeout_seconds,
+        )
+        server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
+        if not server:
+            return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    if server.get("suspended"):
+        # A paused process can't answer; the request would just hang until timeout.
+        return {"success": False, "error": f"Server for '{mode}' is paused; resume it before benchmarking.", "server": server}
 
     base_url = _api_base(server)
     request_payload = {
