@@ -18,6 +18,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
 - Generate portable launch scripts without overwriting hand-written scripts.
+- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`).
 
 ### Frontends
 
@@ -247,6 +248,44 @@ inferencedeck-web --host 0.0.0.0 --port 8716
 ```
 
 The example above is illustrative; do not commit the token to the repository or a config file.
+
+## Inference gateway (API mapping)
+
+```bash
+inferencedeck-gateway --host 127.0.0.1 --port 8717
+```
+
+The gateway gives applications one stable inference API, whatever is serving the model. It sends each request to the current target:
+
+1. the enabled remote/cloud endpoint, if there is one;
+2. otherwise the running (not paused) local server.
+
+The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+
+| Client API | Path |
+|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| Anthropic Messages | `POST /v1/messages` |
+| Model list (the current target) | `GET /v1/models` |
+
+Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
+
+The translation covers:
+
+- messages and system prompts
+- images
+- tool definitions, tool calls and tool results
+- sampling (`temperature`, `top_p`, `top_k`, `min_p`, penalties, seed, stop sequences)
+- streaming, finish reasons and token usage
+- errors, returned in the caller's own format
+
+For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
+
+The only engine adapter so far is OpenAI-compatible. It covers `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter. The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
+
+API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
 
 ## Development
 
