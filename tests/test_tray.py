@@ -176,7 +176,9 @@ class PystrayMenuTests(unittest.TestCase):
         icon, items, api, _ = self._menu([RUNNING])
         self.assertIn("Running — qwen.gguf on :8080", items)
         enabled = {name for name, item in items.items() if item.enabled}
-        self.assertTrue({"Pause (model stays in VRAM)", "Release GPU", "Reload & restart", "Context size", "Stop server"} <= enabled)
+        # Labels go through menu_text, which doubles "&" on Windows.
+        expected = {"Pause (model stays in VRAM)", "Release GPU", tray.menu_text("Reload & restart"), "Context size", "Stop server"}
+        self.assertTrue(expected <= enabled, enabled)
         self.assertFalse(items["Resume"].enabled or items["Restore"].enabled)
         sizes = {str(i.text): i for i in items["Context size"].submenu.items}
         self.assertTrue(sizes["32K"].checked and not sizes["64K"].checked)
@@ -201,7 +203,7 @@ class PystrayMenuTests(unittest.TestCase):
         self.assertFalse(start["Bad — unresolved"].enabled)
         start["Qwen — qwen.gguf"](icon)
         api.start.assert_called_once_with("qwen")
-        remote = [i for i in items["Remote & cloud models"].submenu.items if "OpenAI" in str(i.text)][0]
+        remote = [i for i in items[tray.menu_text("Remote & cloud models")].submenu.items if "OpenAI" in str(i.text)][0]
         self.assertEqual(str(remote.text), "OpenAI — set $OPENAI_API_KEY")
         self.assertFalse(remote.enabled)
         items["Open Web UI"](icon)
