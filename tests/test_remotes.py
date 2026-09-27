@@ -63,3 +63,85 @@ class RemoteEndpointTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("disable", result["error"])
         run.assert_not_called()
+
+class EndpointLocationTests(unittest.TestCase):
+    def _parse(self, **fields):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ep.json"
+            path.write_text(json.dumps({"apiKeyEnv": "K", **fields}))
+            return list_endpoints(Path(tmp))[0]
+
+    def test_self_hosted_over_tailscale(self) -> None:
+        cfg = self._parse(provider="llamacpp", lane="remote_host", host="Thanatos",
+                          transport="tailscale", baseUrl="http://thanatos:8080/v1")
+        self.assertTrue(cfg.valid)
+        self.assertEqual(cfg.summary, "Thanatos · Tailscale · Self-hosted")
+        self.assertEqual(cfg.to_dict()["summary"], cfg.summary)
+
+    def test_transport_and_host_inferred_from_url(self) -> None:
+        cases = {
+            "http://thanatos.tail1234.ts.net:8080/v1": "tailscale",
+            "http://100.101.102.103:8080/v1": "tailscale",
+            "http://192.168.1.20:8080/v1": "",
+        }
+        for url, transport in cases.items():
+            cfg = self._parse(provider="llamacpp", baseUrl=url)
+            self.assertEqual(cfg.transport, transport, url)
+        cfg = self._parse(provider="llamacpp", baseUrl="http://192.168.1.20:8080/v1")
+        self.assertEqual(cfg.summary, "192.168.1.20 · Self-hosted")
+
+    def test_cloud_provider_summary(self) -> None:
+        cfg = self._parse(provider="openrouter", lane="true_cloud", baseUrl="https://openrouter.ai/api/v1")
+        self.assertEqual(cfg.transport, "https")
+        self.assertEqual(cfg.summary, "OpenRouter · Cloud")
+
+    def test_unknown_transport_is_invalid(self) -> None:
+        cfg = self._parse(provider="llamacpp", baseUrl="http://x:8080/v1", transport="carrier-pigeon")
+        self.assertFalse(cfg.valid)
+        self.assertIn("transport", cfg.error)
+
+    def test_examples_parse(self) -> None:
+        examples = Path(__file__).resolve().parents[1] / "examples" / "remote_endpoints"
+        with tempfile.TemporaryDirectory() as tmp:
+            for example in examples.glob("*.example.json"):
+                (Path(tmp) / example.name.replace(".example", "")).write_text(example.read_text())
+            configs = list_endpoints(Path(tmp))
+        self.assertTrue(configs)
+        for cfg in configs:
+            self.assertTrue(cfg.valid, f"{cfg.name}: {cfg.error}")
+
+
+class OptionalKeyTests(unittest.TestCase):
+    def _root(self, tmp: str, **fields) -> Path:
+        root = Path(tmp)
+        (root / "ep.json").write_text(json.dumps({"baseUrl": "http://thanatos:8080/v1", **fields}))
+        return root
+
+    def test_remote_host_without_key_is_selectable_and_enables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host")
+            cfg = list_endpoints(root)[0]
+            self.assertTrue(cfg.valid, cfg.error)
+            self.assertFalse(cfg.key_required)
+            self.assertTrue(cfg.selectable)
+            self.assertFalse(cfg.to_dict()["key_required"])
+            self.assertTrue(enable_endpoint("ep", root).enabled)
+
+    def test_remote_host_with_named_key_still_requires_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host", apiKeyEnv="UNSET_TEST_KEY_VAR")
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("UNSET_TEST_KEY_VAR", None)
+                self.assertFalse(list_endpoints(root)[0].selectable)
+                with self.assertRaises(ValueError):
+                    enable_endpoint("ep", root)
+
+    def test_cloud_without_key_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="openrouter", lane="true_cloud")
+            cfg = list_endpoints(root)[0]
+            self.assertFalse(cfg.valid)
+            self.assertIn("apiKeyEnv", cfg.error)
+            # A config with no lane falls back to true_cloud unless it is llama.cpp.
+            (Path(tmp) / "ep.json").write_text(json.dumps({"provider": "openai", "baseUrl": "https://x/v1"}))
+            self.assertFalse(list_endpoints(root)[0].valid)

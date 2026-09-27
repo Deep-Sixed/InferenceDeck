@@ -226,6 +226,8 @@ class PystrayMenuTests(unittest.TestCase):
         remote = [i for i in items[tray.menu_text("Remote & cloud models")].submenu.items if "OpenAI" in str(i.text)][0]
         self.assertEqual(str(remote.text), "OpenAI — set $OPENAI_API_KEY")
         self.assertFalse(remote.enabled)
+        self.assertEqual(tray.remote_label({"display_name": "Qwen", "summary": "Thanatos · Tailscale · Self-hosted"}),
+                         "Qwen (Thanatos · Tailscale · Self-hosted)")
         items["Open Web UI"](icon)
         self.assertEqual(opened, [True])
         self.assertTrue(items["Open Web UI"].default)

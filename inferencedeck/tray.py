@@ -318,6 +318,12 @@ def menu_text(text: str) -> str:
     return text.replace("&", "&&") if is_windows() else text
 
 
+def remote_label(remote: dict[str, Any]) -> str:
+    name = str(remote.get("display_name") or remote.get("name") or "")
+    summary = remote.get("summary")
+    return f"{name} ({summary})" if summary else name
+
+
 def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], None], quit_tray: Callable[[], None]):
     Item, Menu = pystray.MenuItem, pystray.Menu
     st = lambda: controller.state  # noqa: E731 - always read the latest state
@@ -352,7 +358,7 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         for r in st().remotes:
             suffix = " — active" if r.get("enabled") else "" if r.get("selectable") else f" — set ${r.get('api_key_env')}"
             yield Item(
-                menu_text(f"{r.get('display_name') or r.get('name')}{suffix}"),
+                menu_text(f"{remote_label(r)}{suffix}"),
                 remote_action(r),
                 checked=lambda _item, on=bool(r.get("enabled")): on,
                 enabled=bool(r.get("enabled") or r.get("selectable")),
