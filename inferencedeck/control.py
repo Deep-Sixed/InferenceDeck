@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .backends import detect_llama_cpp
+from .backends import detect_all, detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
 from .config import AppConfig
 from .fit import run_fit_test
@@ -15,6 +15,7 @@ from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
 from . import otlp, telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
+from .runtime_updates import check_runtime_updates
 from .server_manager import (
     CONTEXT_PRESETS,
     list_servers,
@@ -130,6 +131,17 @@ class ControlPlane:
         root = Path(self.project_root).expanduser().resolve() if self.project_root else find_project_root()
         env = detect_llama_cpp(root, config=self._config())
         return env.details["runtime_selection"]
+
+    def updates(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Installed runtime versions against their latest upstream releases.
+
+        GitHub answers are cached for an hour; ``refresh`` asks again. Nothing is
+        ever downloaded or replaced.
+        """
+        root = Path(self.project_root).expanduser().resolve() if self.project_root else find_project_root()
+        config = self._config()
+        environments = [env.to_dict() for env in detect_all(root, config=config)]
+        return check_runtime_updates(environments, channel=config.update_channel, force_refresh=refresh)
 
     def set_runtime(self, runtime: str) -> dict[str, Any]:
         """Pin a discovered, compatible build (by id), or go back to "auto"."""

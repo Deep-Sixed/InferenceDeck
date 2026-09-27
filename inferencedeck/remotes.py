@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .fileio import atomic_write_text, locked
 from .paths import config_dir
@@ -12,6 +14,33 @@ from .paths import config_dir
 LANE_REMOTE_HOST = "remote_host"
 LANE_TRUE_CLOUD = "true_cloud"
 VALID_LANES = {LANE_REMOTE_HOST, LANE_TRUE_CLOUD}
+# Providers that are always someone's own server, so a config without a lane
+# is treated as remote_host (and may omit apiKeyEnv).
+SELF_HOSTED_PROVIDERS = {"llamacpp", "ollama"}
+
+# Transport is how requests reach the endpoint, independent of the lane (who
+# runs the model). A self-hosted llama.cpp on another box is remote_host
+# whether it is reached over the LAN or a tailnet.
+TRANSPORT_TAILSCALE = "tailscale"
+TRANSPORT_LAN = "lan"
+TRANSPORT_HTTPS = "https"
+VALID_TRANSPORTS = {TRANSPORT_TAILSCALE, TRANSPORT_LAN, TRANSPORT_HTTPS}
+
+LANE_LABELS = {LANE_REMOTE_HOST: "Self-hosted", LANE_TRUE_CLOUD: "Cloud"}
+TRANSPORT_LABELS = {TRANSPORT_TAILSCALE: "Tailscale", TRANSPORT_LAN: "LAN", TRANSPORT_HTTPS: "HTTPS"}
+PROVIDER_LABELS = {
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "llamacpp": "llama.cpp",
+    "ollama": "Ollama",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "vllm": "vLLM",
+}
+# Tailscale assigns node addresses from the CGNAT range and MagicDNS names
+# under ts.net.
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 
 @dataclass(frozen=True)
@@ -28,23 +57,48 @@ class RemoteEndpoint:
     error: str = ""
     context_size: int | None = None
     tags: tuple[str, ...] = ()
+    host: str = ""
+    transport: str = ""
+    # Gateway name routing: extra model names clients may request, and whether
+    # the endpoint takes name-routed requests while it is not the enabled one.
+    aliases: tuple[str, ...] = ()
+    routable: bool = False
 
     @property
     def name(self) -> str:
         return self.path.stem
 
     @property
+    def key_required(self) -> bool:
+        # Cloud endpoints always name a key variable; a self-hosted endpoint
+        # (e.g. llama-server without --api-key on a tailnet) may omit it.
+        return bool(self.api_key_env)
+
+    @property
     def key_present(self) -> bool:
-        return bool(self.api_key_env) and bool(os.environ.get(self.api_key_env, "").strip())
+        return self.key_required and bool(os.environ.get(self.api_key_env, "").strip())
 
     @property
     def selectable(self) -> bool:
-        return self.valid and self.key_present
+        return self.valid and (self.key_present or not self.key_required)
+
+    @property
+    def summary(self) -> str:
+        """Where the model runs, e.g. "Thanatos · Tailscale · Self-hosted"."""
+        if self.lane == LANE_REMOTE_HOST:
+            where = self.host
+        else:
+            where = PROVIDER_LABELS.get(self.provider.lower(), self.provider)
+        parts = [where, TRANSPORT_LABELS.get(self.transport, "") if self.lane == LANE_REMOTE_HOST else "",
+                 LANE_LABELS.get(self.lane, self.lane)]
+        return " · ".join(part for part in parts if part)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["path"] = str(self.path)
         payload["name"] = self.name
+        payload["summary"] = self.summary
+        payload["key_required"] = self.key_required
         payload["key_present"] = self.key_present
         payload["selectable"] = self.selectable
         # Never serialize the actual environment value.
@@ -53,6 +107,31 @@ class RemoteEndpoint:
 
 def endpoints_dir() -> Path:
     return config_dir() / "remote_endpoints"
+
+
+def _url_host(base_url: str) -> str:
+    try:
+        return urlsplit(base_url).hostname or ""
+    except ValueError:
+        return ""
+
+
+def infer_transport(base_url: str, lane: str) -> str:
+    """Best guess at the transport when the config does not name one."""
+    hostname = _url_host(base_url).lower()
+    if hostname.endswith(".ts.net"):
+        return TRANSPORT_TAILSCALE
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and (address in _TAILNET_V4 or address in _TAILNET_V6):
+        return TRANSPORT_TAILSCALE
+    if lane == LANE_TRUE_CLOUD:
+        return TRANSPORT_HTTPS
+    # A bare name such as http://thanatos:8080 may be MagicDNS or LAN DNS;
+    # leave it unnamed rather than guess.
+    return ""
 
 
 def _parse(path: Path) -> RemoteEndpoint:
@@ -66,7 +145,7 @@ def _parse(path: Path) -> RemoteEndpoint:
     api_key_env = str(data.get("apiKeyEnv") or "").strip()
     display_name = str(data.get("displayName") or model or path.stem).strip()
     raw_enabled = data.get("enabled", False)
-    lane = str(data.get("lane") or (LANE_REMOTE_HOST if provider == "llamacpp" else LANE_TRUE_CLOUD)).strip().lower()
+    lane = str(data.get("lane") or (LANE_REMOTE_HOST if provider in SELF_HOSTED_PROVIDERS else LANE_TRUE_CLOUD)).strip().lower()
     error = ""
     if "apiKey" in data or "api_key" in data:
         error = "API keys must not be stored in endpoint configuration"
@@ -74,10 +153,16 @@ def _parse(path: Path) -> RemoteEndpoint:
         error = "enabled must be true/false"
     elif not base_url:
         error = "baseUrl is required"
-    elif not api_key_env:
-        error = "apiKeyEnv is required"
     elif lane not in VALID_LANES:
         error = "lane must be remote_host or true_cloud"
+    elif not api_key_env and lane != LANE_REMOTE_HOST:
+        error = "apiKeyEnv is required for true_cloud endpoints"
+    transport = str(data.get("transport") or "").strip().lower()
+    if transport and transport not in VALID_TRANSPORTS:
+        error = error or "transport must be tailscale, lan or https"
+    elif not transport:
+        transport = infer_transport(base_url, lane)
+    host = str(data.get("host") or "").strip() or _url_host(base_url)
     context = data.get("contextSize")
     try:
         context_size = int(context) if context is not None else None
@@ -85,6 +170,17 @@ def _parse(path: Path) -> RemoteEndpoint:
         context_size = None
         error = error or "contextSize must be an integer"
     tags = tuple(str(tag) for tag in (data.get("tags") or []) if str(tag).strip())
+    raw_aliases = data.get("aliases") or []
+    if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
+        error = error or "aliases must be a list of strings"
+        raw_aliases = []
+    aliases = tuple(a.strip() for a in raw_aliases if a.strip())
+    # Self-hosted endpoints are routable by name unless opted out; a cloud
+    # endpoint must opt in, so no request leaves your machines by accident.
+    raw_routable = data.get("routable", lane == LANE_REMOTE_HOST)
+    if not isinstance(raw_routable, bool):
+        error = error or "routable must be true/false"
+        raw_routable = False
     return RemoteEndpoint(
         path=path,
         provider=provider,
@@ -98,6 +194,10 @@ def _parse(path: Path) -> RemoteEndpoint:
         error=error,
         context_size=context_size,
         tags=tags,
+        host=host,
+        transport=transport,
+        aliases=aliases,
+        routable=raw_routable,
     )
 
 
@@ -133,7 +233,7 @@ def enable_endpoint(name: str, directory: Path | None = None) -> RemoteEndpoint:
             raise ValueError(f"Unknown remote endpoint: {name}")
         if not target.valid:
             raise ValueError(f"Invalid endpoint {name}: {target.error}")
-        if not target.key_present:
+        if target.key_required and not target.key_present:
             raise ValueError(f"{target.display_name}: set ${target.api_key_env} before enabling")
         # Disable the others before enabling the target, so a failure part-way
         # leaves at most one endpoint enabled, never two.

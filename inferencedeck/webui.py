@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ssl
 import sys
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
@@ -44,17 +45,39 @@ class WebRequestHandler(ControlRequestHandler):
         super().do_GET()
 
 
-def serve(
+def make_server(
     host: str = "127.0.0.1",
     port: int = 8716,
     control_plane: ControlPlane | None = None,
     auth_state: AuthState | None = None,
-) -> None:
+    certfile: str | None = None,
+    keyfile: str | None = None,
+) -> ThreadingHTTPServer:
+    """Build the server; with ``certfile`` it speaks HTTPS and marks the session cookie Secure."""
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
+    handler.secure_cookies = bool(certfile)
+    server = ThreadingHTTPServer((host, port), handler)
+    if certfile:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(certfile, keyfile or None)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    return server
+
+
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8716,
+    control_plane: ControlPlane | None = None,
+    auth_state: AuthState | None = None,
+    certfile: str | None = None,
+    keyfile: str | None = None,
+) -> None:
+    server = make_server(host, port, control_plane, auth_state, certfile, keyfile)
     config = AppConfig.load()
     start_sampler(config.telemetry_sample_seconds, config.telemetry_retention_days)
     try:
@@ -62,15 +85,19 @@ def serve(
     except ValueError as exc:
         # A bad export setting shouldn't keep the control panel from starting.
         print(f"inferencedeck-web: OpenTelemetry export disabled: {exc}", file=sys.stderr)
-    ThreadingHTTPServer((host, port), handler).serve_forever()
+    server.serve_forever()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="InferenceDeck local web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8716)
+    parser.add_argument("--certfile", help="PEM certificate (with chain) to serve HTTPS; recommended for LAN/tailnet binds")
+    parser.add_argument("--keyfile", help="PEM private key, if not included in --certfile")
     args = parser.parse_args()
-    serve(args.host, args.port)
+    if args.keyfile and not args.certfile:
+        parser.error("--keyfile needs --certfile")
+    serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile)
     return 0
 
 

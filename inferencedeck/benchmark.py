@@ -142,7 +142,7 @@ def run_profile_benchmark(
     restart: bool = False,
     stop_after: bool = False,
     # None: wait as long as this profile's runtime needs to load (see
-    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp takes far longer than llama.cpp).
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp and MLC LLM take far longer than llama.cpp).
     ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Time one chat completion against the profile's server.
@@ -180,7 +180,8 @@ def run_profile_benchmark(
             {"role": "system", "content": "You are benchmarking local inference. Answer directly."},
             {"role": "user", "content": prompt or DEFAULT_PROMPT},
         ],
-        "temperature": float(params.get("temperature", 0.2) or 0.2),
+        # 0 is a real setting (greedy decoding); only a missing value gets the default.
+        "temperature": float(0.2 if params.get("temperature") is None else params["temperature"]),
         "max_tokens": int(completion_tokens),
         "stream": False,
     }
