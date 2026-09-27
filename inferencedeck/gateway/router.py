@@ -41,6 +41,7 @@ class Target:
     names: tuple[str, ...] = ()  # every name that routes here
     endpoint: str = ""           # remote endpoint name, for <endpoint>/<model>
     default: bool = False
+    server_id: str = ""          # local server id, for in-flight tracking (see inflight.py)
 
     def matches(self, name: str) -> bool:
         wanted = name.casefold()
@@ -48,7 +49,7 @@ class Target:
 
     def to_dict(self) -> dict[str, Any]:
         return {"label": self.label, "model": self.model_id, "names": list(self.names),
-                "api_base": self.engine.api_base, "default": self.default}
+                "api_base": self.engine.api_base, "default": self.default, "server_id": self.server_id}
 
 
 def _api_base(base_url: str) -> str:
@@ -100,7 +101,7 @@ def local_target(server: dict[str, Any], default: bool = False) -> Target:
     model_path = server.get("model_path")
     names = _unique([mode, str(server.get("id") or ""), Path(model_path).stem if model_path else ""])
     engine = OpenAICompatibleEngine(http_base(server.get("host"), int(server.get("port") or 8080)) + "/v1")
-    return Target(engine, f"{mode} (local)", mode, names, default=default)
+    return Target(engine, f"{mode} (local)", mode, names, default=default, server_id=str(server.get("id") or ""))
 
 
 @dataclass

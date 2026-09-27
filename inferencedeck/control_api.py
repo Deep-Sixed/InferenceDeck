@@ -374,7 +374,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return
             if payload.get("success", True):
                 code = HTTPStatus.OK
-            elif payload.get("reason") == "vram_conflict":
+            elif payload.get("reason") in ("vram_conflict", "vram_busy"):
                 code = HTTPStatus.CONFLICT
             else:
                 code = HTTPStatus.BAD_REQUEST

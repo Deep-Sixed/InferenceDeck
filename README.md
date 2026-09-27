@@ -333,6 +333,8 @@ llama-server `/slots` every 15 seconds. A slot that is processing, or one that t
 new task since the last poll, counts as activity. A server whose `/slots` cannot be
 read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
 which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
+Requests through the gateway also count (see [Requests in flight](#requests-in-flight)): a server with a
+gateway request running is never released, even before any slot starts processing it.
 
 ### Model capabilities
 
@@ -392,6 +394,10 @@ release, biggest first. The web UI then offers to release them and continue (Res
 them back) or to start anyway. Over the API, send `"release_conflicts": true` or
 `"force": true` with `/api/start`, `/api/restore` or `/api/restart`. `POST /api/plan` with a
 `mode` reports the plan without starting anything.
+
+A server answering gateway requests is never picked for release. If only releasing such a
+server would make room, the start is refused (HTTP 409, `"reason": "vram_busy"`) even with
+`release_conflicts`; try again once its requests finish, or send `"force": true`.
 
 A tight fit, or a model too big for the GPU even alone, starts with a warning as before;
 the Fit tools are the place to shrink it. Set `concurrent_vram_check` in the app config to
@@ -514,6 +520,28 @@ There are two engine adapters:
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+### Requests in flight
+
+The gateway counts the requests it is sending to each local server, from the moment the
+request is routed until the last byte of the reply (streamed or not) has been sent. Each
+gateway process keeps its counts in `<cache>/inflight/gateway-<pid>.json`; `inferencedeck-web`
+reads them, ignoring (and deleting) the files of gateways that are no longer running.
+
+- **Idle auto-release** treats a server with requests in flight as busy, and each finished
+  request restarts its idle clock.
+- **Making room** for another model (`release_conflicts`) never releases a server with
+  requests in flight; the start is refused with `"reason": "vram_busy"` instead. The check
+  runs again just before releasing, so a request that arrived after the plan was made still
+  holds the server.
+- **Status**: `/api/status` adds `in_flight` and `last_request_at` to each server the gateway
+  has sent requests to, and the web UI shows "N in flight".
+
+Only requests through the gateway are counted. Requests sent straight to a server's own
+port are still seen by idle release through `/slots`, but not by the making-room check.
+Stop, Release GPU and Reload & restart are explicit and act immediately. Two Start requests
+for the same profile were already serialised: the second one is refused while the first
+server is tracked.
 
 The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
 

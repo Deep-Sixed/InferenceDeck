@@ -19,6 +19,7 @@ from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
 from .hardware import detect_system_hardware
+from .inflight import busy_servers
 from .llama_args import LaunchCommand, build_llama_server_args
 from .mlc_llm_args import build_mlc_llm_serve_args
 from .vllm_cpp_args import build_vllm_cpp_server_args
@@ -815,7 +816,8 @@ def _vram_plan(prepared: dict[str, Any], exclude: set[str]) -> dict[str, Any]:
     model = (prepared.get("profile") or {}).get("model")
     need = estimate_server_vram_mib(prepared.get("params") or {}, model)
     hardware = detect_system_hardware()
-    return plan_start(need, hardware, list_servers(), live_free=live_free_mib(hardware), exclude=exclude)
+    return plan_start(need, hardware, list_servers(), live_free=live_free_mib(hardware), exclude=exclude,
+                      busy=busy_servers())
 
 
 def plan_launch(
@@ -880,8 +882,26 @@ def start_profile(
             replaced = {str(s.get("id")) for s in list_servers() if s.get("mode") == mode} if stop_existing else set()
             vram_plan = _vram_plan(prepared, replaced)
             status = vram_plan.get("status")
+            if status == "busy" and not force and check_mode == "block":
+                return {
+                    "success": False,
+                    "error": vram_plan["message"],
+                    "reason": "vram_busy",
+                    "vram_plan": vram_plan,
+                }
             if status == "conflict" and not force:
                 if release_conflicts:
+                    # Requests may have arrived since the plan was made; check
+                    # every server before releasing any of them.
+                    now_busy = busy_servers()
+                    serving = [release_id for release_id in vram_plan["release"] if now_busy.get(release_id)]
+                    if serving:
+                        return {
+                            "success": False,
+                            "error": f"Not releasing {', '.join(serving)}: requests just started on it. Try again shortly.",
+                            "reason": "vram_busy",
+                            "vram_plan": vram_plan,
+                        }
                     for release_id in vram_plan["release"]:
                         released = release_gpu(server_id=release_id)
                         if not released.get("success"):
@@ -898,7 +918,7 @@ def start_profile(
                         "reason": "vram_conflict",
                         "vram_plan": vram_plan,
                     }
-            if status in ("tight", "too_big") or (status == "conflict" and (force or check_mode == "warn")):
+            if status in ("tight", "too_big") or (status in ("conflict", "busy") and (force or check_mode == "warn")):
                 prepared["warnings"] = list(prepared.get("warnings") or []) + [vram_plan["message"]]
             prepared["warnings"] = list(prepared.get("warnings") or []) + list(vram_plan.get("warnings") or [])
 

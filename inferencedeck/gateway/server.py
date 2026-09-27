@@ -6,6 +6,9 @@ Endpoints:
   GET  /v1/models            every model name the gateway can route (see router.py)
   GET  /healthz
 
+Requests to local servers are counted while they run (see inflight.py), so
+idle release and making room for another model leave a busy server alone.
+
 Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
 SDK sends API keys (``Authorization: Bearer``, ``x-api-key``) or as
@@ -24,6 +27,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from ..inflight import Tracker, tracker
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
 from .router import Router
@@ -61,6 +65,8 @@ APIS = {
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     auth_state = AuthState()
     router: Router = Router()
+    # None: this process's shared tracker (see inflight.py).
+    inflight: Tracker | None = None
     server_version = "InferenceDeckGateway/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -178,14 +184,17 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             request: ChatRequest = api.parse(body)
             target = self.router.resolve(request.model)
             model = request.model or target.model_id
-            if request.stream:
-                events = target.engine.stream(request)
-                self._send_stream(api.render_stream(events, model, body))
-            else:
-                result = target.engine.complete(request)
-                # Report the model the client asked for, so aliases stay stable.
-                result.model = model
-                self._send(HTTPStatus.OK, api.render_result(result))
+            # Counted until the last byte is sent, so a streaming reply keeps
+            # its server from being released by idle release or to make room.
+            with (self.inflight or tracker()).track(target.server_id):
+                if request.stream:
+                    events = target.engine.stream(request)
+                    self._send_stream(api.render_stream(events, model, body))
+                else:
+                    result = target.engine.complete(request)
+                    # Report the model the client asked for, so aliases stay stable.
+                    result.model = model
+                    self._send(HTTPStatus.OK, api.render_result(result))
         except GatewayError as exc:
             self._send(exc.status, api.render_error(exc))
         except Exception as exc:  # pragma: no cover - last-resort guard
@@ -193,12 +202,14 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
-                router: Router | None = None) -> ThreadingHTTPServer:
+                router: Router | None = None, inflight: Tracker | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     attrs: dict[str, Any] = {"auth_state": auth}
     if router is not None:
         attrs["router"] = router
+    if inflight is not None:
+        attrs["inflight"] = inflight
     handler = type("BoundGatewayRequestHandler", (GatewayRequestHandler,), attrs)
     return ThreadingHTTPServer((host, port), handler)
 

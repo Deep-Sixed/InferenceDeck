@@ -45,6 +45,7 @@ class IdleMonitorTests(unittest.TestCase):
         self.addCleanup(self._reap)
         self.clock = _Clock()
         self.slots: list[dict] | None = _slots(1)
+        self.gateway: dict = {}  # in-flight gateway counts (inflight.snapshot)
         self.config = AppConfig(idle_release_seconds=0)
         self.release = mock.Mock(return_value={"success": True})
 
@@ -69,6 +70,7 @@ class IdleMonitorTests(unittest.TestCase):
             release=release or self.release,
             clock=self.clock,
             config_loader=lambda: self.config,
+            inflight=lambda: self.gateway,
         )
 
     def test_releases_after_idle_window(self) -> None:
@@ -108,6 +110,47 @@ class IdleMonitorTests(unittest.TestCase):
             monitor.check()
             self.clock.now += 100
         self.release.assert_not_called()
+
+    def test_gateway_request_in_flight_keeps_the_server(self) -> None:
+        # e.g. a long prompt still uploading: no slot is processing yet.
+        sid = self._track(idle_release_seconds=60)
+        self.gateway = {sid: {"in_flight": 1, "requests": 1, "last_request_at": None}}
+        monitor = self._monitor()
+        for _ in range(5):
+            monitor.check()
+            self.clock.now += 100
+        self.release.assert_not_called()
+        self.gateway = {sid: {"in_flight": 0, "requests": 1, "last_request_at": None}}
+        monitor.check()  # the request finishing counts as activity
+        self.clock.now += 59
+        monitor.check()
+        self.release.assert_not_called()
+        self.clock.now += 2
+        monitor.check()
+        self.release.assert_called_once_with(server_id=sid)
+
+    def test_finished_gateway_requests_reset_the_window(self) -> None:
+        sid = self._track(idle_release_seconds=60)
+        monitor = self._monitor()
+        monitor.check()
+        self.clock.now += 50
+        self.gateway = {sid: {"in_flight": 0, "requests": 3, "last_request_at": None}}
+        monitor.check()
+        self.clock.now += 50
+        monitor.check()
+        self.release.assert_not_called()
+        self.clock.now += 11
+        monitor.check()
+        self.release.assert_called_once()
+
+    def test_gateway_snapshot_failure_is_ignored(self) -> None:
+        self._track(idle_release_seconds=60)
+        monitor = idle.IdleMonitor(probe=lambda _h, _p: self.slots, release=self.release, clock=self.clock,
+                                   config_loader=lambda: self.config, inflight=mock.Mock(side_effect=OSError))
+        monitor.check()
+        self.clock.now += 61
+        monitor.check()
+        self.release.assert_called_once()
 
     def test_unreadable_slots_count_as_active(self) -> None:
         self._track(idle_release_seconds=60)

@@ -11,6 +11,7 @@ from .config import AppConfig
 from .config_check import check_all
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
+from .inflight import snapshot as inflight_snapshot
 from .inventory import build_inventory
 from .live_config import rejected_files
 from .paths import find_project_root
@@ -55,6 +56,13 @@ class ControlPlane:
     def status(self) -> dict[str, Any]:
         servers = list_servers()
         running = [server for server in servers if server.get("running")]
+        # Gateway requests running on each server right now (see inflight.py).
+        gateway = inflight_snapshot()
+        for server in servers:
+            counts = gateway.get(str(server.get("id") or ""))
+            if counts:
+                server["in_flight"] = counts["in_flight"]
+                server["last_request_at"] = counts["last_request_at"]
         remote = active_endpoint()
         return {
             "version": 1,

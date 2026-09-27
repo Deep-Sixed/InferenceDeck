@@ -11,6 +11,10 @@ The idle window comes from the server's ``idle_release_seconds`` (a profile
 param or launch override) or, when that is unset, the app config's
 ``idle_release_seconds``. Zero turns it off, which is the default.
 
+Requests through the gateway count too (see inflight.py): a server with
+gateway requests running is busy even while a long prompt is still being
+received, and each finished gateway request restarts its idle clock.
+
 When /slots cannot be read (disabled with --no-slots, behind --api-key, or the
 server is briefly unresponsive) the server is treated as active: InferenceDeck
 never stops a server it cannot see is idle.
@@ -26,6 +30,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .config import AppConfig
+from .inflight import Snapshot, snapshot
 from .server_manager import http_base, _update_server, list_servers, release_gpu
 
 DEFAULT_POLL_SECONDS = 15
@@ -84,17 +89,33 @@ class IdleMonitor:
         release: Callable[..., dict[str, Any]] = release_gpu,
         clock: Callable[[], float] = time.monotonic,
         config_loader: Callable[[], AppConfig] = AppConfig.load,
+        inflight: Callable[[], Snapshot] = snapshot,
     ) -> None:
         self._probe = probe
         self._release = release
         self._clock = clock
         self._config_loader = config_loader
+        self._inflight = inflight
         # server id -> (slot fingerprint, monotonic time of last activity)
         self._seen: dict[str, tuple[Any, float]] = {}
 
-    def _read(self, server: dict[str, Any]) -> tuple[bool, Any] | None:
+    def _gateway(self) -> Snapshot:
+        try:
+            return self._inflight()
+        except Exception:
+            return {}
+
+    def _read(self, server: dict[str, Any], gateway: Snapshot) -> tuple[bool, Any] | None:
         slots = self._probe(str(server.get("host") or "127.0.0.1"), int(server.get("port") or 8080))
-        return None if slots is None else slots_state(slots)
+        if slots is None:
+            return None
+        busy, fingerprint = slots_state(slots)
+        counts = gateway.get(str(server.get("id") or "")) or {}
+        # ``requests`` grows with every gateway request, so it marks activity
+        # between polls just like a new slot task id; ``in_flight`` dropping
+        # to 0 restarts the clock from when the last request finished.
+        in_flight = counts.get("in_flight", 0)
+        return busy or in_flight > 0, (fingerprint, counts.get("requests", 0), in_flight)
 
     def check(self) -> list[dict[str, Any]]:
         """Release every server idle past its window; returns the release results."""
@@ -102,6 +123,7 @@ class IdleMonitor:
         config = self._config_loader()
         released: list[dict[str, Any]] = []
         watched: set[str] = set()
+        gateway = self._gateway()
         for server in list_servers():
             server_id = str(server.get("id") or "")
             if not server_id or not _watchable(server):
@@ -110,7 +132,7 @@ class IdleMonitor:
             if window <= 0:
                 continue
             watched.add(server_id)
-            state = self._read(server)
+            state = self._read(server, gateway)
             previous = self._seen.get(server_id)
             if state is None or state[0] or previous is None or previous[0] != state[1]:
                 # Unreadable, busy, new to us, or served a request since the last poll.
@@ -120,7 +142,7 @@ class IdleMonitor:
                 continue
             # Look once more right before stopping, so a request that has just
             # arrived is not cut off.
-            if self._read(server) != (False, previous[0]):
+            if self._read(server, self._gateway()) != (False, previous[0]):
                 self._seen[server_id] = (previous[0], now)
                 continue
             result = self._release(server_id=server_id)

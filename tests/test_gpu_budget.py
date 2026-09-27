@@ -44,6 +44,21 @@ class PlanStartTests(unittest.TestCase):
         self.assertEqual(plan["release"], ["big"])  # 3576 free + 12000 is enough
         self.assertIn("big", plan["message"])
 
+    def test_busy_servers_are_not_released(self) -> None:
+        servers = [_server("small", 3000), _server("big", 12000), _server("mid", 8000)]
+        plan = gpu_budget.plan_start(10000, HW_24G, servers, busy={"big": 2})
+        self.assertEqual(plan["status"], "conflict")
+        self.assertEqual(plan["release"], ["mid", "small"])  # the idle ones, biggest first
+        self.assertEqual({s["id"]: s["in_flight"] for s in plan["running"]}, {"small": 0, "big": 2, "mid": 0})
+
+    def test_only_busy_servers_would_make_room(self) -> None:
+        servers = [_server("small", 3000), _server("big", 16000)]
+        plan = gpu_budget.plan_start(10000, HW_24G, servers, busy={"big": 1})
+        self.assertEqual(plan["status"], "busy")
+        self.assertEqual(plan["release"], [])
+        self.assertEqual(plan["busy"], ["big"])
+        self.assertIn("big (1 running)", plan["message"])
+
     def test_too_big_even_alone(self) -> None:
         plan = gpu_budget.plan_start(30000, HW_24G, [_server("a", 4000)])
         self.assertEqual(plan["status"], "too_big")
@@ -154,6 +169,12 @@ class StartProfileVramTests(unittest.TestCase):
         patcher = mock.patch.object(server_manager.AppConfig, "load", side_effect=lambda *a, **k: self.config)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Gateway requests running per server id (inflight.busy_servers).
+        self.busy: list[dict[str, int]] = [{}]
+        patcher = mock.patch.object(server_manager, "busy_servers",
+                                    side_effect=lambda: self.busy.pop(0) if len(self.busy) > 1 else self.busy[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # Cleanups run last-in first-out: reap while the state dir is still patched,
         # so started servers are stopped before Windows is asked to delete their logs.
         self.addCleanup(self._reap)
@@ -196,6 +217,28 @@ class StartProfileVramTests(unittest.TestCase):
         self.assertEqual(result["vram_plan"]["released"], [other])
         self.assertEqual(server_manager._find_server(other)["status"], server_manager.PARKED)
         self.assertEqual(result["server"]["estimated_vram_mib"], 14000)
+
+    def test_server_answering_requests_is_not_released(self) -> None:
+        other = self._track_other()
+        self.busy = [{other: 2}]
+        for kwargs in ({}, {"release_conflicts": True}):
+            result = self._start(**kwargs)
+            self.assertFalse(result["success"])
+            self.assertEqual(result["reason"], "vram_busy")
+            self.assertEqual(result["vram_plan"]["busy"], [other])
+        self.assertEqual(server_manager._find_server(other)["status"], "running")
+        self.assertIsNone(server_manager._find_server(mode="qwen"))
+        forced = self._start(force=True)
+        self.assertTrue(forced["success"], forced)
+        self.assertEqual(server_manager._find_server(other)["status"], "running")
+
+    def test_request_arriving_after_the_plan_stops_the_release(self) -> None:
+        other = self._track_other()
+        self.busy = [{}, {other: 1}]  # idle when planned, busy when about to release
+        result = self._start(release_conflicts=True)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reason"], "vram_busy")
+        self.assertEqual(server_manager._find_server(other)["status"], "running")
 
     def test_force_starts_with_a_warning(self) -> None:
         other = self._track_other()
@@ -269,6 +312,11 @@ class VramApiTests(unittest.TestCase):
         self.control.start.return_value = {"success": True}
         self._post("/api/start", {"mode": "m", "release_conflicts": True})
         self.control.start.assert_called_with("m", None, stop_existing=False, release_conflicts=True)
+
+    def test_busy_is_409(self) -> None:
+        self.control.start.return_value = {"success": False, "reason": "vram_busy", "error": "busy"}
+        status, payload = self._post("/api/start", {"mode": "m"})
+        self.assertEqual((status, payload["reason"]), (409, "vram_busy"))
 
     def test_restore_restart_and_plan(self) -> None:
         self.control.restore.return_value = {"success": True}
