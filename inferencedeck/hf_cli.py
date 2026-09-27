@@ -7,6 +7,8 @@ import subprocess
 import sys
 from typing import Any, Dict
 
+from .proc import run as run_hidden
+
 
 def detect_hf_cli() -> Dict[str, Any]:
     """Detects if Hugging Face CLI is installed and returns its version."""
@@ -19,7 +21,7 @@ def detect_hf_cli() -> Dict[str, Any]:
             "install_guidance": "Run 'pip install huggingface_hub' or click Install CLI below.",
         }
 
-    result = subprocess.run(
+    result = run_hidden(
         [binary, "--version"],
         capture_output=True,
         text=True,
@@ -83,7 +85,7 @@ def install_hf_cli() -> Dict[str, Any]:
     """Attempts to install or upgrade huggingface_hub via pip."""
     try:
         pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "huggingface_hub"]
-        result = subprocess.run(
+        result = run_hidden(
             pip_cmd,
             capture_output=True,
             text=True,

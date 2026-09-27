@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import is_windows
+from .proc import run as run_hidden
 
 TRACKED_FEATURES = (
     "sse4_2", "avx", "avx2", "fma", "f16c", "bmi2", "avx_vnni",
@@ -111,7 +112,7 @@ def _macos() -> CpuFeatures:
     flags: set[str] = set()
     for key in ("machdep.cpu.features", "machdep.cpu.leaf7_features"):
         try:
-            result = subprocess.run([sysctl, "-n", key], capture_output=True, text=True, timeout=2, check=False)
+            result = run_hidden([sysctl, "-n", key], capture_output=True, text=True, timeout=2, check=False)
         except (OSError, subprocess.SubprocessError):
             continue
         flags.update(result.stdout.split())

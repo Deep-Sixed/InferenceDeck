@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import json
 import os
@@ -7,15 +8,17 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from .paths import is_windows
+from .proc import run as run_hidden
 
 
 def _run(args: list[str], timeout: float = 2.0) -> subprocess.CompletedProcess[str] | None:
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        return run_hidden(args, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -848,7 +851,23 @@ def recommended_headroom_mib(gpus: list[dict[str, Any]]) -> int:
     return max(1024, min(4096, int(round(total_mib * 0.06 / 256) * 256)))
 
 
-def detect_system_hardware() -> dict[str, Any]:
+# Detection shells out (PowerShell, nvidia-smi, lspci); every UI and tray asks
+# for it, so reuse a recent result instead of re-running it per request.
+HARDWARE_CACHE_SECONDS = 30.0
+_hardware_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def detect_system_hardware(max_age: float = HARDWARE_CACHE_SECONDS) -> dict[str, Any]:
+    global _hardware_cache
+    now = time.monotonic()
+    if _hardware_cache is not None and now - _hardware_cache[0] < max_age:
+        return copy.deepcopy(_hardware_cache[1])
+    result = _detect_system_hardware()
+    _hardware_cache = (now, result)
+    return copy.deepcopy(result)
+
+
+def _detect_system_hardware() -> dict[str, Any]:
     gpus = detect_gpus()
     memory = detect_memory()
     primary_gpu = gpus[0] if gpus else None
