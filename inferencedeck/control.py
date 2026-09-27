@@ -13,6 +13,7 @@ from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
+from . import fleet as fleet_view
 from . import otlp, telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .runtime_updates import check_runtime_updates
@@ -88,6 +89,18 @@ class ControlPlane:
     def metrics(self) -> str:
         """The telemetry snapshot in Prometheus text exposition format."""
         return render_prometheus(telemetry_snapshot())
+
+    def _fleet(self) -> fleet_view.Fleet:
+        config = self._config()
+        return fleet_view.current(config.fleet_peers, config.fleet_name)
+
+    def fleet(self) -> dict[str, Any]:
+        """This machine and every configured peer, one summary row each."""
+        return self._fleet().overview()
+
+    def fleet_placement(self, profile: str = "", model: str = "") -> dict[str, Any]:
+        """Machines ranked for running a profile or model file; advice only, nothing is started."""
+        return fleet_view.placement(self._fleet().overview(), profile=profile, model=model)
 
     def telemetry_history(self, range_name: str = "1h") -> dict[str, Any]:
         """Sampled telemetry over ``range_name`` (15m, 1h, 6h, 24h or 7d), bucketed for charts."""

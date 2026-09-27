@@ -171,6 +171,17 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
             elif parsed.path == "/api/telemetry":
                 self._json(HTTPStatus.OK, self.control_plane.telemetry())
+            elif parsed.path == "/api/fleet":
+                self._json(HTTPStatus.OK, self.control_plane.fleet())
+            elif parsed.path == "/api/fleet/placement":
+                try:
+                    payload = self.control_plane.fleet_placement(
+                        profile=(query.get("profile") or [""])[0], model=(query.get("model") or [""])[0]
+                    )
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, payload)
             elif parsed.path == "/api/telemetry/history":
                 range_name = (query.get("range") or ["1h"])[0]
                 try:

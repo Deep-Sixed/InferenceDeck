@@ -50,6 +50,11 @@ class AppConfig:
     # also enables it; put credentials in OTEL_EXPORTER_OTLP_HEADERS, not here.
     otlp_endpoint: str = ""
     otlp_export_seconds: int = 15
+    # Other InferenceDeck control panels to combine into the fleet view, as
+    # {"name", "url", "tokenEnv", "caFile"}; tokens are read from tokenEnv, never stored here.
+    fleet_peers: list[dict[str, Any]] = field(default_factory=list)
+    # This machine's name in the fleet view; empty means the host name.
+    fleet_name: str = ""
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

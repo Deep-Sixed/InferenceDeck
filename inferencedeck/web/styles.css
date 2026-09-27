@@ -18,3 +18,10 @@
 .ttip{position:absolute;z-index:3;pointer-events:none;background:#1b2633;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;min-width:120px}.ttip .trow{display:flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums}
 .tfailtext{color:var(--bad)}
 .tdetails{margin-top:12px}.tdetails summary{cursor:pointer}.ttable{width:100%;border-collapse:collapse;margin:10px 0;font-size:12px;font-variant-numeric:tabular-nums}.ttable th,.ttable td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--line)}.ttable th:first-child,.ttable td:first-child{text-align:left}.ttable th{color:var(--muted);font-weight:500}
+
+/* Machines (fleet) card */
+/* min-width:0 lets the table scroll inside the card instead of widening main's grid column */
+#fleet-card{min-width:0}.fleet-scroll{overflow-x:auto}.fleet-table{margin-top:0}.fleet-table td{vertical-align:top}.fleet-table td,.fleet-table th{white-space:nowrap}.fleet-table td:not(:first-child),.fleet-table th:not(:first-child){text-align:left}
+.fleet-down td:first-child strong{color:var(--muted)}
+#fleet-form input{background:#0b1118;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;min-width:0;flex:1 1 160px}
+#fleet-form{align-items:center}#fleet-placement{margin-top:10px}

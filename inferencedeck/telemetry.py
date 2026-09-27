@@ -396,6 +396,9 @@ def _server_entry(server: dict[str, Any], now: float, gpu_by_pid: dict[int, int]
         "server_id": server.get("id"),
         "profile": server.get("mode"),
         "runtime": server.get("runtime") or "llama.cpp",
+        # The model file name, so machines whose profiles are named differently
+        # can still be matched on the model they serve.
+        "model": Path(str(server["model_path"])).name if server.get("model_path") else None,
         "pid": pid,
         "status": server.get("status"),
         "running": running,

@@ -394,6 +394,50 @@ A collector that is down doesn't affect InferenceDeck. Events are queued (up to
 `GET /api/telemetry` reports the exporter's state under `otlp`: last export time,
 last error, and counts exported and dropped.
 
+#### Machines (fleet view)
+
+With InferenceDeck running on several machines, one web UI can show them all.
+List the other machines as peers in `config.json`:
+
+```json
+{
+  "fleet_name": "thanatos",
+  "fleet_peers": [
+    {"name": "friday", "url": "https://friday.tail1234.ts.net:8716", "tokenEnv": "FRIDAY_DECK_TOKEN"},
+    {"name": "p70", "url": "http://192.168.1.70:8716", "tokenEnv": "P70_DECK_TOKEN", "caFile": "~/p70-ca.pem"}
+  ]
+}
+```
+
+A **Machines** card then appears in the web UI. It has one row per machine with
+GPU load, VRAM, the models loaded (with their live tok/s), active requests, and
+whether the machine answered. `GET /api/fleet` returns the same data.
+
+- Each peer's `/api/telemetry` is read with its own token, sent as `Authorization: Bearer`.
+  The token comes from the environment variable named by `tokenEnv`, never from
+  `config.json`. A peer bound to the LAN or tailnet requires a token.
+- Peers are asked in parallel with a 3-second timeout, and the combined view is
+  cached for 5 seconds. A slow or offline machine shows as unreachable (with the
+  reason, such as `HTTP 401 (check its token)`) rather than stalling the page.
+- Redirects are refused, so a token is never sent anywhere except the configured URL.
+  `caFile` trusts a private CA for a peer served over HTTPS with `--certfile`.
+- Only `/api/telemetry` is read, never a peer's own fleet view, so machines that
+  list each other don't loop.
+
+**Where should this run?** The card's form, and
+`GET /api/fleet/placement?profile=qwen3-30b` (or `?model=<file>.gguf`), rank the
+machines for a model:
+
+1. machines with it **loaded** and serving;
+2. machines with it loaded but **paused**;
+3. machines that have **run it before** (a stopped or released server, or a benchmark);
+4. the rest.
+
+Within each group, faster machines rank first (live tok/s, else the last benchmark),
+then less busy ones, then those with more free VRAM. Profiles are matched by name,
+or by model file name when profile names differ between machines. This is advice
+only: nothing is started or routed automatically.
+
 ## Inference gateway (API mapping)
 
 ```bash

@@ -20,6 +20,7 @@ ASSET_TYPES = {
     "/app.js": "text/javascript; charset=utf-8",
     "/styles.css": "text/css; charset=utf-8",
     "/telemetry.js": "text/javascript; charset=utf-8",
+    "/fleet.js": "text/javascript; charset=utf-8",
 }
 
 

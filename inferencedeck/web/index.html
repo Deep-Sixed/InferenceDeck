@@ -14,6 +14,21 @@
     <div id="status" class="muted">Loading…</div>
     <div id="server-actions"></div>
   </section>
+  <section class="card" id="fleet-card" hidden>
+    <h2>Machines</h2>
+    <div class="fleet-scroll"><table class="ttable fleet-table">
+      <thead><tr><th>Machine</th><th>GPU</th><th>VRAM</th><th>Loaded</th><th>Requests</th><th>State</th></tr></thead>
+      <tbody id="fleet-rows"></tbody>
+    </table></div>
+    <div id="fleet-errors"></div>
+    <form id="fleet-form" class="actions">
+      <label class="meta" for="fleet-profile">Where should this run?</label>
+      <input id="fleet-profile" list="fleet-profiles" placeholder="profile name" autocomplete="off">
+      <datalist id="fleet-profiles"></datalist>
+      <button type="submit">Rank machines</button>
+    </form>
+    <div id="fleet-placement" class="list"></div>
+  </section>
   <section class="card">
     <div class="thead"><h2>Telemetry</h2>
       <div id="telemetry-range" class="trange" role="group" aria-label="Time range">
@@ -82,5 +97,6 @@
 <div id="toast" role="status"></div>
 <script src="/app.js"></script>
 <script src="/telemetry.js"></script>
+<script src="/fleet.js"></script>
 </body>
 </html>
