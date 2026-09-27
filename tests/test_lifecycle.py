@@ -163,6 +163,13 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in logs.iterdir()), [])
         self.assertTrue(outside.exists())  # only files in the log dir are ever deleted
 
+    @staticmethod
+    def _wait_exited(record: dict) -> None:
+        # An exited record has its pid moved to last_pid.
+        pid = record.get("pid") or record.get("last_pid")
+        if not server_manager._wait_gone(pid, 10):
+            raise AssertionError(f"PID {pid} did not exit")
+
     def test_each_launch_gets_its_own_logs(self) -> None:
         prepared = {
             "success": True,
@@ -173,8 +180,10 @@ class LifecycleTests(unittest.TestCase):
         }
         with mock.patch.object(server_manager, "prepare_launch_command", return_value=prepared):
             first = server_manager.start_profile("qwen", wait_ready=False)["server"]
-            self.assertTrue(server_manager._wait_gone(first["pid"], 10))
+            self._wait_exited(first)
             second = server_manager.start_profile("qwen", wait_ready=False)["server"]
+        # Windows can't delete the temp dir while the process still holds its log open.
+        self._wait_exited(second)
         self.assertNotEqual(first["id"], second["id"])  # even if the OS reused the PID
         self.assertNotEqual(first["stdout_log"], second["stdout_log"])
         self.assertEqual(len(server_manager.read_state()["servers"]), 2)
