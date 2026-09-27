@@ -13,6 +13,7 @@ from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
+from . import telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
     CONTEXT_PRESETS,
@@ -86,6 +87,15 @@ class ControlPlane:
     def metrics(self) -> str:
         """The telemetry snapshot in Prometheus text exposition format."""
         return render_prometheus(telemetry_snapshot())
+
+    def telemetry_history(self, range_name: str = "1h") -> dict[str, Any]:
+        """Sampled telemetry over ``range_name`` (15m, 1h, 6h, 24h or 7d), bucketed for charts."""
+        history = telemetry_history.current()
+        if history is None:
+            if range_name not in telemetry_history.RANGES:
+                raise ValueError(f"range must be one of {', '.join(telemetry_history.RANGES)}")
+            return {"enabled": False, "range": range_name, "timestamps": [], "series": {}, "labels": {}, "limits": {}, "events": []}
+        return {"enabled": True, **history.query(range_name)}
 
     def fit(self, mode: str, overrides: dict[str, Any] | None = None, *, target_mib: int = 1024) -> dict[str, Any]:
         return run_fit_test(

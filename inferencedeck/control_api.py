@@ -151,6 +151,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
             elif parsed.path == "/api/telemetry":
                 self._json(HTTPStatus.OK, self.control_plane.telemetry())
+            elif parsed.path == "/api/telemetry/history":
+                range_name = (query.get("range") or ["1h"])[0]
+                try:
+                    payload = self.control_plane.telemetry_history(range_name)
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, payload)
             elif parsed.path == "/metrics":
                 self._text(HTTPStatus.OK, self.control_plane.metrics(), PROMETHEUS_CONTENT_TYPE)
             elif parsed.path == "/api/logs":

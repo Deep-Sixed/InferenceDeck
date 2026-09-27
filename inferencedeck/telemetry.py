@@ -64,7 +64,18 @@ class TelemetryRegistry:
         self._lock = threading.Lock()
         self._counters: dict[tuple[str, str, str], int] = {}
         self._events: deque[dict[str, Any]] = deque(maxlen=max_events)
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
         self.started_at = time.time()
+
+    def add_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        """Call ``listener`` with every event recorded from now on (the history store keeps them on disk)."""
+        with self._lock:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener: Callable[[dict[str, Any]], None]) -> None:
+        with self._lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
 
     def emit(self, event: str, **fields: Any) -> None:
         record = {"type": event, "timestamp": _now_iso(), **{k: v for k, v in fields.items() if v is not None}}
@@ -72,6 +83,12 @@ class TelemetryRegistry:
         with self._lock:
             self._counters[key] = self._counters.get(key, 0) + 1
             self._events.append(record)
+            listeners = list(self._listeners)
+        for listener in listeners:
+            try:
+                listener(record)
+            except Exception:
+                pass
 
     def counters(self) -> list[dict[str, Any]]:
         with self._lock:

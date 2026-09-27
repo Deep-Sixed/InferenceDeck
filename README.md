@@ -224,7 +224,29 @@ for two seconds so a UI poll and a scrape share one `nvidia-smi` call. GPU readi
 need `nvidia-smi`, and per-process memory and CPU time need Linux `/proc`. On other
 platforms those fields are left out. They are never reported as zero.
 
-Scrape it with Prometheus (the token goes in a bearer header, which Prometheus sends natively):
+#### History and graphs
+
+`inferencedeck-web` also samples the snapshot every 5 seconds and keeps it for the
+**Telemetry** card in the web UI. That card has one chart per measure: GPU
+utilisation, VRAM, temperature, power and clock; GPU memory per server; CPU and
+RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
+are marked on the charts, with failed starts and stops in red. A data table
+under the charts lists the latest, average and peak value of every series.
+
+The last hour is kept at full resolution in memory. One-minute averages are
+written to one JSON-lines file per UTC day under the cache directory's
+`telemetry/` folder, so the 6h, 24h and 7d views survive a restart. Lifecycle
+events go into the same files. Gaps in a chart mean the control process wasn't
+running. The same data is available as `GET /api/telemetry/history?range=15m|1h|6h|24h|7d`.
+
+| Setting (`config.json`) | Default | Meaning |
+|---|---|---|
+| `telemetry_sample_seconds` | `5` | Seconds between samples; `0` turns history off |
+| `telemetry_retention_days` | `7` | Days of one-minute averages kept on disk |
+
+#### Prometheus
+
+Scrape `/metrics` with Prometheus (the token goes in a bearer header, which Prometheus sends natively):
 
 ```yaml
 scrape_configs:

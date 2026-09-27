@@ -39,6 +39,10 @@ class AppConfig:
     server_history_limit: int = 5
     auto_generate_launch_scripts: bool = True
     auto_scan_on_startup: bool = True
+    # Telemetry history: seconds between samples (0 turns history off) and days of
+    # one-minute averages kept on disk.
+    telemetry_sample_seconds: int = 5
+    telemetry_retention_days: int = 7
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

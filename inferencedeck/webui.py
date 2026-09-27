@@ -7,13 +7,16 @@ from importlib.resources import files
 from pathlib import Path
 
 from .auth import AuthState, validate_bind_security
+from .config import AppConfig
 from .control import ControlPlane
 from .control_api import ControlRequestHandler
+from .telemetry_history import start_sampler
 
 
 ASSET_TYPES = {
     "/app.js": "text/javascript; charset=utf-8",
     "/styles.css": "text/css; charset=utf-8",
+    "/telemetry.js": "text/javascript; charset=utf-8",
 }
 
 
@@ -50,6 +53,8 @@ def serve(
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
+    config = AppConfig.load()
+    start_sampler(config.telemetry_sample_seconds, config.telemetry_retention_days)
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 

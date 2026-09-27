@@ -15,6 +15,19 @@
     <div id="server-actions"></div>
   </section>
   <section class="card">
+    <div class="thead"><h2>Telemetry</h2>
+      <div id="telemetry-range" class="trange" role="group" aria-label="Time range">
+        <button data-range="15m" aria-pressed="false">15m</button><button data-range="1h" aria-pressed="true">1h</button><button data-range="6h" aria-pressed="false">6h</button><button data-range="24h" aria-pressed="false">24h</button><button data-range="7d" aria-pressed="false">7d</button>
+      </div>
+    </div>
+    <div id="telemetry-charts" class="tcharts"><div id="telemetry-tip" class="ttip" hidden></div></div>
+    <div id="telemetry-empty" class="muted" hidden></div>
+    <details class="tdetails"><summary class="meta">Data table &amp; recent events</summary>
+      <table id="telemetry-table" class="ttable"></table>
+      <div id="telemetry-events" class="list"></div>
+    </details>
+  </section>
+  <section class="card">
     <h2>llama.cpp runtime</h2>
     <div id="runtime" class="muted">Loading…</div>
   </section>
@@ -63,5 +76,6 @@
 </div>
 <div id="toast" role="status"></div>
 <script src="/app.js"></script>
+<script src="/telemetry.js"></script>
 </body>
 </html>
