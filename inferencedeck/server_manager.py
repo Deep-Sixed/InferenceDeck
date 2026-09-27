@@ -257,6 +257,54 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
     }
 
 
+
+def _set_process_suspended(pid: int, suspended: bool) -> tuple[bool, str]:
+    if not pid_is_running(pid):
+        return False, f"PID {pid} is not running."
+    if is_windows():
+        import ctypes
+
+        PROCESS_SUSPEND_RESUME = 0x0800
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+        handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, int(pid))
+        if not handle:
+            return False, f"OpenProcess failed for PID {pid}."
+        try:
+            fn = ntdll.NtSuspendProcess if suspended else ntdll.NtResumeProcess
+            status = int(fn(handle))
+            if status != 0:
+                return False, f"NT process state change failed with status 0x{status & 0xffffffff:08x}."
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        import signal
+
+        os.kill(int(pid), signal.SIGSTOP if suspended else signal.SIGCONT)
+    return True, (f"Suspended PID {pid}." if suspended else f"Resumed PID {pid}.")
+
+
+def suspend_server(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
+    server = _find_server(server_id, mode)
+    if not server:
+        return {"success": False, "error": "No tracked server matched the request."}
+    pid = int(server.get("pid") or 0)
+    success, message = _set_process_suspended(pid, True)
+    if success:
+        _update_server(server["id"], {"status": "suspended", "running": True, "suspended": True})
+    return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
+
+
+def resume_server(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
+    server = _find_server(server_id, mode)
+    if not server:
+        return {"success": False, "error": "No tracked server matched the request."}
+    pid = int(server.get("pid") or 0)
+    success, message = _set_process_suspended(pid, False)
+    if success:
+        _update_server(server["id"], {"status": "running", "running": True, "suspended": False})
+    return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
+
 def _update_server(server_id: str, patch: dict[str, Any]) -> None:
     state = read_state()
     servers = state.setdefault("servers", [])
