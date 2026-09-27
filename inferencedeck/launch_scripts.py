@@ -148,6 +148,27 @@ MANIFEST_PARAM_KEYS = (
     "cache_ram_mib",
     "cache_reuse",
     "slot_prompt_similarity",
+    # vllm.cpp profiles (runtime: vllm.cpp); see vllm_cpp_args.
+    "block_size",
+    "num_blocks",
+    "kv_cache_memory_mib",
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "kv_cache_dtype",
+    "enable_prefix_caching",
+    "scheduling_policy",
+    "tool_call_parser",
+    "reasoning_parser",
+    "speculative_config",
+    # MLC LLM profiles (runtime: mlc-llm); see mlc_llm_args.
+    "mlc_model",
+    "mlc_mode",
+    "model_lib",
+    "max_total_seq_length",
+    "prefill_chunk_size",
+    "gpu_memory_utilization",
+    "tensor_parallel_shards",
+    "sliding_window_size",
 )
 
 
@@ -357,12 +378,16 @@ def _render_ps1_classic(
         if _model_is_hf_id(model_path)
         else "if (-not (Test-Path -LiteralPath $model)) { throw \"Missing model: $model\" }\n"
     )
+    # Single-quoted PowerShell strings escape ' by doubling it; a model or
+    # binary path with an apostrophe must not end the string early.
+    posix_model = _script_model_value(model_path).replace("'", "''")
+    posix_binary = Path(binary).as_posix().replace("'", "''")
     return (
         "$ErrorActionPreference = 'Stop'\n"
         + SCRIPT_HEADER_COMMENT
-        + f"$model = '{_script_model_value(model_path)}'\n"
+        + f"$model = '{posix_model}'\n"
         + guard
-        + f"& '{Path(binary).as_posix()}'{invocation_text} $model"
+        + f"& '{posix_binary}'{invocation_text} $model"
         + (f" {body}\n" if body else "\n")
     )
 

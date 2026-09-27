@@ -112,6 +112,22 @@ class GenerateSingleLaunchScriptTests(_IsolatedDirs):
         self.assertIsNotNone(parsed)
         self.assertTrue(parsed.replace("\\", "/").endswith("models/Tiny-1B-Q8_0.gguf".replace("/", os.sep).replace("\\", "/")) or parsed.endswith("Tiny-1B-Q8_0.gguf"))
 
+    def test_ps1_escapes_apostrophes_in_paths(self) -> None:
+        model_path = self._seed_model("O'Brien's-1B-Q8_0.gguf")
+        payload = generate_launch_script(
+            mode="obrien",
+            model_path=str(model_path),
+            params={"ctx_size": 4096},
+            project_root=self.project_root,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        model_line = next(line for line in ps1.splitlines() if line.startswith("$model ="))
+        # Every ' inside the quoted value is doubled, so the string can't end early.
+        self.assertIn("O''Brien''s-1B-Q8_0.gguf'", model_line)
+        self.assertNotIn("O'Brien", model_line.replace("''", ""))
+        parsed = _parse_model_path(Path(payload["ps1_path"]))
+        self.assertTrue(parsed.endswith("O'Brien's-1B-Q8_0.gguf"))
+
     def test_overwrite_false_skips_existing(self) -> None:
         model_path = self._seed_model("Tiny-1B-Q8_0.gguf")
         first = generate_launch_script(
@@ -202,6 +218,55 @@ class VllmCppLaunchScriptTests(_IsolatedDirs):
         scripts = {item.mode: Path(item.ps1_path).read_text(encoding="utf-8") for item in result.generated}
         self.assertIn(f"& '{self.server_bin.as_posix()}' -m $model", scripts["tiny"])
         self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", scripts["qwen-vllm"])
+
+    def test_vllm_cpp_profile_appends_extra_vllm_cpp_args_only(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        config = AppConfig(
+            vllm_cpp_server_path=str(self.vllm_bin),
+            extra_llama_args=["--llama-only"],
+            extra_vllm_cpp_args=["--vllm-extra", "1"],
+        )
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={"runtime": "vllm.cpp", "ctx_size": 8192},
+            project_root=self.project_root,
+            config=config,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn("--vllm-extra 1", ps1)
+        self.assertNotIn("--llama-only", ps1)
+
+    def test_vllm_cpp_speculative_config_json_survives_rendering(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={
+                "runtime": "vllm.cpp",
+                "ctx_size": 8192,
+                "speculative_config": {"method": "mtp", "num_speculative_tokens": 2},
+            },
+            project_root=self.project_root,
+            config=self.config,
+        )
+        spec = '{"method": "mtp", "num_speculative_tokens": 2}'
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn(f"--speculative-config '{spec}'", ps1)
+        if not paths_module.is_windows():
+            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
+            self.assertIn(f"--speculative-config '{spec}'", sh)
+
+    def test_manifest_params_keep_vllm_cpp_keys(self) -> None:
+        params = {
+            "runtime": "vllm.cpp",
+            "ctx_size": 8192,
+            "max_num_seqs": 4,
+            "enable_prefix_caching": True,
+            "block_size": 32,
+            "kv_cache_dtype": "fp8",
+        }
+        self.assertEqual(launch_scripts_module._manifest_params(params), params)
 
 
 class ScanAllLaunchScriptsTests(_IsolatedDirs):

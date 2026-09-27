@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import list_servers, start_profile, stop_server
+from .fileio import atomic_write_text, locked
+from .server_manager import http_base, list_servers, start_profile, stop_server
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -37,13 +38,12 @@ def load_benchmark_results() -> list[dict[str, Any]]:
 
 
 def save_benchmark_result(result: dict[str, Any]) -> None:
-    results = load_benchmark_results()
-    results.append(result)
-    results = results[-100:]
     path = benchmark_results_path()
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    # Locked read-modify-write: two benchmarks finishing together keep both results.
+    with locked(path.with_name(path.name + ".lock")):
+        results = load_benchmark_results()
+        results.append(result)
+        atomic_write_text(path, json.dumps(results[-100:], indent=2) + "\n")
 
 
 def _server_for_mode(mode: str) -> dict[str, Any] | None:
@@ -54,10 +54,7 @@ def _server_for_mode(mode: str) -> dict[str, Any] | None:
 
 
 def _api_base(server: dict[str, Any]) -> str:
-    host = str(server.get("host") or "127.0.0.1")
-    if host in {"0.0.0.0", "::"}:
-        host = "127.0.0.1"
-    return f"http://{host}:{int(server.get('port') or 8080)}"
+    return http_base(server.get("host"), int(server.get("port") or 8080))
 
 
 def _completion_text(payload: dict[str, Any]) -> str:
@@ -141,24 +138,39 @@ def run_profile_benchmark(
     overrides: dict[str, Any] | None = None,
     prompt: str | None = None,
     completion_tokens: int = 128,
-    restart: bool = True,
+    restart: bool = False,
     stop_after: bool = False,
-    ready_timeout_seconds: int = 90,
+    # None: wait as long as this profile's runtime needs to load (see
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp and MLC LLM take far longer than llama.cpp).
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    """Time one chat completion against the profile's server.
+
+    A server already running for ``mode`` is benchmarked as it is; one is only
+    started (with ``overrides``) when none is running or ``restart`` is set.
+    The completion length is capped per request via ``max_tokens``, never as a
+    server flag, so the server is left as the user configured it.
+    """
+
     params = dict(overrides or {})
-    params["n_predict"] = int(completion_tokens)
-    start = start_profile(
-        mode=mode,
-        project_root=project_root,
-        model_dirs=model_dirs,
-        overrides=params,
-        stop_existing=restart,
-        wait_ready=True,
-        ready_timeout_seconds=ready_timeout_seconds,
-    )
-    server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
-    if not server:
-        return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    server = None if restart else _server_for_mode(mode)
+    start = None
+    if server is None:
+        start = start_profile(
+            mode=mode,
+            project_root=project_root,
+            model_dirs=model_dirs,
+            overrides=params or None,
+            stop_existing=restart,
+            wait_ready=True,
+            ready_timeout_seconds=ready_timeout_seconds,
+        )
+        server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
+        if not server:
+            return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    if server.get("suspended"):
+        # A paused process can't answer; the request would just hang until timeout.
+        return {"success": False, "error": f"Server for '{mode}' is paused; resume it before benchmarking.", "server": server}
 
     base_url = _api_base(server)
     request_payload = {
