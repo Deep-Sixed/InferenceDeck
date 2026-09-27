@@ -1088,10 +1088,11 @@ class RuntimeDispatchTests(unittest.TestCase):
         self.assertEqual(detect_runtime(None).id, "llama.cpp")
         self.assertEqual(detect_runtime("ollama").id, "ollama")
         self.assertEqual(detect_runtime("vllm.cpp").id, "vllm.cpp")
+        self.assertEqual(detect_runtime("mlc-llm").id, "mlc-llm")
         # Unknown id is rejected (no silent fallback to llama.cpp).
         self.assertIsNone(detect_runtime("nonsense-runtime"))
         # The runtimes wired into the launch path.
-        self.assertEqual(LAUNCHABLE_RUNTIMES, ("llama.cpp", "vllm.cpp"))
+        self.assertEqual(LAUNCHABLE_RUNTIMES, ("llama.cpp", "vllm.cpp", "mlc-llm"))
 
 
 if __name__ == "__main__":

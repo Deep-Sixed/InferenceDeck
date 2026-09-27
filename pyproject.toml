@@ -16,6 +16,7 @@ tray = ["pystray>=0.19", "Pillow>=9"]
 [project.scripts]
 inferencedeck = "inferencedeck.cli:main"
 inferencedeck-web = "inferencedeck.webui:main"
+inferencedeck-gateway = "inferencedeck.gateway.server:main"
 
 # A GUI program on Windows: no console window.
 [project.gui-scripts]

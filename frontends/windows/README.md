@@ -24,7 +24,11 @@ On Windows `inferencedeck-tray.exe` is a GUI program (no console window). If
 
 Status · Open Web UI (also the tray icon's default click) · Start profile · Remote & cloud
 models · Pause / Resume · Release GPU / Restore · Reload & restart · Context size
-(8K-128K) · Stop / Forget released server · Copy active command · Exit.
+(8K-128K) · Stop / Forget released server · Copy active command · Runtime updates · Exit.
+
+**Runtime updates** says how many runtimes have a newer release, checked at startup and
+then hourly. Its submenu lists each one (clicking opens the GitHub release page) and has
+**Check now**. InferenceDeck never downloads or installs an update itself.
 
 The icon colour follows the state: green running, amber paused, grey idle or released,
 red when InferenceDeck can't be reached.
@@ -32,7 +36,9 @@ red when InferenceDeck can't be reached.
 ## Settings (environment variables)
 
 - `INFERENCEDECK_URL`: the `inferencedeck-web` address, default `http://127.0.0.1:8716`.
-- `INFERENCEDECK_TOKEN`: required when authentication is enabled.
+- `INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE`: required when authentication is enabled; read the
+  same way as the server reads them. After a rejected token the tray checks again less often (up to every
+  10 minutes), so a stale token can't lock this machine out of the web UI.
 - `INFERENCEDECK_TRAY_START_WEB=0`: don't start `inferencedeck-web` automatically. It is
   only ever started for a local (loopback) address.
 
