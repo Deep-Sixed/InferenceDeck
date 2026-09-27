@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from importlib.resources import files
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
+from .config_check import check_all, format_report
 from .control_api import ControlRequestHandler
 from .idle import start_idle_monitor
 
@@ -61,7 +63,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="InferenceDeck local web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8716)
+    parser.add_argument(
+        "--check-config", action="store_true",
+        help="Validate config.json, models.json and remote endpoints, print the result and exit.",
+    )
     args = parser.parse_args()
+    report = check_all()
+    if args.check_config:
+        print(format_report(report))
+        return 1 if report["errors"] else 0
+    if report["errors"] or report["warnings"]:
+        # A broken config.json silently falls back to defaults, so say so up front.
+        print(format_report(report), file=sys.stderr)
     serve(args.host, args.port)
     return 0
 

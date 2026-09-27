@@ -93,6 +93,8 @@ Commands (all print JSON; with no command, `inventory` runs):
 | `servers` | Servers started by InferenceDeck. |
 | `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
 | `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+| `config validate [--strict] [--json]` | Check `config.json`, `models.json` and remote endpoint files without starting anything (see below). Exits 1 on errors. |
+| `config schema config\|profiles\|endpoint` | Print the JSON Schema for a configuration file. |
 | `updates [--channel stable\|prerelease] [--refresh]` | Compare each installed runtime's version with its latest upstream release (see below). |
 
 Discovery commands accept `--project-root`, `--model-dir` (repeatable), `--max-files`
@@ -140,6 +142,32 @@ Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` 
 `VLLM_CPP_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
 metadata requests when set.
 
+
+### Checking the configuration
+
+`inferencedeck config validate` (or `inferencedeck-web --check-config`) checks the three
+files that shape what InferenceDeck does, without launching servers, probing hardware or
+opening ports:
+
+- `config.json`: key types and allowed values, unknown keys (a typo such as
+  `idel_release_seconds` is otherwise silently ignored), and configured paths that don't
+  exist. A `config.json` that isn't valid JSON is an error, since InferenceDeck then runs
+  on defaults.
+- `models.json`: each profile has a unique `mode`, typed `recommended_params` (for
+  example `ctx_size` must be an integer and `flash_attn` a boolean), unknown params with a
+  "did you mean" hint, and runtimes that are detected but cannot be launched.
+- `remote_endpoints/*.json`: the same rules the endpoint loader enforces, plus unknown
+  keys; an `apiKey` stored in the file is an error.
+
+Errors mean a file won't work as written; warnings mean it will, but probably not as
+meant. `inferencedeck-web` prints any problems when it starts, the web UI shows them in the
+Status card, and `GET /api/config/check` returns them as JSON. `--strict` makes warnings
+fail the command too, for CI.
+
+The schemas are also in `schemas/` (`config.schema.json`, `models.schema.json`,
+`remote-endpoint.schema.json`). Point an editor at one for completion and inline checks,
+e.g. `"$schema": "https://raw.githubusercontent.com/Deep-Sixed/InferenceDeck/main/schemas/models.schema.json"`
+in `models.json`.
 ## Choosing a llama.cpp build
 
 InferenceDeck picks the llama-server build this CPU can run:

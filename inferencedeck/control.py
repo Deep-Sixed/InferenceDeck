@@ -8,6 +8,7 @@ from .backends import detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
 from .capabilities import filter_profiles, profile_capabilities
 from .config import AppConfig
+from .config_check import check_all
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
 from .inventory import build_inventory
@@ -235,6 +236,10 @@ class ControlPlane:
 
     def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
         return set_idle_release(server_id, seconds)
+
+    def config_check(self) -> dict[str, Any]:
+        root = Path(self.project_root).expanduser() if self.project_root else None
+        return check_all(project_root=root)
 
     def sampling_presets(self) -> dict[str, Any]:
         return {"presets": sampling_presets()}

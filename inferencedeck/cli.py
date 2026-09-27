@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .backends import detect_all
 from .config import AppConfig
+from .config_check import SCHEMAS, check_all, format_report
 from .inventory import build_inventory
 from .profile_resolver import resolved_inventory, resolve_profiles
 from .runtime_updates import SUPPORTED_CHANNELS, check_runtime_updates
@@ -99,6 +100,26 @@ def updates_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def config_validate_command(args: argparse.Namespace) -> int:
+    report = check_all(
+        project_root=Path(args.project_root).expanduser() if args.project_root else None,
+        config_path=Path(args.config).expanduser() if args.config else None,
+        endpoints=Path(args.endpoints).expanduser() if args.endpoints else None,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_report(report))
+    if report["errors"]:
+        return 1
+    return 1 if args.strict and report["warnings"] else 0
+
+
+def config_schema_command(args: argparse.Namespace) -> int:
+    print(json.dumps(SCHEMAS[args.which], indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m inferencedeck",
@@ -149,6 +170,21 @@ def main(argv: list[str] | None = None) -> int:
     updates_parser.add_argument("--refresh", action="store_true", help="Ignore the one-hour cache and ask GitHub again.")
     updates_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     updates_parser.set_defaults(func=updates_command)
+
+    config_parser = subparsers.add_parser("config", help="Check or describe the configuration files.")
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
+    validate_parser = config_sub.add_parser(
+        "validate", help="Check config.json, models.json and remote endpoints without starting anything."
+    )
+    validate_parser.add_argument("--project-root", help="Folder holding models.json (default: found from here).")
+    validate_parser.add_argument("--config", help="config.json to check (default: the per-user config).")
+    validate_parser.add_argument("--endpoints", help="remote_endpoints folder to check (default: the per-user one).")
+    validate_parser.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    validate_parser.add_argument("--strict", action="store_true", help="Also exit non-zero on warnings.")
+    validate_parser.set_defaults(func=config_validate_command)
+    schema_parser = config_sub.add_parser("schema", help="Print a JSON Schema for one of the configuration files.")
+    schema_parser.add_argument("which", choices=sorted(SCHEMAS), help="config.json, models.json (profiles) or an endpoint file.")
+    schema_parser.set_defaults(func=config_schema_command)
 
     _add_common_args(parser)
     parser.set_defaults(func=inventory_command)
