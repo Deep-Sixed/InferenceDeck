@@ -61,10 +61,45 @@ class ControlApiTests(unittest.TestCase):
         self.control.suspend.assert_called_once_with(server_id="abc", mode=None)
 
     def test_invalid_json_is_400(self) -> None:
-        req = urllib.request.Request(self.base + "/api/start", data=b"{", method="POST")
+        req = urllib.request.Request(
+            self.base + "/api/start", data=b"{", headers={"Content-Type": "application/json"}, method="POST"
+        )
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(req, timeout=2)
         self.assertEqual(caught.exception.code, 400)
+
+    def _status_code(self, req: urllib.request.Request) -> int:
+        try:
+            with urllib.request.urlopen(req, timeout=2) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_cross_site_simple_post_is_rejected(self) -> None:
+        # A web page can send text/plain to localhost without a CORS preflight.
+        req = urllib.request.Request(
+            self.base + "/api/stop",
+            data=json.dumps({"server_id": "abc"}).encode(),
+            headers={"Content-Type": "text/plain"},
+            method="POST",
+        )
+        self.assertEqual(self._status_code(req), 415)
+        self.control.stop.assert_not_called()
+
+    def test_foreign_host_header_is_rejected_without_auth(self) -> None:
+        req = urllib.request.Request(self.base + "/api/status", headers={"Host": "rebind.example:80"})
+        self.assertEqual(self._status_code(req), 403)
+        self.control.status.assert_not_called()
+
+    def test_loopback_host_headers_are_allowed(self) -> None:
+        port = self.server.server_port
+        for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", "localhost"):
+            req = urllib.request.Request(self.base + "/api/status", headers={"Host": host})
+            self.assertEqual(self._status_code(req), 200, host)
+
+    def test_non_integer_log_lines_is_400(self) -> None:
+        req = urllib.request.Request(self.base + "/api/logs?server_id=abc&lines=lots")
+        self.assertEqual(self._status_code(req), 400)
 
 class PerformanceControlTests(unittest.TestCase):
     def test_hardware_delegates(self) -> None:

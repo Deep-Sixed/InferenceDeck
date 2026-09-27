@@ -19,11 +19,14 @@ internal sealed record RemoteState(string Name, string DisplayName, string Provi
 
 internal sealed class ControlClient
 {
+    private static readonly TimeSpan ShortTimeout = TimeSpan.FromSeconds(5);
+    // api/start waits for the model to load (up to 45 s server-side) before replying.
+    private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(120);
     private readonly HttpClient _http;
 
     public ControlClient(string baseUrl)
     {
-        _http = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"), Timeout = TimeSpan.FromSeconds(5) };
+        _http = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"), Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         var token = Environment.GetEnvironmentVariable("INFERENCEDECK_TOKEN");
         if (!string.IsNullOrWhiteSpace(token)) _http.DefaultRequestHeaders.Add("X-Auth-Token", token);
     }
@@ -70,25 +73,38 @@ internal sealed class ControlClient
     public Task<JsonDocument> EnableRemoteAsync(string name) => PostAsync("api/remote", new { action = "enable", name });
     public Task<JsonDocument> DisableRemotesAsync() => PostAsync("api/remote", new { action = "disable" });
 
-    public Task<JsonDocument> StartAsync(string mode) => PostAsync("api/start", new { mode });
+    public Task<JsonDocument> StartAsync(string mode) => PostAsync("api/start", new { mode }, StartTimeout);
     public Task<JsonDocument> StopAsync(string serverId) => PostAsync("api/stop", new { server_id = serverId });
     public Task<JsonDocument> SuspendAsync(string serverId) => PostAsync("api/suspend", new { server_id = serverId });
     public Task<JsonDocument> ResumeAsync(string serverId) => PostAsync("api/resume", new { server_id = serverId });
 
     private async Task<JsonDocument> GetJsonAsync(string path)
     {
-        using var response = await _http.GetAsync(path);
-        var bytes = await response.Content.ReadAsByteArrayAsync();
-        response.EnsureSuccessStatusCode();
-        return JsonDocument.Parse(bytes);
+        using var cts = new CancellationTokenSource(ShortTimeout);
+        using var response = await _http.GetAsync(path, cts.Token);
+        return await ReadAsync(response, cts.Token);
     }
 
-    private async Task<JsonDocument> PostAsync(string path, object body)
+    private async Task<JsonDocument> PostAsync(string path, object body, TimeSpan? timeout = null)
     {
-        using var response = await _http.PostAsJsonAsync(path, body);
-        var bytes = await response.Content.ReadAsByteArrayAsync();
-        response.EnsureSuccessStatusCode();
-        return JsonDocument.Parse(bytes);
+        using var cts = new CancellationTokenSource(timeout ?? ShortTimeout);
+        using var response = await _http.PostAsJsonAsync(path, body, cts.Token);
+        return await ReadAsync(response, cts.Token);
+    }
+
+    private static async Task<JsonDocument> ReadAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        var bytes = await response.Content.ReadAsByteArrayAsync(token);
+        if (response.IsSuccessStatusCode) return JsonDocument.Parse(bytes);
+        // Surface the API's own error message instead of "400 (Bad Request)".
+        string? error = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(bytes);
+            error = TextOrNull(doc.RootElement, "error") ?? TextOrNull(doc.RootElement, "message");
+        }
+        catch (JsonException) { }
+        throw new HttpRequestException(error ?? $"{(int)response.StatusCode} {response.ReasonPhrase}", null, response.StatusCode);
     }
 
     private static string Text(JsonElement item, string name) => TextOrNull(item, name) ?? string.Empty;

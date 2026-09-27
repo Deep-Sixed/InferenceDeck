@@ -985,6 +985,34 @@ class RuntimeUpdatesTests(unittest.TestCase):
 
 
 class ServerStopTests(unittest.TestCase):
+    def test_stop_suspended_server_exits_on_sigterm(self) -> None:
+        import subprocess
+        import sys
+        import time
+        from unittest import mock
+
+        from inferencedeck import server_manager
+
+        if server_manager.is_windows():
+            self.skipTest("POSIX SIGSTOP/SIGCONT")
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.object(server_manager, "cache_dir", return_value=Path(tmp)):
+                    server_manager.write_state({"servers": [{"id": "s", "mode": "m", "pid": proc.pid, "running": True}]})
+                    self.assertTrue(server_manager.suspend_server(server_id="s")["success"])
+                    started = time.monotonic()
+                    result = server_manager.stop_server(server_id="s")
+                    elapsed = time.monotonic() - started
+            self.assertTrue(result["success"], result)
+            self.assertNotIn("SIGKILL", result["message"])
+            self.assertLess(elapsed, 4)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
     def test_stop_escalates_to_sigkill_when_sigterm_ignored(self) -> None:
         import subprocess
         import sys
