@@ -9,8 +9,10 @@ serves the control API and the web UI.
 
 ## Install and run
 
+From the repository checkout:
+
 ```powershell
-pip install "inferencedeck[tray]"
+pip install -e ".[tray]"
 inferencedeck-tray
 ```
 
