@@ -231,6 +231,65 @@ def detect_vllm() -> Environment:
     )
 
 
+def _vllm_cpp_roots(config: AppConfig) -> list[Path]:
+    roots: list[Path] = []
+    home = os.environ.get("VLLM_CPP_HOME")
+    if home:
+        roots.append(Path(home).expanduser())
+    roots.extend(Path(raw).expanduser() for raw in config.runtime_dirs if raw)
+    # A source build puts vllm-server in build/examples; a release archive in bin.
+    expanded: list[Path] = []
+    for root in roots:
+        expanded.extend([root, root / "build" / "examples"])
+    return [path for path in expanded if path.is_dir()]
+
+
+def detect_vllm_cpp(config: AppConfig | None = None) -> Environment:
+    """vllm.cpp's ``vllm-server``: a standalone C++ engine with vLLM's serving core."""
+
+    app_config = config or AppConfig.load()
+    binary = (
+        _configured_file(app_config.vllm_cpp_server_path)
+        or _find_executable("vllm-server", ["VLLM_CPP_SERVER", "VLLM_CPP_SERVER_BIN"], _vllm_cpp_roots(app_config))
+    )
+
+    configured_url = os.environ.get("VLLM_CPP_SERVER_URL")
+    api_url = _normalize_base_url(configured_url, "http://127.0.0.1:8000")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    version = None
+    if ok:
+        # The CLI has no documented --version; a running server answers /version.
+        got_version, version_payload, _ = _request_json(f"{api_url}/version")
+        if got_version and isinstance(version_payload, dict):
+            version = version_payload.get("version")
+
+    warnings: list[str] = []
+    if not binary:
+        warnings.append(
+            "vllm-server was not found. Set vllm_cpp_server_path in config, VLLM_CPP_SERVER, "
+            "or VLLM_CPP_HOME to a vllm.cpp build or release archive."
+        )
+    return Environment(
+        id="vllm.cpp",
+        kind="local_binary",
+        name="vllm.cpp",
+        available=bool(binary or ok),
+        binary_path=binary,
+        api_url=api_url if ok else None,
+        version=str(version) if version else None,
+        model_count=model_count,
+        details={
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "status": "alpha: CLI flags may change between vllm.cpp releases",
+        },
+        warnings=warnings,
+    )
+
+
 def detect_mlx() -> Environment:
     module_available = importlib.util.find_spec("mlx_lm") is not None
     is_macos = os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
@@ -313,13 +372,14 @@ def detect_all(project_root: Path | None = None, config: AppConfig | None = None
         detect_ollama(),
         detect_lm_studio(),
         detect_vllm(),
+        detect_vllm_cpp(config),
         detect_mlx(),
     ]
 
 
 # Runtimes whose launch path is actually wired into prepare_launch_command.
 # Others are detectable (and selectable in the UI) but cannot be started yet.
-LAUNCHABLE_RUNTIMES = ("llama.cpp",)
+LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp")
 
 
 def detect_runtime(
@@ -333,6 +393,8 @@ def detect_runtime(
         return detect_llama_cpp(project_root, config=config)
     if runtime_id == "wsl-llama.cpp":
         return detect_wsl_llama_cpp()
+    if runtime_id == "vllm.cpp":
+        return detect_vllm_cpp(config)
     detectors = {
         "ollama": detect_ollama,
         "lm-studio": detect_lm_studio,
