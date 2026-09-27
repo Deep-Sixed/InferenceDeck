@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from typing import Any
 
+from .hf_download import download_model, find_hf_cli
 from .proc import run as run_hidden
 
 
@@ -100,7 +100,7 @@ def download_model_file(repo_id: str, filename: str, dest_dir: str) -> dict[str,
     Used by the selected-model HF update flow: caller passes the exact repo and
     filename from a prior update check, so this is a targeted refresh, not a guess.
     """
-    hf_cli = shutil.which("huggingface-cli")
+    hf_cli = find_hf_cli()
     if not hf_cli:
         return {"success": False, "message": "Hugging Face CLI not found. Install with 'pip install huggingface_hub'."}
     if not (repo_id and filename and dest_dir):
@@ -115,34 +115,7 @@ def download_model_file(repo_id: str, filename: str, dest_dir: str) -> dict[str,
 
 
 def pull_draft_model(repo_id: str, quant: str = "Q4_K_M") -> dict[str, Any]:
-    hf_cli = shutil.which("huggingface-cli")
-    if not hf_cli:
-        return {"success": False, "message": "Hugging Face CLI not found. Install with 'pip install huggingface_hub'."}
-    search_pattern = f"{repo_id}/{quant}"
-    result = _run(
-        [hf_cli, "ls", repo_id, "--patterns", f"*{quant}*"],
-        timeout=15.0,
-    )
-    if not result or result.returncode != 0:
-        result = _run(
-            [hf_cli, "ls", repo_id],
-            timeout=15.0,
-        )
-    if result and result.returncode == 0 and result.stdout.strip():
-        files = result.stdout.strip().splitlines()
-        gguf_files = [f for f in files if f.lower().endswith(".gguf")]
-        if not gguf_files:
-            return {"success": False, "message": "No GGUF files found for this repo/quant combination."}
-        target_file = gguf_files[0]
-    else:
-        return {"success": False, "message": f"Could not list files for {repo_id}. Check the repo ID."}
-    download_result = _run(
-        [hf_cli, "download", repo_id, "--include", target_file],
-        timeout=600.0,
-    )
-    if download_result and download_result.returncode == 0:
-        return {"success": True, "message": f"Downloaded {target_file} from {repo_id}."}
-    return {
-        "success": False,
-        "message": download_result.stderr.strip() if download_result else "Download failed.",
-    }
+    """Download the ``quant`` GGUF (all shards) of a draft-model repo into the HF cache."""
+    result = download_model(repo_id, quant=quant, include_mmproj=False)
+    message = result.get("message") if result.get("success") else result.get("error")
+    return result | {"message": message or "Download failed."}

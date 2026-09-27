@@ -139,6 +139,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/runtime":
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
+            elif parsed.path == "/api/hf/files":
+                self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -230,6 +232,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("mode") or ""),
                     validate_overrides(body.get("overrides")),
                     completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
+                )
+            elif parsed.path == "/api/hf/download":
+                # Always into the HF cache: the API never picks a destination path.
+                payload = self.control_plane.hf_download(
+                    str(body.get("repo_id") or ""),
+                    quant=str(body.get("quant") or "") or None,
+                    pattern=str(body.get("pattern") or "") or None,
+                    include_mmproj=bool(body.get("include_mmproj", True)),
+                    dry_run=bool(body.get("dry_run", False)),
                 )
             elif parsed.path == "/api/runtime":
                 payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))

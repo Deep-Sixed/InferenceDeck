@@ -90,6 +90,8 @@ Commands (all print JSON; with no command, `inventory` runs):
 | `servers` | Servers started by InferenceDeck. |
 | `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
 | `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+| `hf-files REPO` | List the GGUF quants (split shards grouped) and vision projectors in a Hugging Face repo. |
+| `pull REPO --quant Q4_K_M` / `pull REPO --pattern GLOB` | Download one quant: every shard, plus the repo's mmproj (`--no-mmproj` to skip). `--dry-run` shows the files first. |
 
 Discovery commands accept `--project-root`, `--model-dir` (repeatable), `--max-files`
 and `--no-manifest`.
@@ -137,6 +139,45 @@ pins), under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root and working dire
   ```
 - the build's `CMakeCache.txt` (`GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_CUDA`);
 - otherwise it is assumed to be a standard build that needs AVX2.
+
+## Downloading models from Hugging Face
+
+`inferencedeck pull` (and `POST /api/hf/download`) fetch exactly one quant of a repo.
+Split GGUFs (`-00001-of-00003`) are grouped so all shards come down together, and a
+vision projector (`mmproj`, preferring F16) is added when the repo has one. No match,
+or more than one, fails with the list of available quants instead of guessing.
+
+```bash
+inferencedeck hf-files unsloth/gemma-3-4b-it-GGUF --pretty
+inferencedeck pull unsloth/gemma-3-4b-it-GGUF --quant Q4_K_M
+inferencedeck pull unsloth/gemma-3-4b-it-GGUF --pattern '*UD-Q4_K_XL*' --dest ~/models
+```
+
+Files go to the Hugging Face cache (already scanned for models) unless `--dest` is
+given; the control API always uses the cache. The download runs the `hf` CLI
+(`huggingface-cli` on older installs, from `pip install huggingface_hub`), which
+resumes interrupted downloads and uses `HF_TOKEN` for gated repos.
+
+## Multi-GPU, LoRA and other launch options
+
+Profile `recommended_params` map to `llama-server` flags:
+
+| Param | Flag | Example |
+|---|---|---|
+| `split_mode` | `--split-mode` | `"layer"`, `"row"`, `"tensor"`, `"none"` |
+| `tensor_split` | `--tensor-split` | `[3, 1]` or `"3,1"` |
+| `main_gpu` | `--main-gpu` | `0` |
+| `rpc_servers` | `--rpc` | `["10.0.0.2:50052"]` |
+| `lora` | `--lora` / `--lora-scaled` | `["style.gguf", {"path": "domain.gguf", "scale": 0.5}]` |
+| `override_kv` | `--override-kv` (one per entry) | `["tokenizer.ggml.add_bos_token=bool:false"]` |
+| `rope_scaling`, `rope_scale`, `rope_freq_base`, `rope_freq_scale` | `--rope-*` | `"yarn"`, `4` |
+| `yarn_orig_ctx`, `yarn_ext_factor`, `yarn_attn_factor`, `yarn_beta_slow`, `yarn_beta_fast` | `--yarn-*` | `32768` |
+| `numa` | `--numa` | `true` (distribute), `"isolate"`, `"numactl"` |
+
+Invalid values are left out of the command and reported as warnings. These params pick
+hardware and files, so they live in the profile and can't be changed over the control
+API. The fit test passes the split to `llama-fit-params` and applies the `-ts`/`-sm`/`-mg`
+it suggests.
 
 ## Running a profile on vllm.cpp
 
