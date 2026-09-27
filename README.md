@@ -173,6 +173,38 @@ new task since the last poll, counts as activity. A server whose `/slots` cannot
 read (started with `--no-slots` or `--api-key`, or not responding) is never
 auto-released. The idle clock restarts when `inferencedeck-web` restarts.
 
+### Request defaults and sampling presets
+
+A profile can set what requests get when they don't choose for themselves:
+
+```json
+{
+  "sampling_preset": "coding",
+  "temperature": 0.3,
+  "n_predict": 2048,
+  "jinja": true,
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+- `sampling_preset` is one of `coding`, `factual`, `balanced` or `creative`
+  (`GET /api/sampling` lists their values). A profile's own values sit on top of
+  its preset, so the example above is the coding preset with `temperature` 0.3.
+- A preset picked at launch (the web UI's preset menu next to **Start**, or
+  `"overrides": {"sampling_preset": "creative"}` on `POST /api/start`) replaces the
+  profile's sampling values; other explicit overrides still win over it. `"none"`
+  drops the profile's preset.
+- `chat_template_kwargs` becomes llama-server's `--chat-template-kwargs`, for switches
+  such as `enable_thinking` or `reasoning_effort`. It is read by the Jinja chat
+  template, so pair it with `"jinja": true`. It can only be set in the profile, not
+  over the API.
+
+These become llama-server launch flags, so they are **defaults**: a request that sends
+its own `temperature`, `max_tokens` or `chat_template_kwargs` still gets what it asked
+for. The web UI shows each running server's defaults. Forcing a value over the
+client's (llama-swap's `setParams`) would need InferenceDeck in the request path, which
+it is not.
+
 For authenticated LAN/tailnet use:
 
 ```bash

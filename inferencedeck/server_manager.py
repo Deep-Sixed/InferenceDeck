@@ -20,6 +20,7 @@ from .llama_args import LaunchCommand, build_llama_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
 from .proc import run as run_hidden
+from .sampling import layer_sampling_preset, request_defaults
 
 
 STATE_FILENAME = "servers.json"
@@ -584,8 +585,7 @@ def prepare_launch_command(
             "profile": resolved.to_dict(),
         }
 
-    params = dict(resolved.params)
-    params.update(overrides or {})
+    params, preset_warnings = layer_sampling_preset(dict(resolved.params), overrides)
     params.setdefault("host", app_config.default_host)
     params.setdefault("port", app_config.default_port)
 
@@ -617,13 +617,14 @@ def prepare_launch_command(
         params,
         extra_args=app_config.extra_llama_args,
     )
-    warnings = resolved.warnings + command.warnings
+    warnings = resolved.warnings + preset_warnings + command.warnings
     return {
         "success": True,
         "profile": resolved.to_dict(),
         "environment": llama.to_dict(),
         "command": command.to_dict(),
         "params": params,
+        "request_defaults": request_defaults(params),
         "warnings": warnings,
     }
 
@@ -707,6 +708,8 @@ def start_profile(
         "ctx_size": params.get("ctx_size"),
         # None falls back to AppConfig.idle_release_seconds (see idle.py).
         "idle_release_seconds": params.get("idle_release_seconds"),
+        # Sampling/template defaults baked into the launch flags; requests may override them.
+        "request_defaults": prepared.get("request_defaults"),
     }
     _upsert_server(server)
     app_config = AppConfig.load()

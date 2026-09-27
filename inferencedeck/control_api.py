@@ -139,6 +139,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/runtime":
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
+            elif parsed.path == "/api/sampling":
+                self._json(HTTPStatus.OK, self.control_plane.sampling_presets())
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:

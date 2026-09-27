@@ -13,6 +13,7 @@ from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
+from .sampling import sampling_presets
 from .server_manager import (
     CONTEXT_PRESETS,
     list_servers,
@@ -199,6 +200,9 @@ class ControlPlane:
 
     def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
         return set_idle_release(server_id, seconds)
+
+    def sampling_presets(self) -> dict[str, Any]:
+        return {"presets": sampling_presets()}
 
     def logs(self, server_id: str, *, lines: int = 200) -> dict[str, Any]:
         return server_logs(server_id, lines=lines)
