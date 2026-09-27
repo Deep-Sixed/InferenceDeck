@@ -28,14 +28,16 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 ### Remote and cloud endpoints
 
-InferenceDeck supports two endpoint lanes:
+InferenceDeck supports two endpoint lanes, which say who runs the model:
 
-- `remote_host` — another self-hosted runtime, such as `llama.cpp` over a LAN or tailnet.
-- `true_cloud` — a hosted API endpoint.
+- `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet.
+- `true_cloud` — a hosted API such as OpenRouter, where the request leaves your infrastructure.
+
+How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and `100.64.0.0/10` addresses count as Tailscale, and `true_cloud` endpoints default to HTTPS. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
-Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`.
+Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` is required for `true_cloud` endpoints and optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
 
 ### Web/control authentication
 
@@ -112,6 +114,11 @@ GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR
 root and working directory, common home folders (`~/models`, `~/llms`, …), LM Studio's
 model folders and the Hugging Face cache (`HF_HOME`). A whole drive is never scanned.
 
+Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` (or
+`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST` and
+`VLLM_CPP_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
+metadata requests when set.
+
 ## Choosing a llama.cpp build
 
 InferenceDeck picks the llama-server build this CPU can run:
@@ -156,7 +163,9 @@ The runtime is part of the profile and can't be switched over the control API.
 
 `vllm-server` is found at `vllm_cpp_server_path` in config, `VLLM_CPP_SERVER` /
 `VLLM_CPP_SERVER_BIN`, under `VLLM_CPP_HOME` or `runtime_dirs` (`bin/` of a release
-archive or `build/examples/` of a source build), or on `PATH`.
+archive or `build/examples/` of a source build), or on `PATH`. Discovery also probes a
+running vllm.cpp server at `VLLM_CPP_SERVER_URL` (default `http://127.0.0.1:8000`, the
+same port vLLM's probe uses).
 
 | Profile param | `vllm-server` flag |
 |---|---|
@@ -167,7 +176,7 @@ archive or `build/examples/` of a source build), or on `PATH`.
 | `reasoning` | `--enable-thinking` / `--no-enable-thinking` (unset: the chat template decides) |
 | `enable_prefix_caching` | `--enable-prefix-caching` / `--no-enable-prefix-caching` |
 | `speculative_config` | `--speculative-config` (JSON) |
-| `tool_call_parser`, `reasoning_parser`, `scheduling_policy`, `generation_config`, `mmproj` | the flag of the same name |
+| `tool_call_parser`, `reasoning_parser`, `scheduling_policy`, `generation_config`, `tokenizer_config`, `mmproj` | the flag of the same name |
 
 llama.cpp-only settings (`gpu_layers`, `threads`, `cache_type_k`, …) and sampling
 values (vllm-server takes those per request) produce a warning rather than a flag.

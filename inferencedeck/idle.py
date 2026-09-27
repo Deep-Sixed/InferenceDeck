@@ -26,7 +26,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .config import AppConfig
-from .server_manager import _probe_base, _update_server, list_servers, release_gpu
+from .server_manager import http_base, _update_server, list_servers, release_gpu
 
 DEFAULT_POLL_SECONDS = 15
 MAX_IDLE_RELEASE_SECONDS = 7 * 24 * 3600
@@ -48,7 +48,7 @@ def idle_window(server: dict[str, Any], config: AppConfig) -> int:
 def probe_slots(host: str, port: int, timeout: float = 2) -> Slots | None:
     """llama-server's slot list, or None when it cannot be read."""
     try:
-        with urllib.request.urlopen(f"{_probe_base(host, port)}/slots", timeout=timeout) as response:
+        with urllib.request.urlopen(f"{http_base(host, port)}/slots", timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None

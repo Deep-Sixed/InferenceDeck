@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.error
@@ -17,6 +16,7 @@ from typing import Any
 from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
 from .capabilities import profile_capabilities, resolve_projector, with_served
 from .config import AppConfig
+from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
 from .hardware import detect_system_hardware
 from .llama_args import LaunchCommand, build_llama_server_args
@@ -69,55 +69,13 @@ def read_state() -> dict[str, Any]:
 
 
 def write_state(state: dict[str, Any]) -> None:
-    path = state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # A unique temp name per write, so concurrent writers never share (and
-    # clobber) one staging file.
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(state, indent=2) + "\n")
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(state_path(), json.dumps(state, indent=2) + "\n")
 
 
 # Guards read-modify-write of servers.json. The RLock covers threads in this
 # process; the file lock covers other processes (e.g. the CLI next to the daemon).
 _STATE_LOCK = threading.RLock()
 _STATE_DEPTH = threading.local()
-
-
-def _lock_file(fh: Any) -> None:
-    if is_windows():
-        import msvcrt
-
-        fh.seek(0)
-        while True:
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                return
-            except OSError:
-                time.sleep(0.05)
-    import fcntl
-
-    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(fh: Any) -> None:
-    if is_windows():
-        import msvcrt
-
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -488,9 +446,21 @@ def _remove_server(server_id: str) -> None:
 READY_TIMEOUT_SECONDS = {"llama.cpp": DEFAULT_READY_TIMEOUT_SECONDS, "vllm.cpp": 180}
 
 
-def _probe_base(host: str, port: int) -> str:
-    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
-    return f"http://{probe_host}:{int(port)}"
+def http_base(host: str | None, port: int) -> str:
+    """``http://host:port`` for reaching a server bound to ``host`` from this machine.
+
+    A wildcard bind is reached on the matching loopback address, and an IPv6
+    literal is bracketed, as URLs require (``http://[::1]:8080``).
+    """
+    host = str(host or "").strip().strip("[]")
+    if host in {"", "0.0.0.0"}:
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{int(port)}"
+
 
 
 def _probe_status(url: str) -> int | None:
@@ -513,7 +483,7 @@ def wait_until_ready(
     can serve. Servers without /health (404/405) fall back to /v1/models.
     """
     deadline = time.time() + max(int(timeout_seconds), MIN_READY_TIMEOUT_SECONDS)
-    base = _probe_base(host, port)
+    base = http_base(host, port)
     path = "/health"
     while time.time() < deadline:
         if not pid_is_running(pid):
@@ -555,7 +525,7 @@ def parse_props(props: dict[str, Any]) -> dict[str, Any]:
 def probe_capabilities(host: str, port: int, timeout: float = 3) -> dict[str, Any] | None:
     """Read /props from a ready llama-server; None if it has no such endpoint."""
     try:
-        with urllib.request.urlopen(f"{_probe_base(host, port)}/props", timeout=timeout) as response:
+        with urllib.request.urlopen(f"{http_base(host, port)}/props", timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
