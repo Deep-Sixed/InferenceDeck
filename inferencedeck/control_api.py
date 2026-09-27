@@ -203,6 +203,18 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 payload = self.control_plane.stop(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/suspend":
                 payload = self.control_plane.suspend(server_id=body.get("server_id"), mode=body.get("mode"))
+            elif parsed.path in ("/api/release", "/api/restore", "/api/restart"):
+                server_id = str(body.get("server_id") or "")
+                if not server_id:
+                    raise ValueError("server_id is required")
+                if parsed.path == "/api/release":
+                    payload = self.control_plane.release_gpu(server_id=server_id)
+                else:
+                    # Only the context size may change on restore/restart; the rest of
+                    # the saved spec is reused as it was.
+                    extra = validate_overrides({"ctx_size": body["ctx_size"]}) if body.get("ctx_size") is not None else None
+                    action = self.control_plane.restore if parsed.path == "/api/restore" else self.control_plane.restart
+                    payload = action(server_id, extra)
             elif parsed.path == "/api/resume":
                 payload = self.control_plane.resume(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/fit":
