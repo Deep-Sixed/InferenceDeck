@@ -217,6 +217,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     extra = validate_overrides({"ctx_size": body["ctx_size"]}) if body.get("ctx_size") is not None else None
                     action = self.control_plane.restore if parsed.path == "/api/restore" else self.control_plane.restart
                     payload = action(server_id, extra)
+            elif parsed.path == "/api/idle":
+                server_id = str(body.get("server_id") or "")
+                if not server_id:
+                    raise ValueError("server_id is required")
+                seconds = body.get("seconds")
+                if seconds is not None:
+                    seconds = validate_overrides({"idle_release_seconds": seconds})["idle_release_seconds"]
+                payload = self.control_plane.set_idle_release(server_id, seconds)
             elif parsed.path == "/api/resume":
                 payload = self.control_plane.resume(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/fit":

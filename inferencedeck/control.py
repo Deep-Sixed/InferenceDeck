@@ -22,6 +22,7 @@ from .server_manager import (
     restore_server,
     resume_server,
     server_logs,
+    set_idle_release,
     start_profile,
     stop_server,
     suspend_server,
@@ -65,8 +66,11 @@ class ControlPlane:
                 "restart": True,
                 "prepare": True,
                 "logs": True,
+                "idle_release": True,
             },
             "context_presets": list(CONTEXT_PRESETS),
+            # Servers without their own idle_release_seconds use this; 0 = off.
+            "idle_release_default_seconds": self._config().idle_release_seconds,
         }
 
     def inventory(self) -> dict[str, Any]:
@@ -192,6 +196,9 @@ class ControlPlane:
         if blocked:
             return blocked
         return restart_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+
+    def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
+        return set_idle_release(server_id, seconds)
 
     def logs(self, server_id: str, *, lines: int = 200) -> dict[str, Any]:
         return server_logs(server_id, lines=lines)

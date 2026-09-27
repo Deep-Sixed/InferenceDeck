@@ -158,6 +158,21 @@ Server controls (the same in the web UI and both trays):
 | **Context 8K–128K** | Restarts the server (or restores a released one) at that context size. |
 | **Stop** | Stops the server. On a released server it forgets the saved settings. |
 
+### Idle auto-release
+
+InferenceDeck can release a server's GPU (the same as **Release GPU**) once it has
+gone a set time without requests; **Restore** starts it again with the same settings.
+It is off by default. Set a default for all servers with `idle_release_seconds` in the
+app config, or per server with the **Auto-release** buttons in the web UI (`POST
+/api/idle` with `server_id` and `seconds`, or `null` to use the default). A profile
+param or launch override named `idle_release_seconds` sets it at start.
+
+InferenceDeck is not in the request path, so `inferencedeck-web` polls each server's
+llama-server `/slots` every 15 seconds. A slot that is processing, or one that took a
+new task since the last poll, counts as activity. A server whose `/slots` cannot be
+read (started with `--no-slots` or `--api-key`, or not responding) is never
+auto-released. The idle clock restarts when `inferencedeck-web` restarts.
+
 For authenticated LAN/tailnet use:
 
 ```bash

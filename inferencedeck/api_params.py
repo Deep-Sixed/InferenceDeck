@@ -35,6 +35,8 @@ ALLOWED_OVERRIDES: dict[str, tuple[str, float, float]] = {
     "reasoning": ("bool", 0, 0),
     "cache_type_k": ("cache", 0, 0),
     "cache_type_v": ("cache", 0, 0),
+    # Not a llama-server flag: InferenceDeck's idle auto-release window (0 = off).
+    "idle_release_seconds": ("int", 0, 7 * 24 * 3600),
 }
 
 

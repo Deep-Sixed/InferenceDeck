@@ -9,6 +9,7 @@ from pathlib import Path
 from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
 from .control_api import ControlRequestHandler
+from .idle import start_idle_monitor
 
 
 ASSET_TYPES = {
@@ -50,7 +51,10 @@ def serve(
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
-    ThreadingHTTPServer((host, port), handler).serve_forever()
+    httpd = ThreadingHTTPServer((host, port), handler)
+    # This process owns server state, so it is the one that releases idle servers.
+    start_idle_monitor()
+    httpd.serve_forever()
 
 
 def main() -> int:

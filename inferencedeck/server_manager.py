@@ -705,6 +705,8 @@ def start_profile(
         # What Release GPU / Restart need to bring this server back as it was.
         "overrides": dict(overrides or {}),
         "ctx_size": params.get("ctx_size"),
+        # None falls back to AppConfig.idle_release_seconds (see idle.py).
+        "idle_release_seconds": params.get("idle_release_seconds"),
     }
     _upsert_server(server)
     app_config = AppConfig.load()
@@ -762,6 +764,41 @@ def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[s
         "message": f"Released GPU: stopped {server.get('mode')}. Restore starts it again.",
         "server": _find_server(server["id"]),
     }
+
+
+def set_idle_release(server_id: str, seconds: int | None) -> dict[str, Any]:
+    """Set (or with None, clear back to the config default) a server's idle release window.
+
+    The value is also kept in the server's overrides, so a Restore or Restart
+    carries it over.
+    """
+
+    if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0):
+        return {"success": False, "error": "seconds must be a non-negative integer or null."}
+    found: dict[str, Any] = {}
+
+    def change(state: dict[str, Any]) -> bool:
+        for record in state["servers"]:
+            if record.get("id") == server_id:
+                overrides = dict(record.get("overrides") or {})
+                if seconds is None:
+                    overrides.pop("idle_release_seconds", None)
+                else:
+                    overrides["idle_release_seconds"] = seconds
+                record["overrides"] = overrides
+                record["idle_release_seconds"] = seconds
+                restart = record.get("restart")
+                if isinstance(restart, dict):
+                    restart["overrides"] = dict(overrides)
+                found.update(record)
+                return True
+        return False
+
+    _mutate_state(change)
+    if not found:
+        return {"success": False, "error": "No tracked server matched the request."}
+    label = "the default" if seconds is None else ("off" if seconds == 0 else f"{seconds}s idle")
+    return {"success": True, "message": f"Auto-release set to {label}.", "server": _find_server(server_id)}
 
 
 def restore_server(

@@ -31,6 +31,10 @@ class AppConfig:
     server_history_limit: int = 5
     auto_generate_launch_scripts: bool = True
     auto_scan_on_startup: bool = True
+    # Release a server's GPU (stop and park it, like Release GPU) after this
+    # many seconds without requests; 0 turns it off. A profile param or launch
+    # override named idle_release_seconds sets it for one server.
+    idle_release_seconds: int = 0
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
