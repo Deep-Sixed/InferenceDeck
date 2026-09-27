@@ -22,7 +22,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 ### Frontends
 
 - Local browser control panel (`inferencedeck-web`).
-- Native Windows `.NET 8` system tray under `frontends/windows/`.
+- Python system tray for Windows and macOS (`inferencedeck-tray`, see `frontends/windows/`). No .NET runtime needed.
 - Linux GTK/AyatanaAppIndicator tray under `frontends/linux/`.
 - All frontends use the same InferenceDeck control API; they do not duplicate model discovery or server-management logic.
 
@@ -137,7 +137,7 @@ The example above is illustrative; do not commit the token to the repository or 
 python -m unittest discover -s tests -v
 ```
 
-CI exercises Python 3.10 and 3.12 on Linux, Windows, and macOS. Separate jobs build the Windows tray and syntax-check the Linux tray.
+CI exercises Python 3.10 and 3.12 on Linux, Windows, and macOS, including the tray's menu logic. A separate job syntax-checks the Linux tray.
 
 ## Provenance
 

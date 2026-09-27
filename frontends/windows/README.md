@@ -1,16 +1,42 @@
-# InferenceDeck Windows tray
+# InferenceDeck tray (Windows and macOS)
 
-Native Windows system-tray frontend for the InferenceDeck control plane, derived from the proven Thanatos `LlamaServerTray` interaction model.
+A system-tray frontend written in Python with [pystray](https://github.com/moses-palmer/pystray).
+It replaces the earlier .NET tray, so there is no .NET runtime to install.
 
-The tray intentionally contains **no model-discovery or server-launch logic**. It talks to the `inferencedeck-web` process (default `http://127.0.0.1:8716`), which serves both the control API and the web UI.
+Like every InferenceDeck frontend it holds **no model-discovery or server-launch logic**:
+it talks to the `inferencedeck-web` process (default `http://127.0.0.1:8716`), which
+serves the control API and the web UI.
 
-Environment overrides:
-
-- `INFERENCEDECK_URL` — the `inferencedeck-web` address
-- `INFERENCEDECK_TOKEN` — required when authentication is enabled
-
-Build on Windows with .NET 8:
+## Install and run
 
 ```powershell
-dotnet build .\frontends\windows\InferenceDeck.Tray\InferenceDeck.Tray.csproj -c Release
+pip install "inferencedeck[tray]"
+inferencedeck-tray
 ```
+
+On Windows `inferencedeck-tray.exe` is a GUI program (no console window). If
+`inferencedeck-web` isn't running on this machine, the tray starts it in the background
+(hidden) and waits for it. Its output goes to the InferenceDeck cache folder's `logs\web.log`.
+
+## Menu
+
+Status · Open Web UI (also the tray icon's default click) · Start profile · Remote & cloud
+models · Pause / Resume · Release GPU / Restore · Reload & restart · Context size
+(8K-128K) · Stop / Forget released server · Copy active command · Exit.
+
+The icon colour follows the state: green running, amber paused, grey idle or released,
+red when InferenceDeck can't be reached.
+
+## Settings (environment variables)
+
+- `INFERENCEDECK_URL`: the `inferencedeck-web` address, default `http://127.0.0.1:8716`.
+- `INFERENCEDECK_TOKEN`: required when authentication is enabled.
+- `INFERENCEDECK_TRAY_START_WEB=0`: don't start `inferencedeck-web` automatically. It is
+  only ever started for a local (loopback) address.
+
+## Start at logon (Windows)
+
+Press Win+R, open `shell:startup`, and create a shortcut there to `inferencedeck-tray.exe`
+(it is in your Python environment's `Scripts` folder: `where inferencedeck-tray`).
+
+Linux uses the GTK/AppIndicator tray in `frontends/linux/`.
