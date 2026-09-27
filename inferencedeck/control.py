@@ -12,6 +12,7 @@ from .config_check import check_all
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
 from .inventory import build_inventory
+from .live_config import rejected_files
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
@@ -57,6 +58,8 @@ class ControlPlane:
         remote = active_endpoint()
         return {
             "version": 1,
+            # Config files whose latest edit was rejected; the previous version is in effect.
+            "config_rejected": rejected_files(),
             "running_count": len(running),
             "servers": servers,
             "remote_active": remote.to_dict() if remote else None,

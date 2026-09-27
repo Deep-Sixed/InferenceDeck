@@ -182,6 +182,21 @@ e.g. `"$schema": "https://raw.githubusercontent.com/Deep-Sixed/InferenceDeck/mai
 in `models.json`.
 ## Choosing a llama.cpp build
 
+### Editing configuration while InferenceDeck runs
+
+`config.json`, `models.json` and the remote endpoint files are read on use, so edits take
+effect without a restart. An edit only takes effect if the file still parses and, for
+`config.json`, passes the checks above (a wrong type or value, not just an unknown key).
+Otherwise the previous version stays in effect and the rejected one is reported until it
+is fixed or reverted. That covers a file caught half-saved by an editor as well as a real
+mistake. The web UI shows an "edit not applied" note in the Status card, and
+`GET /api/status` lists the file under `config_rejected`.
+
+A file with no previous good version runs on defaults (no profiles, for `models.json`),
+as does a deleted file. While `config.json` holds a rejected edit, settings the web UI
+would save there (such as the pinned runtime) are refused, so your edit isn't
+overwritten.
+
 InferenceDeck picks the llama-server build this CPU can run:
 
 1. A pinned build (`llama_runtime` in config, or the web UI's Runtime menu), if it is compatible.
