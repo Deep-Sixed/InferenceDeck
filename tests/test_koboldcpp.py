@@ -295,7 +295,9 @@ class KoboldCppLaunchScriptTests(unittest.TestCase):
             config=AppConfig(koboldcpp_path=str(script)),
         )
         ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
-        self.assertIn(f"& '{Path(sys.executable).as_posix()}' '{script.as_posix()}' --model $model", ps1)
+        # The interpreter is written like every other script binary (forward slashes);
+        # koboldcpp.py is an argument and keeps its native path.
+        self.assertIn(f"& '{Path(sys.executable).as_posix()}' '{script}' --model $model", ps1)
 
 
 if __name__ == "__main__":
