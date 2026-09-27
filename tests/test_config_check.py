@@ -144,6 +144,12 @@ class EndpointFileTests(_Dir):
     def test_repository_examples_are_valid(self) -> None:
         self.assertEqual(check_endpoints(REPO / "examples" / "remote_endpoints"), [])
 
+    def test_gateway_routing_keys(self) -> None:
+        self.write("ep/box.json", {"baseUrl": "http://10.0.0.2:8080/v1", "lane": "remote_host", "aliases": ["qwen"], "routable": True})
+        self.assertEqual(check_endpoints(self.dir / "ep"), [])
+        self.write("ep/box.json", {"baseUrl": "http://10.0.0.2:8080/v1", "lane": "remote_host", "aliases": "qwen"})
+        self.assertEqual([(p.path, p.severity) for p in check_endpoints(self.dir / "ep")], [("aliases", "error")])
+
     def test_problems(self) -> None:
         self.write("ep/keyed.json", {"baseUrl": "https://x.invalid/v1", "apiKeyEnv": "K", "apiKey": "sk-secret"})
         self.write("ep/lane.json", {"baseUrl": "https://x.invalid/v1", "apiKeyEnv": "K", "lane": "moon", "colour": 1})

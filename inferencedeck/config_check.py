@@ -202,6 +202,8 @@ ENDPOINT_SCHEMA: dict[str, Any] = {
         "tags": _STRING_LIST,
         "transport": {"enum": sorted(VALID_TRANSPORTS)},
         "host": {"type": "string"},
+        "aliases": {**_STRING_LIST, "description": "Extra model names the gateway routes to this endpoint."},
+        "routable": {"type": "boolean", "description": "Take name-routed gateway requests while not the enabled endpoint."},
     },
 }
 
