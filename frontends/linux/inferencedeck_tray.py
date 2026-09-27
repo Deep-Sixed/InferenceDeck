@@ -242,7 +242,10 @@ class TrayApplication:
             endpoints = self.api.remotes().get("endpoints", [])
             for remote in endpoints:
                 suffix = " — active" if remote.get("enabled") else ("" if remote.get("selectable") else f" — set ${remote.get('api_key_env')}")
-                item = Gtk.CheckMenuItem(label=f"{remote.get('display_name') or remote.get('name')}{suffix}")
+                name = remote.get('display_name') or remote.get('name')
+                summary = remote.get('summary')
+                label = f"{name} ({summary})" if summary else f"{name}"
+                item = Gtk.CheckMenuItem(label=f"{label}{suffix}")
                 item.set_active(bool(remote.get("enabled")))
                 item.set_sensitive(bool(remote.get("enabled") or remote.get("selectable")))
                 item.connect("activate", self._toggle_remote, remote)
