@@ -26,6 +26,8 @@ STATE_FILENAME = "servers.json"
 # restart spec (mode + overrides) so Restore can bring it back.
 PARKED = "parked"
 RESTORING = "restoring"
+# The process ended without a Stop from us (crash, killed outside InferenceDeck).
+EXITED = "exited"
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 LOG_DIRNAME = "logs"
 
@@ -231,13 +233,26 @@ def list_servers() -> list[dict[str, Any]]:
 
 
 def prune_stale_servers() -> None:
-    """Remove entries for PIDs that are no longer running."""
+    """Turn records whose process has exited into history.
+
+    The record is kept (so its logs stay reachable and the history limit has
+    something to cap) but its PID is cleared: once the process is gone the PID
+    can be reused by an unrelated process, which must never look like ours.
+    trim_server_history drops the oldest history records.
+    """
 
     def change(state: dict[str, Any]) -> bool:
-        servers = state["servers"]
-        kept = [s for s in servers if pid_is_running(s.get("pid")) or not s.get("pid")]
-        state["servers"] = kept
-        return len(kept) != len(servers)
+        changed = False
+        for server in state["servers"]:
+            pid = server.get("pid")
+            if not pid or pid_is_running(pid):
+                continue
+            server.update({"pid": None, "last_pid": pid, "running": False, "suspended": False})
+            if server.get("status") not in ("stopped", "startup_timeout"):
+                server["status"] = EXITED
+            server.setdefault("stopped_at", _now())
+            changed = True
+        return changed
 
     _mutate_state(change)
 
@@ -254,10 +269,29 @@ def trim_server_history(limit: int = 5) -> None:
         if excess <= 0 or not idle:
             return False
         dropped = set(idle[: min(excess, len(idle))])
+        removed.extend(s for i, s in enumerate(servers) if i in dropped)
         state["servers"] = [s for i, s in enumerate(servers) if i not in dropped]
         return True
 
+    removed: list[dict[str, Any]] = []
     _mutate_state(change)
+    _delete_logs(removed)
+
+
+def _delete_logs(records: list[dict[str, Any]]) -> None:
+    """Delete the log files of dropped history records (only files in our log dir)."""
+    root = log_dir().resolve()
+    for record in records:
+        for key in ("stdout_log", "stderr_log"):
+            path = record.get(key)
+            if not path:
+                continue
+            try:
+                resolved = Path(path).resolve()
+                if resolved.parent == root:
+                    resolved.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _find_server(server_id: str | None = None, mode: str | None = None) -> dict[str, Any] | None:
@@ -265,9 +299,11 @@ def _find_server(server_id: str | None = None, mode: str | None = None) -> dict[
     if server_id:
         return next((s for s in servers if s.get("id") == server_id), None)
     if mode:
-        # Prefer a live server over a parked record of the same profile.
+        # A live server first, then a parked one; exited history records are
+        # only reachable by id.
         matches = [s for s in servers if s.get("mode") == mode]
-        return next((s for s in matches if s.get("running")), matches[0] if matches else None)
+        live = next((s for s in matches if s.get("running")), None)
+        return live or next((s for s in matches if s.get("status") in (PARKED, RESTORING)), None)
     return None
 
 
@@ -455,10 +491,13 @@ def _upsert_server(server: dict[str, Any]) -> None:
 def _remove_server(server_id: str) -> None:
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
+        removed.extend(s for s in servers if s.get("id") == server_id)
         state["servers"] = [s for s in servers if s.get("id") != server_id]
-        return len(state["servers"]) != len(servers)
+        return bool(removed)
 
+    removed: list[dict[str, Any]] = []
     _mutate_state(change)
+    _delete_logs(removed)
 
 
 def _health_url(host: str, port: int) -> str:
@@ -581,8 +620,11 @@ def start_profile(
         warnings=prepared["command"].get("warnings", []),
     )
     mode_slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in mode).strip("-") or "server"
-    stdout_path = log_dir() / f"{mode_slug}-stdout.log"
-    stderr_path = log_dir() / f"{mode_slug}-stderr.log"
+    # One pair of log files per launch, so a restart doesn't wipe the logs of
+    # the run before it; trim_server_history deletes them with their record.
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    stdout_path = log_dir() / f"{mode_slug}-{stamp}-stdout.log"
+    stderr_path = log_dir() / f"{mode_slug}-{stamp}-stderr.log"
     stdout_handle = stdout_path.open("w", encoding="utf-8", errors="replace")
     stderr_handle = stderr_path.open("w", encoding="utf-8", errors="replace")
     try:
@@ -609,7 +651,9 @@ def start_profile(
         stderr_handle.close()
 
     params = prepared["params"]
-    server_id = f"{mode}-{proc.pid}"
+    # The launch stamp keeps ids unique when the OS reuses a PID, so a new
+    # server never overwrites an older record that is kept as history.
+    server_id = f"{mode}-{proc.pid}-{stamp}"
     server = {
         "id": server_id,
         "mode": mode,

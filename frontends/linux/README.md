@@ -15,7 +15,9 @@ The distro/system Python is normally required because PyGObject is provided by t
 ## Environment
 
 - `INFERENCEDECK_URL` — the `inferencedeck-web` process, default `http://127.0.0.1:8716` (serves both the API and the web UI)
-- `INFERENCEDECK_TOKEN` — required when authentication is enabled
+- `INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE` — required when authentication is enabled; read the same way as the server
+  reads them. After a rejected token the tray checks again less often (up to every 10 minutes), so a stale
+  token can't lock this machine out of the web UI.
 
 ## Run
 
