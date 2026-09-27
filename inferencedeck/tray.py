@@ -51,6 +51,11 @@ TIMEOUTS = {
     "stop": STOP_TIMEOUT_SECONDS,
     "release": STOP_TIMEOUT_SECONDS,
 }
+# Update checks detect every runtime and may ask GitHub about each one (the
+# server caches answers for an hour), so they run at startup and hourly, off
+# the 5 s status poll, with room for several slow GitHub calls.
+UPDATE_CHECK_SECONDS = 3600
+UPDATE_TIMEOUT_SECONDS = 120
 
 
 class ApiError(Exception):
@@ -125,6 +130,9 @@ class ApiClient:
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self.request("/api/remote", {"action": action, "name": name})
 
+    def updates(self, refresh: bool = False) -> dict[str, Any]:
+        return self.request("/api/updates" + ("?refresh=1" if refresh else ""), timeout=UPDATE_TIMEOUT_SECONDS)
+
 
 def is_parked(server: dict[str, Any]) -> bool:
     # Released to free VRAM: no process, but Restore can start it again.
@@ -193,6 +201,32 @@ class TrayState:
         return "Stopped — no tracked server"
 
 
+def available_updates(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [u for u in (payload or {}).get("updates") or [] if u.get("update_available")]
+
+
+def updates_label(payload: dict[str, Any] | None, error: str | None = None) -> str:
+    """The "Runtime updates" menu entry: how many runtimes have a newer release."""
+    if error:
+        return "Runtime updates: check failed"
+    if payload is None:
+        return "Runtime updates: checking…"
+    count = len(available_updates(payload))
+    if count:
+        return f"Runtime updates: {count} available"
+    return "Runtime updates: up to date" if payload.get("updates") else "Runtime updates: nothing to check"
+
+
+def update_entry_label(update: dict[str, Any]) -> str:
+    return f"{update.get('runtime_name')} {update.get('current_version')} → {update.get('latest_version')}"
+
+
+def release_url(update: dict[str, Any]) -> str | None:
+    # Only ever open GitHub release pages from the tray.
+    url = str(update.get("release_url") or "")
+    return url if url.startswith("https://github.com/") else None
+
+
 def fetch_state(api: ApiClient) -> TrayState:
     try:
         status = api.status()
@@ -229,6 +263,10 @@ class TrayController:
         self.on_change = on_change
         self.background = background or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self.state = TrayState(error="connecting")
+        # Kept apart from state: status polls every 5 s, update checks hourly.
+        self.updates: dict[str, Any] | None = None
+        self.updates_error: str | None = None
+        self._last_update_check = 0.0
 
     def refresh(self) -> None:
         self.state = fetch_state(self.api)
@@ -271,6 +309,35 @@ class TrayController:
 
     def disable_remotes(self) -> None:
         self._run(self.api.remote, "disable")
+
+    def check_updates(self, refresh: bool = False) -> None:
+        """Ask the API about runtime updates in the background.
+
+        ``refresh`` is the menu's "Check now": it skips the server's one-hour
+        cache and reports the outcome.
+        """
+        self._last_update_check = time.monotonic()
+
+        def work() -> None:
+            try:
+                self.updates = self.api.updates(refresh=refresh)
+                self.updates_error = None
+                if refresh:
+                    count = len(available_updates(self.updates))
+                    self.notify(f"{count} runtime update(s) available." if count else "All runtimes are up to date.")
+            except ApiError as exc:
+                self.updates_error = str(exc)
+                if refresh:
+                    self.notify(f"Update check failed: {exc}")
+            self.on_change()
+
+        self.background(work)
+
+    def updates_due(self, now: float | None = None) -> bool:
+        if self.state.error or self.state.unauthorized:
+            return False
+        now = time.monotonic() if now is None else now
+        return not self._last_update_check or now - self._last_update_check >= UPDATE_CHECK_SECONDS
 
     def active_command(self) -> str | None:
         return (self.state.active or {}).get("command_line") if self.state.alive else None
@@ -395,6 +462,16 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         yield Menu.SEPARATOR
         yield Item("Disable all remote/cloud models", lambda: controller.disable_remotes())
 
+    def open_release(url: str) -> Callable[[], None]:
+        return lambda: webbrowser.open(url)
+
+    def update_items():
+        for update in available_updates(controller.updates):
+            url = release_url(update)
+            yield Item(menu_text(update_entry_label(update)), open_release(url) if url else None, enabled=bool(url))
+        yield Menu.SEPARATOR
+        yield Item("Check now", lambda: controller.check_updates(refresh=True))
+
     def context_items():
         for size in CONTEXT_PRESETS:
             yield Item(
@@ -431,6 +508,7 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         ),
         Menu.SEPARATOR,
         Item("Copy active command", copy_command, enabled=lambda _i: st().alive),
+        Item(lambda _i: menu_text(updates_label(controller.updates, controller.updates_error)), Menu(update_items)),
         Menu.SEPARATOR,
         Item("Exit tray", lambda: quit_tray()),
     )
@@ -477,6 +555,8 @@ def main() -> int:
         while not stop.is_set():
             try:
                 controller.refresh()
+                if controller.updates_due():
+                    controller.check_updates()
             except Exception as exc:  # one bad update must not freeze the tray for good
                 sys.stderr.write(f"inferencedeck tray refresh failed: {exc}\n")
             wait, auth_delay = next_poll_delay(controller.state, auth_delay)

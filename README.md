@@ -124,7 +124,10 @@ channel defaults to `update_channel` in config.
 - A project that tags versions without publishing GitHub releases is checked against
   its highest matching tag instead.
 
-The check isn't shown in the web UI or trays yet.
+The web UI's **Runtime updates** card and both trays' **Runtime updates** menu show
+the same results (API: `GET /api/updates`, `?refresh=1` to skip the cache). They check
+when they start and then every 30 minutes (web) or hourly (trays); **Check now**
+asks GitHub again. Each update links to its GitHub release page.
 
 ## Configuration
 

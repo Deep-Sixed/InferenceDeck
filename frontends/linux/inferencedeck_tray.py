@@ -36,6 +36,10 @@ STOP_TIMEOUT_SECONDS = 20
 # restart stops and then starts, so it can take both.
 RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
+# Update checks detect every runtime and may ask GitHub about each one (the
+# server caches answers for an hour): at startup and hourly, not every sync.
+UPDATE_CHECK_SECONDS = 3600
+UPDATE_TIMEOUT_SECONDS = 120
 
 
 class Unauthorized(RuntimeError):
@@ -115,6 +119,9 @@ class ApiClient:
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self._request("/api/remote", {"action": action, "name": name})
 
+    def updates(self, refresh: bool = False) -> dict[str, Any]:
+        return self._request("/api/updates" + ("?refresh=1" if refresh else ""), timeout=UPDATE_TIMEOUT_SECONDS)
+
 
 def _is_parked(server: dict[str, Any]) -> bool:
     # Released to free VRAM: no process, but Restore can start it again.
@@ -150,6 +157,10 @@ class TrayApplication:
         self.context_item.set_submenu(context_menu)
         self.stop_item = Gtk.MenuItem(label="Stop server")
         self.command_item = Gtk.MenuItem(label="Show active command")
+        self.updates_item = Gtk.MenuItem(label="Runtime updates: checking…")
+        self.updates_menu = Gtk.Menu()
+        self.updates_item.set_submenu(self.updates_menu)
+        self.updates: dict[str, Any] | None = None
         self._syncing = False
 
         menu = Gtk.Menu()
@@ -161,6 +172,7 @@ class TrayApplication:
         web.connect("activate", lambda *_: self._open_web())
         menu.append(web)
         menu.append(self.command_item)
+        menu.append(self.updates_item)
         menu.append(Gtk.SeparatorMenuItem())
         quit_item = Gtk.MenuItem(label="Exit tray")
         quit_item.connect("activate", lambda *_: Gtk.main_quit())
@@ -176,6 +188,7 @@ class TrayApplication:
         self.command_item.connect("activate", lambda *_: self._show_command())
         self.profiles_menu.connect("show", self._populate_profiles)
         self.remotes_menu.connect("show", self._populate_remotes)
+        self.updates_menu.connect("show", self._populate_updates)
 
         self.indicator = AppIndicator.Indicator.new(
             "inferencedeck", "cpu", AppIndicator.IndicatorCategory.APPLICATION_STATUS
@@ -187,7 +200,9 @@ class TrayApplication:
         self._auth_delay = 0
         self._next_sync = 0.0
         GLib.timeout_add_seconds(SYNC_SECONDS, self._tick)
+        GLib.timeout_add_seconds(UPDATE_CHECK_SECONDS, self._update_tick)
         self.refresh()
+        self._check_updates()
 
     def _notify(self, message: str, error: bool = False) -> None:
         n = Notify.Notification.new("InferenceDeck", message, "cpu")
@@ -299,6 +314,64 @@ class TrayApplication:
         except Exception as exc:
             item = Gtk.MenuItem(label=str(exc)); item.set_sensitive(False); self.remotes_menu.append(item)
         self.remotes_menu.show_all()
+
+    def _update_tick(self) -> bool:
+        self._check_updates()
+        return True
+
+    def _check_updates(self, refresh: bool = False) -> None:
+        # Detection and GitHub calls take seconds; keep the GTK loop responsive.
+        def worker() -> None:
+            payload, error = None, ""
+            try:
+                payload = self.api.updates(refresh=refresh)
+            except Exception as exc:
+                error = str(exc)
+            GLib.idle_add(self._updates_done, payload, error, refresh)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _updates_done(self, payload: dict[str, Any] | None, error: str, refresh: bool) -> bool:
+        if error:
+            self.updates_item.set_label("Runtime updates: check failed")
+            if refresh:
+                self._notify(f"Update check failed: {error}", True)
+            return False
+        self.updates = payload
+        available = [u for u in (payload or {}).get("updates") or [] if u.get("update_available")]
+        if available:
+            label = f"Runtime updates: {len(available)} available"
+        elif (payload or {}).get("updates"):
+            label = "Runtime updates: up to date"
+        else:
+            label = "Runtime updates: nothing to check"
+        self.updates_item.set_label(label)
+        if refresh:
+            self._notify(f"{len(available)} runtime update(s) available." if available else "All runtimes are up to date.")
+        return False
+
+    def _populate_updates(self, *_args) -> None:
+        self._clear(self.updates_menu)
+        for update in (self.updates or {}).get("updates") or []:
+            if not update.get("update_available"):
+                continue
+            url = str(update.get("release_url") or "")
+            item = Gtk.MenuItem(label=f"{update.get('runtime_name')} {update.get('current_version')} → {update.get('latest_version')}")
+            # Only ever open GitHub release pages from the tray.
+            item.set_sensitive(url.startswith("https://github.com/"))
+            item.connect("activate", self._open_url, url)
+            self.updates_menu.append(item)
+        self.updates_menu.append(Gtk.SeparatorMenuItem())
+        check = Gtk.MenuItem(label="Check now")
+        check.connect("activate", lambda *_: self._check_updates(refresh=True))
+        self.updates_menu.append(check)
+        self.updates_menu.show_all()
+
+    def _open_url(self, _widget, url: str) -> None:
+        try:
+            subprocess.Popen(["xdg-open", url], start_new_session=True)
+        except Exception as exc:
+            self._notify(str(exc), True)
 
     def _start_profile(self, _widget, mode: str) -> None:
         self._notify(f"Starting {mode}…")
