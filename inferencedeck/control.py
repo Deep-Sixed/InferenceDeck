@@ -23,6 +23,7 @@ from .server_manager import (
     restart_server,
     restore_server,
     resume_server,
+    server_log_paths,
     server_logs,
     set_idle_release,
     start_profile,
@@ -227,6 +228,9 @@ class ControlPlane:
 
     def sampling_presets(self) -> dict[str, Any]:
         return {"presets": sampling_presets()}
+
+    def log_paths(self, server_id: str) -> dict[str, str] | None:
+        return server_log_paths(server_id)
 
     def logs(self, server_id: str, *, lines: int = 200) -> dict[str, Any]:
         return server_logs(server_id, lines=lines)

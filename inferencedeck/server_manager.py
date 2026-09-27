@@ -218,16 +218,26 @@ def _wait_gone(pid: int, seconds: float) -> bool:
 
 
 def tail_file(path: str | Path | None, lines: int = 120) -> str:
+    """The last ``lines`` lines, read from the end so a huge log is never loaded whole."""
     if not path:
         return ""
     file_path = Path(path)
     if not file_path.is_file():
         return ""
     try:
-        with file_path.open("r", encoding="utf-8", errors="replace") as f:
-            return "".join(f.readlines()[-lines:])
+        with file_path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            # Assume generous 512-byte lines; at most 4 MiB is read either way.
+            window = min(size, max(64 * 1024, lines * 512), 4 * 1024 * 1024)
+            f.seek(size - window)
+            data = f.read(window)
     except OSError as exc:
         return f"Could not read {file_path}: {exc}"
+    text = data.decode("utf-8", errors="replace")
+    kept = text.splitlines(keepends=True)
+    if window < size and kept:
+        kept = kept[1:]  # the first line was cut by the window
+    return "".join(kept[-lines:])
 
 
 def list_servers() -> list[dict[str, Any]]:
@@ -982,6 +992,14 @@ def restart_server(
         server_id, overrides, project_root=project_root, model_dirs=model_dirs,
         release_conflicts=release_conflicts, force=force,
     )
+
+
+def server_log_paths(server_id: str) -> dict[str, str] | None:
+    """A tracked server's log files by stream name, or None if it is not tracked."""
+    server = _find_server(server_id)
+    if not server:
+        return None
+    return {name: str(server[key]) for name, key in (("stderr", "stderr_log"), ("stdout", "stdout_log")) if server.get(key)}
 
 
 def server_logs(server_id: str, lines: int = 200) -> dict[str, Any]:

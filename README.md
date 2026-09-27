@@ -211,6 +211,21 @@ new task since the last poll, counts as activity. A server whose `/slots` cannot
 read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
 which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
 
+### Live logs
+
+Each tracked server has a **Logs** button in the web UI that opens a live view of its
+log. Behind it is `GET /api/logs/stream?server_id=…` (server-sent events; add
+`&stream=stderr` or `stdout` for one file, `&history=` bytes of backlog, default 64 KiB).
+It sends recent history, then new lines as llama-server writes them.
+
+Servers write straight to their log files under the cache dir, so the files stay the
+complete record and a slow browser can never stall a server. The stream is what's
+bounded: history is capped, a viewer that falls more than 1 MiB behind skips ahead
+(and is told how much it missed), at most 8 streams run at once, and the web view
+keeps the last 2000 lines. A stream ends when its server is no longer tracked; a
+restart gives the server a new id, so reopen **Logs** after one. `GET /api/logs` (the
+last N lines) now reads only the end of the file instead of loading all of it.
+
 ### Starting a server next to running ones
 
 Before a llama.cpp server starts (Start, Restore, Reload & restart, Benchmark), InferenceDeck

@@ -7,6 +7,8 @@ server state. Browsers and both trays talk to that one process.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -15,14 +17,25 @@ from urllib.parse import parse_qs, urlparse
 from .api_params import validate_overrides
 from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState
 from .control import ControlPlane
+from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
 
 MAX_BODY_BYTES = 1024 * 1024
+# Each live log stream holds a handler thread open; cap how many run at once.
+MAX_LOG_STREAMS = 8
+MAX_LOG_HISTORY_BYTES = 256 * 1024
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
     control_plane = ControlPlane()
     auth_state = AuthState()
     server_version = "InferenceDeckControl/1"
+    log_stream_slots = threading.BoundedSemaphore(MAX_LOG_STREAMS)
+    log_poll_seconds = 0.5
+    log_keepalive_seconds = 15.0
+    # How often a stream checks that its server is still tracked.
+    log_check_seconds = 2.0
+    # Streams end after this long; EventSource reconnects on its own.
+    log_max_seconds = 3600.0
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -92,6 +105,71 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sse(self, event: str, data: dict[str, Any] | None = None) -> None:
+        payload = f"event: {event}\ndata: {json.dumps(data or {})}\n\n" if event else ": keepalive\n\n"
+        self.wfile.write(payload.encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_logs(self, query: dict[str, list[str]]) -> None:
+        """Server-sent events: recent history, then new log lines as they are written."""
+
+        server_id = (query.get("server_id") or [""])[0]
+        if not server_id:
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "server_id is required"})
+            return
+        wanted = (query.get("stream") or ["both"])[0]
+        if wanted not in ("both", "stderr", "stdout"):
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "stream must be both, stderr or stdout"})
+            return
+        try:
+            history = int((query.get("history") or [str(DEFAULT_HISTORY_BYTES)])[0])
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "history must be an integer"})
+            return
+        paths = self.control_plane.log_paths(server_id)
+        if paths is None:
+            self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "No tracked server matched the request."})
+            return
+        if wanted != "both":
+            paths = {wanted: paths[wanted]} if wanted in paths else {}
+        if not self.log_stream_slots.acquire(blocking=False):
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"success": False, "error": "Too many live log streams are open."})
+            return
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            follower = LogFollower(paths, history_bytes=max(0, min(history, MAX_LOG_HISTORY_BYTES)))
+            for event in follower.start():
+                self._sse(event["type"], event)
+            self._sse("ready", {"server_id": server_id, "streams": sorted(paths)})
+            started = last_write = last_check = time.monotonic()
+            while True:
+                time.sleep(self.log_poll_seconds)
+                now = time.monotonic()
+                for event in follower.poll():
+                    self._sse(event["type"], event)
+                    last_write = now
+                if now - last_check >= self.log_check_seconds:
+                    last_check = now
+                    # A restart gives the mode a new server id (and truncates the
+                    # files), so this stream ends when its server is gone.
+                    if self.control_plane.log_paths(server_id) is None:
+                        self._sse("end", {"reason": "server_gone"})
+                        return
+                if now - started >= self.log_max_seconds:
+                    self._sse("end", {"reason": "timeout"})
+                    return
+                if now - last_write >= self.log_keepalive_seconds:
+                    self._sse("")  # also how a vanished viewer is noticed
+                    last_write = now
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.log_stream_slots.release()
+
     def _body(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length", "0")
         try:
@@ -123,6 +201,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"required": self.auth_state.enabled, "username": self.auth_state.username})
             return
         if not self._require_auth():
+            return
+        if parsed.path == "/api/logs/stream":
+            self._stream_logs(query)
             return
         try:
             if parsed.path == "/api/status":
