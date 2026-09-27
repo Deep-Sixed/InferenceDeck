@@ -168,6 +168,16 @@ def _resolved_params(profile: ModelProfile) -> dict[str, Any]:
     params.setdefault("host", "127.0.0.1")
     params.setdefault("port", 8080)
     params.setdefault("alias", profile.mode or "local-model")
+    if _runtime(params) == "koboldcpp":
+        # A llama.cpp fork on the same GGUF files, but it picks its own backend,
+        # threads, GPU layers (autofit) and batch size when left unset, so only
+        # the settings whose defaults InferenceDeck chooses deliberately are set.
+        params.setdefault("reasoning", wants_reasoning)
+        if "threads" in params:
+            params.setdefault("threads_batch", params["threads"])
+        if "jinja" not in params and profile.model_path:
+            params.setdefault("jinja", recommend_jinja(profile.model_path, probe=False)["recommended"])
+        return params
     if _runtime(params) != "llama.cpp":
         # vllm-server and mlc_llm serve take their own flags; none of the
         # llama-server defaults below apply. Reasoning is only forced when the profile says so, because
@@ -204,7 +214,8 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
     text = " ".join([profile.mode, profile.name, profile.description]).lower()
     # vllm.cpp runs MTP from the checkpoint's own heads via speculative_config,
     # not from a separate draft GGUF.
-    if "mtp" in text and _runtime(params) == "llama.cpp":
+    # KoboldCpp, like llama.cpp, drafts from a separate GGUF.
+    if "mtp" in text and _runtime(params) in ("llama.cpp", "koboldcpp"):
         draft_model = str(params.get("draft_model", "")).strip()
         if not draft_model:
             missing.append("draft_model")
@@ -218,8 +229,9 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
     if runtime == "vllm.cpp":
         # vllm.cpp sizes its KV pool from ctx_size; the rest are llama.cpp knobs.
         required = ["ctx_size"]
-    elif runtime == "mlc-llm":
-        # The model's mlc-chat-config.json supplies the context window.
+    elif runtime in ("mlc-llm", "koboldcpp"):
+        # MLC reads the context window from mlc-chat-config.json; KoboldCpp
+        # defaults the context and autofits GPU layers itself.
         required = []
     else:
         required = ["ctx_size", "threads", "cache_type_k", "cache_type_v", "gpu_layers"]
