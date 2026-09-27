@@ -19,6 +19,12 @@ The distro/system Python is normally required because PyGObject is provided by t
   reads them. After a rejected token the tray checks again less often (up to every 10 minutes), so a stale
   token can't lock this machine out of the web UI.
 
+## Runtime updates
+
+The **Runtime updates** menu entry says how many runtimes have a newer release, checked at
+startup and then hourly. Its submenu lists each one (clicking opens the GitHub release page)
+and has **Check now**. InferenceDeck never downloads or installs an update itself.
+
 ## Run
 
 ```bash
