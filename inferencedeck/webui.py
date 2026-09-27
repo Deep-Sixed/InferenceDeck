@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from importlib.resources import files
@@ -10,6 +11,7 @@ from .auth import AuthState, validate_bind_security
 from .config import AppConfig
 from .control import ControlPlane
 from .control_api import ControlRequestHandler
+from .otlp import start_exporter
 from .telemetry_history import start_sampler
 
 
@@ -55,6 +57,11 @@ def serve(
     handler.auth_state = auth
     config = AppConfig.load()
     start_sampler(config.telemetry_sample_seconds, config.telemetry_retention_days)
+    try:
+        start_exporter(config.otlp_endpoint, config.otlp_export_seconds)
+    except ValueError as exc:
+        # A bad export setting shouldn't keep the control panel from starting.
+        print(f"inferencedeck-web: OpenTelemetry export disabled: {exc}", file=sys.stderr)
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 

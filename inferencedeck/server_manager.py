@@ -653,7 +653,7 @@ def start_profile(
         if ready:
             emit_event("server.ready", server, startup_seconds=round(time.monotonic() - launched, 3))
         else:
-            emit_event("server.start_failed", server, reason="startup_timeout")
+            emit_event("server.start_failed", server, reason="startup_timeout", waited_seconds=round(time.monotonic() - launched, 3))
         _update_server(
             server_id,
             {

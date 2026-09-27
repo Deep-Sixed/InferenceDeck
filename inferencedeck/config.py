@@ -43,6 +43,10 @@ class AppConfig:
     # one-minute averages kept on disk.
     telemetry_sample_seconds: int = 5
     telemetry_retention_days: int = 7
+    # OpenTelemetry export (OTLP/HTTP JSON), off while empty. OTEL_EXPORTER_OTLP_ENDPOINT
+    # also enables it; put credentials in OTEL_EXPORTER_OTLP_HEADERS, not here.
+    otlp_endpoint: str = ""
+    otlp_export_seconds: int = 15
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

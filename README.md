@@ -281,6 +281,39 @@ scrape_configs:
       credentials_file: /etc/prometheus/inferencedeck-token   # omit when auth is off
 ```
 
+#### OpenTelemetry
+
+`inferencedeck-web` can also push telemetry to an OpenTelemetry Collector, or any
+OTLP/HTTP receiver. It is off unless an endpoint is set, and it is the only
+telemetry that leaves the machine. It speaks OTLP over HTTP with JSON encoding
+(the collector's `otlp` receiver on port 4318), with no extra dependencies.
+
+| Signal | What is sent |
+|---|---|
+| Metrics | The same readings as `/metrics`, every `otlp_export_seconds`. Gauges stay gauges and counters become cumulative sums |
+| Logs | One record per lifecycle event. Failed starts and stops are `WARN` |
+| Traces | An `inferencedeck.server.startup` span from launch until ready (or until it gave up, with error status), and an `inferencedeck.benchmark` span per benchmark run |
+
+Turn it on with `otlp_endpoint` in `config.json`, or the standard environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20...'   # credentials belong here, not in config.json
+export OTEL_SERVICE_NAME=thanatos                                # default: inferencedeck
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=home
+inferencedeck-web
+```
+
+| Setting (`config.json`) | Default | Meaning |
+|---|---|---|
+| `otlp_endpoint` | `""` | OTLP/HTTP base URL; `/v1/metrics`, `/v1/logs` and `/v1/traces` are appended |
+| `otlp_export_seconds` | `15` | Seconds between exports |
+
+A collector that is down doesn't affect InferenceDeck. Events are queued (up to
+2,000) and retried, and a missed metrics round is replaced by the next one.
+`GET /api/telemetry` reports the exporter's state under `otlp`: last export time,
+last error, and counts exported and dropped.
+
 ## Development
 
 ```bash

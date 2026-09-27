@@ -13,7 +13,7 @@ from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
-from . import telemetry_history
+from . import otlp, telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .server_manager import (
     CONTEXT_PRESETS,
@@ -82,7 +82,7 @@ class ControlPlane:
 
     def telemetry(self) -> dict[str, Any]:
         """Live system, GPU and per-server readings plus lifecycle counters. Collected locally; never sent anywhere."""
-        return telemetry_snapshot()
+        return {**telemetry_snapshot(), "otlp": otlp.status()}
 
     def metrics(self) -> str:
         """The telemetry snapshot in Prometheus text exposition format."""
