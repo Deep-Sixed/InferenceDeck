@@ -333,8 +333,10 @@ def _render_ps1_classic(
             rendered_tokens.append(f"'{escaped}'")
 
     body = " ".join(rendered_tokens).strip()
-    posix_model = Path(model_path).as_posix()
-    posix_binary = Path(binary_path).as_posix()
+    # Single-quoted PowerShell strings escape ' by doubling it; a model or
+    # binary path with an apostrophe must not end the string early.
+    posix_model = Path(model_path).as_posix().replace("'", "''")
+    posix_binary = Path(binary_path).as_posix().replace("'", "''")
     return (
         "$ErrorActionPreference = 'Stop'\n"
         + SCRIPT_HEADER_COMMENT
