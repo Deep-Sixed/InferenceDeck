@@ -10,8 +10,8 @@ from typing import Any
 from unittest import mock
 
 from inferencedeck.auth import AuthState
-from inferencedeck.gateway import router
 from inferencedeck.gateway.ir import GatewayError
+from inferencedeck.gateway.router import Router
 from inferencedeck.gateway.server import make_server
 from inferencedeck.gateway.switching import ModelSwitcher
 from inferencedeck.tray import ApiError
@@ -66,25 +66,20 @@ class FakeControlApi:
         return [dict(s) for s in self.servers]
 
 
-class RoutingTests(unittest.TestCase):
-    def resolve(self, servers, model, switcher=None):
-        with mock.patch.object(router, "active_endpoint", return_value=None), \
-                mock.patch.object(router, "list_servers", return_value=servers):
-            return router.resolve_target(model, switcher)
+def enabled_remote() -> mock.Mock:
+    remote = mock.Mock(valid=True, enabled=True, routable=True, api_key_env="", key_required=False,
+                       provider="llamacpp", base_url="http://thanatos:8080", model="qwen3-32b", aliases=[],
+                       display_name="Qwen on Thanatos", summary="Thanatos · Self-hosted")
+    remote.name = "thanatos"
+    return remote
 
-    def test_model_picks_the_running_server_it_names(self) -> None:
-        servers = [server("qwen", 8080), server("llama", 8081)]
-        self.assertEqual(self.resolve(servers, "llama").engine.api_base, "http://127.0.0.1:8081/v1")
-        self.assertEqual(self.resolve(servers, "LLAMA").model_id, "llama")
 
-    def test_unknown_model_falls_back_to_the_running_server(self) -> None:
-        target = self.resolve([server("qwen")], "gpt-4o")
-        self.assertEqual(target.model_id, "qwen")
-
-    def test_without_switching_nothing_is_started(self) -> None:
+class WithoutSwitchingTests(unittest.TestCase):
+    def test_a_stopped_profile_is_never_started(self) -> None:
         with self.assertRaises(GatewayError) as ctx:
-            self.resolve([], "llama")
+            Router(endpoints=lambda: [], servers=lambda: []).resolve("llama")
         self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(Router(endpoints=lambda: [], servers=lambda: []).loadable(), [])
 
 
 class SwitcherTests(unittest.TestCase):
@@ -92,10 +87,8 @@ class SwitcherTests(unittest.TestCase):
         self.api = FakeControlApi([server("qwen")])
         self.switcher = ModelSwitcher(self.api, drain_timeout=2)
 
-    def resolve(self, model):
-        with mock.patch.object(router, "active_endpoint", return_value=None), \
-                mock.patch.object(router, "list_servers", side_effect=self.api.list):
-            return router.resolve_target(model, self.switcher)
+    def resolve(self, model, endpoints=()):
+        return Router(endpoints=lambda: list(endpoints), servers=self.api.list, switcher=self.switcher).resolve(model)
 
     def test_named_profile_is_loaded_by_alias_after_releasing_the_other(self) -> None:
         target = self.resolve("llama-3.3-70b")
@@ -169,11 +162,26 @@ class SwitcherTests(unittest.TestCase):
         self.assertEqual(results, ["llama"] * 4)
         self.assertEqual([c[0] for c in self.api.calls].count("start"), 1)
 
-    def test_models_lists_loaded_and_switchable_profiles(self) -> None:
-        with mock.patch.object(router, "active_endpoint", return_value=None), \
-                mock.patch.object(router, "list_servers", side_effect=self.api.list):
-            models = router.list_models(self.switcher)
-        self.assertEqual([(m["id"], m["loaded"]) for m in models], [("qwen", True), ("llama", False)])
+    def test_running_profile_matched_by_name_or_alias_needs_no_switch(self) -> None:
+        # The catalog knows a server by mode/id/file; name and alias come from the profile.
+        target = self.resolve("qwen3-32b")
+        self.assertEqual(target.model_id, "qwen")
+        self.assertEqual(self.api.calls, [])
+
+    def test_no_switch_while_a_remote_endpoint_is_enabled(self) -> None:
+        target = self.resolve("llama", endpoints=[enabled_remote()])
+        self.assertEqual(target.endpoint, "thanatos")
+        self.assertEqual(self.api.calls, [])
+
+    def test_local_targets_carry_a_lease_remote_ones_do_not(self) -> None:
+        target = self.resolve("qwen")
+        with target.lease():
+            self.assertEqual(self.switcher.inflight.count("qwen-id"), 1)
+        self.assertEqual(self.switcher.inflight.count("qwen-id"), 0)
+
+    def test_loadable_lists_profiles_that_are_not_running(self) -> None:
+        router = Router(endpoints=lambda: [], servers=self.api.list, switcher=self.switcher)
+        self.assertEqual([p["mode"] for p in router.loadable()], ["llama"])
 
 
 class SwitchingGatewayTests(unittest.TestCase):
@@ -186,12 +194,8 @@ class SwitchingGatewayTests(unittest.TestCase):
         port = upstream.server_address[1]
         self.api = FakeControlApi([server("qwen", port)], port=port)
         self.switcher = ModelSwitcher(self.api)
-        patches = [mock.patch.object(router, "active_endpoint", return_value=None),
-                   mock.patch.object(router, "list_servers", side_effect=self.api.list)]
-        for patch in patches:
-            patch.start()
-            self.addCleanup(patch.stop)
-        gateway = make_server("127.0.0.1", 0, AuthState(token=""), switcher=self.switcher)
+        router = Router(endpoints=lambda: [], servers=self.api.list, switcher=self.switcher)
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""), router=router)
         threading.Thread(target=gateway.serve_forever, daemon=True).start()
         self.addCleanup(gateway.server_close)
         self.addCleanup(gateway.shutdown)
@@ -218,7 +222,8 @@ class SwitchingGatewayTests(unittest.TestCase):
     def test_models_endpoint(self) -> None:
         with urllib.request.urlopen(self.base + "/v1/models", timeout=10) as response:
             data = json.loads(response.read())["data"]
-        self.assertEqual([(m["id"], m["loaded"]) for m in data], [("qwen", True), ("llama", False)])
+        self.assertEqual([(m["id"], m["loaded"], m["default"]) for m in data],
+                         [("qwen", True, True), ("llama", False, False)])
 
 
 if __name__ == "__main__":

@@ -126,7 +126,10 @@ channel defaults to `update_channel` in config.
 - A project that tags versions without publishing GitHub releases is checked against
   its highest matching tag instead.
 
-The check isn't shown in the web UI or trays yet.
+The web UI's **Runtime updates** card and both trays' **Runtime updates** menu show
+the same results (API: `GET /api/updates`, `?refresh=1` to skip the cache). They check
+when they start and then every 30 minutes (web) or hourly (trays); **Check now**
+asks GitHub again. Each update links to its GitHub release page.
 
 ## Configuration
 
@@ -344,19 +347,46 @@ The example above is illustrative; do not commit the token to the repository or 
 inferencedeck-gateway --host 127.0.0.1 --port 8717
 ```
 
-The gateway gives applications one stable inference API, whatever is serving the model. It sends each request to the current target:
+The gateway gives applications one stable inference API, whatever is serving the model. The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+
+### Routing by model name
+
+The gateway picks a target from the `model` name in each request. It can route to:
+
+- every running (not paused) local server;
+- every self-hosted (`remote_host`) endpoint;
+- cloud endpoints that opt in with `"routable": true`. Cloud endpoints are left out by default, so no request leaves your machines unless you allow it.
+
+A self-hosted endpoint can opt out with `"routable": false`. A cloud endpoint whose API key is not set is left out.
+
+Names are matched without regard to case:
+
+| Target | Names that route to it |
+|---|---|
+| Remote endpoint | its `aliases`, its `model`, and its file name (`thanatos.json` → `thanatos`) |
+| Local server | its profile name, its server id, and its model file name without `.gguf` |
+
+To use any model on a particular endpoint, write `<endpoint>/<model>`. For example, `openrouter/meta-llama/llama-3.3-70b-instruct` sends `meta-llama/llama-3.3-70b-instruct` to the endpoint in `openrouter.json`.
+
+A request with no model name, or one that matches nothing, goes to the **default target**:
 
 1. the enabled remote/cloud endpoint, if there is one;
-2. otherwise the running (not paused) local server the request's `model` names (a profile's mode);
-3. otherwise the running local server, so clients that always send a fixed name such as `gpt-4o` keep working.
+2. otherwise the first running local server.
 
-The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+This means clients with a hard-coded model name keep working. An enabled endpoint that cannot be used (for example, its key is missing) returns an error rather than silently sending the request somewhere else.
+
+`GET /v1/models` lists every target the gateway can route to, with its aliases, and marks the default. Replies report the model name the client asked for.
+
+```json
+{ "provider": "llamacpp", "lane": "remote_host", "host": "Thanatos",
+  "baseUrl": "http://thanatos:8080", "model": "qwen3-32b", "aliases": ["big-qwen"] }
+```
 
 | Client API | Path |
 |---|---|
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | Anthropic Messages | `POST /v1/messages` |
-| Model list (loaded models, plus every profile when switching is on) | `GET /v1/models` |
+| Model list (every routable name, plus loadable profiles when switching is on) | `GET /v1/models` |
 
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
@@ -391,9 +421,10 @@ API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A cl
 inferencedeck-gateway --switch-models   # or "gateway_model_switching": true in config.json
 ```
 
-With switching on, a request can name any launchable profile, by its mode, display name
-or `alias`, and the gateway loads it, as Ollama does. A client can move between models
-just by changing `model`:
+With switching on, a request can also name a launchable profile that isn't running, by
+its mode, display name or `alias`, and the gateway loads it, as Ollama does. Names that
+already route somewhere (a running server, a routable endpoint) are used as they are,
+without switching. A client can move between local models just by changing `model`:
 
 1. every other running local server is released (stopped; its settings are kept, so
    Restore in the web UI or tray brings it back);
@@ -411,8 +442,9 @@ The gateway does not start processes itself. Like the trays, it asks the
 `http://127.0.0.1:8716`, with `INFERENCEDECK_TOKEN` when set), so that process remains
 the only owner of server state. If the control API can't be reached, a switch fails
 with a 503 that says so. A model name that matches no profile is not an error: it goes
-to the running server as before. While a remote endpoint is enabled it serves every
-request and no local model is loaded.
+to the default target as before. While a remote endpoint is enabled, local models are
+not loaded (local starts are refused then); requests that name one go to the default
+target. `GET /v1/models` adds each loadable profile with `"loaded": false`.
 
 The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
 

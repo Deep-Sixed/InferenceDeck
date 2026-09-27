@@ -161,6 +161,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
             elif parsed.path == "/api/hf/files":
                 self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
+            elif parsed.path == "/api/updates":
+                refresh = (query.get("refresh") or ["0"])[0] in ("1", "true")
+                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=refresh))
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:

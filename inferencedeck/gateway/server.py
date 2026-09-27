@@ -3,11 +3,12 @@
 Endpoints:
   POST /v1/chat/completions  OpenAI Chat Completions
   POST /v1/messages          Anthropic Messages
-  GET  /v1/models            the loaded model(s), plus every profile when switching is on
+  GET  /v1/models            every model name the gateway can route (see router.py),
+                             plus loadable profiles when switching is on
   GET  /healthz
 
-A request's ``model`` picks the local server it names; ``--switch-models`` (or
-``gateway_model_switching`` in config) also loads a named profile on demand.
+A request's ``model`` picks the target it names (see router.py); ``--switch-models``
+(or ``gateway_model_switching`` in config) also loads a named profile on demand.
 
 Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
@@ -30,7 +31,7 @@ from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
 from ..config import AppConfig
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
-from .router import Target, list_models, resolve_target
+from .router import Router
 from .switching import ModelSwitcher
 
 DEFAULT_PORT = 8717
@@ -65,8 +66,7 @@ APIS = {
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     auth_state = AuthState()
-    resolve: Callable[[str | None], Target] = staticmethod(resolve_target)
-    models: Callable[[], list[dict[str, Any]]] = staticmethod(list_models)
+    router: Router = Router()
     server_version = "InferenceDeckGateway/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -165,10 +165,20 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._guard(openai_api.render_error):
             return
         if path == "/v1/models":
+            try:
+                targets = self.router.catalog()
+            except GatewayError:
+                targets = []
+            loadable = getattr(self.router, "loadable", lambda: [])()
             self._send(HTTPStatus.OK, {"object": "list", "data": [
-                {"id": m["id"], "object": "model", "owned_by": "inferencedeck",
-                 "description": m["description"], "loaded": m["loaded"]}
-                for m in self.models()
+                {"id": t.model_id, "object": "model", "owned_by": "inferencedeck", "description": t.label,
+                 "aliases": [name for name in t.names if name != t.model_id], "default": t.default, "loaded": True}
+                for t in targets
+            ] + [
+                # With switching on: profiles a request can name to load them.
+                {"id": str(p["mode"]), "object": "model", "owned_by": "inferencedeck",
+                 "description": str(p.get("name") or p["mode"]), "aliases": [], "default": False, "loaded": False}
+                for p in loadable
             ]})
         else:
             self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
@@ -184,7 +194,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             request: ChatRequest = api.parse(body)
-            target = self.resolve(request.model or None)
+            target = self.router.resolve(request.model)
             model = request.model or target.model_id
             # The lease tells a model switch this server is still busy; for a
             # stream it is held until the last chunk is written.
@@ -209,29 +219,13 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, api.render_error(GatewayError(500, str(exc))))
 
 
-def _models_from(resolve: Callable[[str | None], Target]) -> Callable[[], list[dict[str, Any]]]:
-    def models() -> list[dict[str, Any]]:
-        try:
-            target = resolve(None)
-        except GatewayError:
-            return []
-        return [{"id": target.model_id, "description": target.label, "loaded": True}]
-    return models
-
-
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
-                resolve: Callable[[str | None], Target] | None = None,
-                switcher: ModelSwitcher | None = None) -> ThreadingHTTPServer:
+                router: Router | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     attrs: dict[str, Any] = {"auth_state": auth}
-    if resolve is not None:
-        attrs["resolve"] = staticmethod(resolve)
-        attrs["models"] = staticmethod(_models_from(resolve))
-    elif switcher is not None:
-        attrs["resolve"] = staticmethod(lambda model=None: resolve_target(model, switcher))
-    if switcher is not None:
-        attrs["models"] = staticmethod(lambda: list_models(switcher))
+    if router is not None:
+        attrs["router"] = router
     handler = type("BoundGatewayRequestHandler", (GatewayRequestHandler,), attrs)
     return ThreadingHTTPServer((host, port), handler)
 
@@ -247,7 +241,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     switching = AppConfig.load().gateway_model_switching if args.switch_models is None else args.switch_models
-    make_server(args.host, args.port, switcher=ModelSwitcher() if switching else None).serve_forever()
+    router = Router(switcher=ModelSwitcher()) if switching else None
+    make_server(args.host, args.port, router=router).serve_forever()
     return 0
 
 
