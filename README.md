@@ -14,7 +14,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 - Estimate model fit and performance, with `llama-fit-params` integration when available.
 - Resolve and manage portable model profiles.
 - Prepare `llama-server` launch commands and manage servers started by InferenceDeck.
-- Suspend/resume tracked servers to free accelerator resources without losing process state.
+- Pause/resume tracked servers without losing process state, or release the GPU (stop the server, keep its settings) and restore it later.
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
 - Generate portable launch scripts without overwriting hand-written scripts.
@@ -59,8 +59,11 @@ Do not bind the web/control service to a LAN or tailnet address without setting 
 
 ## Install
 
+From a checkout (InferenceDeck is not published on PyPI):
+
 ```bash
-python -m pip install -e .
+python -m pip install -e .          # core, CLI and web UI
+python -m pip install -e ".[tray]"  # also the Windows/macOS tray (pystray, Pillow)
 ```
 
 ## CLI
@@ -75,6 +78,39 @@ or:
 ```bash
 python -m inferencedeck inventory --pretty
 ```
+
+Commands (all print JSON; with no command, `inventory` runs):
+
+| Command | What it does |
+|---|---|
+| `inventory` | Runtimes, GGUF models and profiles. |
+| `profiles` | Profiles from `models.json` resolved against discovered models. |
+| `resolved-inventory` | Inventory plus resolved profile matches. |
+| `prepare MODE` | Build the `llama-server` command for a profile without launching it. |
+| `servers` | Servers started by InferenceDeck. |
+| `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
+| `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+
+Discovery commands accept `--project-root`, `--model-dir` (repeatable), `--max-files`
+and `--no-manifest`.
+
+## Configuration
+
+| Item | Location |
+|---|---|
+| Settings (`config.json`) | Config dir: `%APPDATA%\inferencedeck` on Windows, `$XDG_CONFIG_HOME/inferencedeck` or `~/.config/inferencedeck` elsewhere. Override with `LCC_CONFIG_DIR`. |
+| Remote/cloud endpoints | `remote_endpoints/*.json` in the config dir. |
+| Logs, state, generated launch scripts | Cache dir: `%LOCALAPPDATA%\inferencedeck`, `$XDG_CACHE_HOME/inferencedeck` or `~/.cache/inferencedeck`. Override with `LCC_CACHE_DIR` (and `LCC_LAUNCH_SCRIPTS_DIR` for scripts). |
+| Profiles (`models.json`) | The project root: `--project-root`, else the nearest parent of the working directory containing `models.json`, `llama-server`, `switch-model.ps1` or `pyproject.toml`. |
+
+`config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
+`llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `default_host` and
+`default_port` (see `inferencedeck/config.py` for the full list and defaults).
+
+GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
+`LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
+root and working directory, common home folders (`~/models`, `~/llms`, …), LM Studio's
+model folders and the Hugging Face cache (`HF_HOME`). A whole drive is never scanned.
 
 ## Choosing a llama.cpp build
 
@@ -91,8 +127,9 @@ Xeons) fall back to a CUDA AVX1 build. It never launches a build that needs an
 instruction set the CPU lacks, even if pinned. `llama-fit-params` and `llama-cli`
 are taken from the same build folder as the chosen server.
 
-Builds are found under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root (including
-`build*/bin`) and `PATH`. Each build's requirements come from, in order:
+Builds are found at `llama_server_path` or `LLAMA_SERVER`/`LLAMA_SERVER_BIN` (treated as
+pins), under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root and working directory
+(including `bin`, `build*/bin` and Visual Studio `Release` folders), and on `PATH`. Each build's requirements come from, in order:
 
 - an `inferencedeck-runtime.json` next to the binary:
   ```json
