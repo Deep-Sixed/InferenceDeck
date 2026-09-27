@@ -121,15 +121,29 @@ Server controls (the same in the web UI and both trays):
 | **Context 8K–128K** | Restarts the server (or restores a released one) at that context size. |
 | **Stop** | Stops the server. On a released server it forgets the saved settings. |
 
-For authenticated LAN/tailnet use:
+### Remote access
+
+Off loopback, InferenceDeck requires authentication **and** an encrypted transport,
+because the login password, token and session cookie would otherwise cross the network
+in the clear. Authentication alone doesn't protect them.
 
 ```bash
 export INFERENCEDECK_USER=admin
 export INFERENCEDECK_TOKEN='use-a-secret-from-your-secret-manager'
-inferencedeck-web --host 0.0.0.0 --port 8716
+
+# Over Tailscale: bind to this machine's Tailscale address (WireGuard encrypts it).
+inferencedeck-web --host 100.x.y.z --port 8716
+
+# Over a LAN: serve HTTPS (session cookies are then marked Secure).
+inferencedeck-web --host 192.168.1.20 --port 8716 --tls-cert cert.pem --tls-key key.pem
 ```
 
-The example above is illustrative; do not commit the token to the repository or a config file.
+Don't use `--host 0.0.0.0` for "the tailnet": it listens on every interface, including
+the ordinary LAN. A plain-HTTP non-loopback bind is refused unless you pass
+`--allow-insecure-http`, or put InferenceDeck behind an HTTPS reverse proxy and keep it
+on loopback.
+
+The token above is illustrative; don't commit it to the repository or a config file.
 
 ## Development
 

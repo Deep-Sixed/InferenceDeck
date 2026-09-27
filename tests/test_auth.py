@@ -17,8 +17,15 @@ class AuthStateTests(unittest.TestCase):
     def test_nonloopback_requires_token(self) -> None:
         with self.assertRaises(RuntimeError):
             validate_bind_security("0.0.0.0", AuthState(token=""))
-        validate_bind_security("0.0.0.0", AuthState(token="secret"))
         validate_bind_security("127.0.0.1", AuthState(token=""))
+        # With a token, a LAN bind still needs an encrypted transport or an explicit opt-out.
+        with self.assertRaisesRegex(RuntimeError, "unencrypted"):
+            validate_bind_security("0.0.0.0", AuthState(token="secret"))
+        validate_bind_security("0.0.0.0", AuthState(token="secret"), tls=True)
+        validate_bind_security("0.0.0.0", AuthState(token="secret"), allow_insecure_http=True)
+        validate_bind_security("100.101.102.103", AuthState(token="secret"))  # Tailscale (WireGuard)
+        with self.assertRaises(RuntimeError):
+            validate_bind_security("100.101.102.103", AuthState(token=""))  # still needs auth
 
     def test_credentials_and_sessions(self) -> None:
         auth = AuthState(username="admin", token="secret")

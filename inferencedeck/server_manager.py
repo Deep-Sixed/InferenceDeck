@@ -60,15 +60,14 @@ def read_state() -> dict[str, Any]:
         return {"servers": []}
 
 
-def write_state(state: dict[str, Any]) -> None:
-    path = state_path()
+def write_json_atomic(path: Path, data: Any) -> None:
+    """Write JSON via a unique temp file + rename, so concurrent writers never
+    share (and clobber) one staging file and readers never see half a file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # A unique temp name per write, so concurrent writers never share (and
-    # clobber) one staging file.
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(state, indent=2) + "\n")
+            fh.write(json.dumps(data, indent=2) + "\n")
         os.replace(tmp_name, path)
     except BaseException:
         try:
@@ -76,6 +75,10 @@ def write_state(state: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def write_state(state: dict[str, Any]) -> None:
+    write_json_atomic(state_path(), state)
 
 
 # Guards read-modify-write of servers.json. The RLock covers threads in this
@@ -110,6 +113,19 @@ def _unlock_file(fh: Any) -> None:
     import fcntl
 
     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def file_lock(lock_path: Path, thread_lock: Any) -> Iterator[None]:
+    """Exclusive across threads (``thread_lock``) and processes (an OS lock on ``lock_path``)."""
+    with thread_lock:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as fh:
+            _lock_file(fh)
+            try:
+                yield
+            finally:
+                _unlock_file(fh)
 
 
 @contextmanager

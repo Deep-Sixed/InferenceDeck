@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import list_servers, start_profile, stop_server
+from .server_manager import file_lock, list_servers, start_profile, stop_server, write_json_atomic
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -36,14 +37,17 @@ def load_benchmark_results() -> list[dict[str, Any]]:
     return payload if isinstance(payload, list) else []
 
 
+_RESULTS_LOCK = threading.Lock()
+
+
 def save_benchmark_result(result: dict[str, Any]) -> None:
-    results = load_benchmark_results()
-    results.append(result)
-    results = results[-100:]
+    # Read-append-write under a lock (threads and other processes), so two
+    # benchmarks finishing together can't drop one result or collide on a temp file.
     path = benchmark_results_path()
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    with file_lock(path.with_suffix(".lock"), _RESULTS_LOCK):
+        results = load_benchmark_results()
+        results.append(result)
+        write_json_atomic(path, results[-100:])
 
 
 def _server_for_mode(mode: str) -> dict[str, Any] | None:

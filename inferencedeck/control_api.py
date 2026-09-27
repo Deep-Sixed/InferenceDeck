@@ -22,6 +22,8 @@ MAX_BODY_BYTES = 1024 * 1024
 class ControlRequestHandler(BaseHTTPRequestHandler):
     control_plane = ControlPlane()
     auth_state = AuthState()
+    # Set when served over HTTPS, so session cookies are never sent over plain HTTP.
+    secure_cookies = False
     server_version = "InferenceDeckControl/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -45,6 +47,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         else:
             name = host.rpartition(":")[0] if host.count(":") == 1 else host
         return name.lower() in LOOPBACK_HOSTS
+
+    def _secure(self) -> str:
+        return "; Secure" if self.secure_cookies else ""
 
     def _client(self) -> str:
         return str(self.client_address[0])
@@ -183,11 +188,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     return
                 self.auth_state.record_success(client)
                 sid = self.auth_state.issue_session()
-                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}"])
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}{self._secure()}"])
                 return
             if parsed.path == "/api/logout":
                 self.auth_state.revoke_session(self._cookie("sid"))
-                self._json(HTTPStatus.OK, {"success": True}, cookies=["sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"])
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{self._secure()}"])
                 return
             if not self._require_auth():
                 return
