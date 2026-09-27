@@ -24,13 +24,17 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from .auth import LOOPBACK_HOSTS
+from .auth import LOOPBACK_HOSTS, token_from_environment
 from .paths import cache_dir, is_windows
 from .proc import NO_WINDOW, run as run_hidden
 
 BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("/")
-TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 POLL_SECONDS = 5
+# After a 401 the tray polls less and less often (60 s doubling to 10 min), so a
+# stale token makes at most 3 failed attempts in the server's 5-minute window and
+# never trips the lockout that would also block the browser on this machine.
+AUTH_RETRY_SECONDS = 60
+AUTH_RETRY_MAX_SECONDS = 600
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 # Server-side waits: start waits for the model to load (up to 600 s for
 # MLC LLM, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
@@ -52,10 +56,23 @@ TIMEOUTS = {
 class ApiError(Exception):
     """A failed API call, carrying the API's own error message."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def configured_token() -> str:
+    """The token from the environment or token file; read per request so a rotated file is picked up."""
+    try:
+        return token_from_environment()
+    except RuntimeError:  # unreadable token file: send no token, get a clear 401
+        return ""
+
 
 class ApiClient:
-    def __init__(self, base_url: str = BASE_URL, token: str = TOKEN) -> None:
+    def __init__(self, base_url: str = BASE_URL, token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        # None: use INFERENCEDECK_TOKEN / INFERENCEDECK_TOKEN_FILE, like the server.
         self.token = token
 
     def request(self, path: str, body: dict[str, Any] | None = None, timeout: float = 5) -> dict[str, Any]:
@@ -64,8 +81,9 @@ class ApiClient:
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if self.token:
-            headers["X-Auth-Token"] = self.token
+        token = self.token if self.token is not None else configured_token()
+        if token:
+            headers["X-Auth-Token"] = token
         req = urllib.request.Request(self.base_url + path, data=data, headers=headers, method="POST" if data else "GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -76,7 +94,7 @@ class ApiClient:
                 message = payload.get("error") or payload.get("message")
             except (ValueError, OSError, AttributeError):
                 message = None
-            raise ApiError(message or f"HTTP {exc.code}") from None
+            raise ApiError(message or f"HTTP {exc.code}", status=exc.code) from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise ApiError(f"InferenceDeck is not reachable at {self.base_url} ({exc})") from None
 
@@ -120,6 +138,7 @@ class TrayState:
     remotes: list[dict[str, Any]] = field(default_factory=list)
     remote_active: dict[str, Any] | None = None
     error: str | None = None
+    unauthorized: bool = False
 
     @property
     def active(self) -> dict[str, Any] | None:
@@ -159,6 +178,8 @@ class TrayState:
         return "idle"
 
     def status_text(self) -> str:
+        if self.unauthorized:
+            return "Not signed in - check INFERENCEDECK_TOKEN or INFERENCEDECK_TOKEN_FILE"
         if self.error:
             return "InferenceDeck unavailable"
         server = self.active
@@ -182,7 +203,15 @@ def fetch_state(api: ApiClient) -> TrayState:
             remote_active=status.get("remote_active"),
         )
     except ApiError as exc:
-        return TrayState(error=str(exc))
+        return TrayState(error=str(exc), unauthorized=exc.status == 401)
+
+
+def next_poll_delay(state: TrayState, auth_delay: float) -> tuple[float, float]:
+    """(seconds until the next poll, auth back-off to carry to the one after)."""
+    if not state.unauthorized:
+        return POLL_SECONDS, 0
+    delay = min(auth_delay * 2, AUTH_RETRY_MAX_SECONDS) if auth_delay else AUTH_RETRY_SECONDS
+    return delay, delay
 
 
 class TrayController:
@@ -444,12 +473,14 @@ def main() -> int:
 
     def poll(_icon: Any) -> None:
         _icon.visible = True
+        auth_delay = 0.0
         while not stop.is_set():
             try:
                 controller.refresh()
             except Exception as exc:  # one bad update must not freeze the tray for good
                 sys.stderr.write(f"inferencedeck tray refresh failed: {exc}\n")
-            stop.wait(POLL_SECONDS)
+            wait, auth_delay = next_poll_delay(controller.state, auth_delay)
+            stop.wait(wait)
 
     icon.run(setup=poll)
     return 0

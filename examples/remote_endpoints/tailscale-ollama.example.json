@@ -1,0 +1,11 @@
+{
+  "provider": "ollama",
+  "enabled": false,
+  "lane": "remote_host",
+  "host": "Inference box",
+  "transport": "tailscale",
+  "model": "qwen3:32b",
+  "baseUrl": "http://TAILNET_HOST:11434",
+  "displayName": "Remote Ollama",
+  "tags": ["remote_host", "ollama"]
+}

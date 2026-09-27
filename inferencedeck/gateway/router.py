@@ -13,13 +13,13 @@ from typing import Any
 
 from ..remotes import active_endpoint
 from ..server_manager import http_base, list_servers
-from .engines import OpenAICompatibleEngine
+from .engines import OllamaEngine, OpenAICompatibleEngine
 from .ir import GatewayError
 
 
 @dataclass
 class Target:
-    engine: OpenAICompatibleEngine
+    engine: OpenAICompatibleEngine | OllamaEngine
     label: str       # e.g. "Qwen3-32B (Thanatos · Tailscale · Self-hosted)"
     model_id: str    # what /v1/models reports
 
@@ -30,6 +30,15 @@ class Target:
 def _api_base(base_url: str) -> str:
     base = base_url.rstrip("/")
     return base if base.endswith("/v1") else f"{base}/v1"
+
+
+def _ollama_base(base_url: str) -> str:
+    # Accept the server root, or a URL copied from its OpenAI layer (/v1) or native API (/api).
+    base = base_url.rstrip("/")
+    for suffix in ("/v1", "/api"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
 
 
 def _local_server() -> dict[str, Any] | None:
@@ -46,7 +55,11 @@ def resolve_target() -> Target:
         if remote.key_required and not key:
             raise GatewayError(503, f"{remote.display_name}: ${remote.api_key_env} is not set", "overloaded")
         label = f"{remote.display_name} ({remote.summary})" if remote.summary else remote.display_name
-        engine = OpenAICompatibleEngine(_api_base(remote.base_url), model=remote.model, api_key=key)
+        if remote.provider.lower() == "ollama":
+            engine: OpenAICompatibleEngine | OllamaEngine = OllamaEngine(
+                _ollama_base(remote.base_url), model=remote.model, api_key=key)
+        else:
+            engine = OpenAICompatibleEngine(_api_base(remote.base_url), model=remote.model, api_key=key)
         return Target(engine, label, remote.model or remote.name)
     server = _local_server()
     if server is not None:

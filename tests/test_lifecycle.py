@@ -130,7 +130,66 @@ class LifecycleTests(_LifecycleBase):
         server_manager.stop_server(mode="qwen")
         self.assertFalse(server_manager.pid_is_running(live_pid))
         self.assertEqual(server_manager._find_server(parked)["status"], server_manager.PARKED)
-        self.assertIsNone(server_manager._find_server(live))
+        stopped = server_manager._find_server(live)  # kept as history, not deleted
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertFalse(stopped["running"])
+        self.assertIsNone(stopped["pid"])
+
+    def test_crashed_server_stays_as_history_with_logs(self) -> None:
+        sid = self._track()
+        proc = self.procs[-1]
+        log = server_manager.log_dir() / "qwen-crash-stderr.log"
+        log.write_text("CUDA error: out of memory\n", encoding="utf-8")
+        server_manager._update_server(sid, {"stderr_log": str(log)})
+        proc.kill()
+        proc.wait(timeout=5)
+        record = server_manager._find_server(sid)
+        self.assertEqual(record["status"], server_manager.EXITED)
+        self.assertIsNone(record["pid"])  # a reused PID can't make it look alive
+        self.assertEqual(record["last_pid"], proc.pid)
+        self.assertIn("out of memory", server_manager.server_logs(sid)["stderr"])
+        # History is not what "the qwen server" means for Stop/Pause by mode.
+        self.assertIsNone(server_manager._find_server(mode="qwen"))
+
+    def test_trim_deletes_logs_of_dropped_history(self) -> None:
+        logs = server_manager.log_dir()
+        for i in range(3):
+            (logs / f"h{i}-stderr.log").write_text("x", encoding="utf-8")
+            server_manager._upsert_server({"id": f"h{i}", "status": "stopped", "stderr_log": str(logs / f"h{i}-stderr.log")})
+        outside = server_manager.cache_dir() / "keep.log"
+        outside.write_text("x", encoding="utf-8")
+        server_manager._upsert_server({"id": "h3", "status": "stopped", "stderr_log": str(outside)})
+        server_manager.trim_server_history(limit=1)
+        ids = [s["id"] for s in server_manager.read_state()["servers"]]
+        self.assertEqual(ids, ["h3"])
+        self.assertEqual(sorted(p.name for p in logs.iterdir()), [])
+        self.assertTrue(outside.exists())  # only files in the log dir are ever deleted
+
+    @staticmethod
+    def _wait_exited(record: dict) -> None:
+        # An exited record has its pid moved to last_pid.
+        pid = record.get("pid") or record.get("last_pid")
+        if not server_manager._wait_gone(pid, 10):
+            raise AssertionError(f"PID {pid} did not exit")
+
+    def test_each_launch_gets_its_own_logs(self) -> None:
+        prepared = {
+            "success": True,
+            "command": {"argv": [sys.executable, "-c", "print('hi')"], "cwd": None, "warnings": []},
+            "params": {"host": "127.0.0.1", "port": 18090},
+            "profile": {"model": None},
+            "warnings": [],
+        }
+        with mock.patch.object(server_manager, "prepare_launch_command", return_value=prepared):
+            first = server_manager.start_profile("qwen", wait_ready=False)["server"]
+            self._wait_exited(first)
+            second = server_manager.start_profile("qwen", wait_ready=False)["server"]
+        # Windows can't delete the temp dir while the process still holds its log open.
+        self._wait_exited(second)
+        self.assertNotEqual(first["id"], second["id"])  # even if the OS reused the PID
+        self.assertNotEqual(first["stdout_log"], second["stdout_log"])
+        self.assertEqual(len(server_manager.read_state()["servers"]), 2)
+        self.assertTrue(Path(first["stdout_log"]).exists())
 
 
 class PidReuseTests(_LifecycleBase):
@@ -150,9 +209,16 @@ class PidReuseTests(_LifecycleBase):
         server_manager._update_server(sid, {"pid_identity": "another-process"})
         return sid, self.procs[-1]
 
-    def test_reused_pid_is_not_running_and_is_pruned(self) -> None:
-        sid, _proc = self._track_reused()
-        self.assertIsNone(server_manager._find_server(sid))
+    def test_reused_pid_becomes_history_with_its_pid_cleared(self) -> None:
+        sid, proc = self._track_reused()
+        record = server_manager._find_server(sid)
+        self.assertEqual(record["status"], server_manager.EXITED)
+        self.assertFalse(record["running"])
+        self.assertIsNone(record["pid"])  # the unrelated process is no longer linked to it
+        self.assertIsNone(record["pid_identity"])
+        self.assertEqual(record["last_pid"], proc.pid)
+        self.assertIsNone(proc.poll())  # and it was left running
+        self.assertIsNone(server_manager._find_server(mode="qwen"))
 
     def test_stop_never_kills_a_reused_pid(self) -> None:
         sid, proc = self._track_reused()
