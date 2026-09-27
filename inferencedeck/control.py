@@ -90,6 +90,11 @@ class ControlPlane:
     def benchmark(
         self, mode: str, overrides: dict[str, Any] | None = None, *, completion_tokens: int = 128
     ) -> dict[str, Any]:
+        # Benchmarking starts (or restarts) a local server, so it obeys the same
+        # local/remote exclusivity as Start.
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
         return run_profile_benchmark(
             mode,
             project_root=self.project_root,

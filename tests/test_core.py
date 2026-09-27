@@ -1000,7 +1000,7 @@ class ServerStopTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 with mock.patch.object(server_manager, "cache_dir", return_value=Path(tmp)):
-                    server_manager.write_state({"servers": [{"id": "s", "mode": "m", "pid": proc.pid, "running": True}]})
+                    server_manager.write_state({"servers": [{"id": "s", "mode": "m", "pid": proc.pid, "running": True, "process": server_manager.process_identity(proc.pid)}]})
                     self.assertTrue(server_manager.suspend_server(server_id="s")["success"])
                     started = time.monotonic()
                     result = server_manager.stop_server(server_id="s")
@@ -1035,7 +1035,7 @@ class ServerStopTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 with mock.patch.object(server_manager, "cache_dir", return_value=Path(tmp)):
                     server_manager.write_state(
-                        {"servers": [{"id": "test-server", "mode": "test", "pid": proc.pid}]}
+                        {"servers": [{"id": "test-server", "mode": "test", "pid": proc.pid, "process": server_manager.process_identity(proc.pid)}]}
                     )
                     result = server_manager.stop_server(server_id="test-server")
             self.assertTrue(result["success"], result)

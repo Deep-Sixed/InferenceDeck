@@ -42,7 +42,9 @@ class LifecycleTests(unittest.TestCase):
         self.procs.append(proc)
         server_id = f"{mode}-{proc.pid}"
         server_manager._upsert_server(
-            {"id": server_id, "mode": mode, "pid": proc.pid, "status": "running", "overrides": overrides or {}}
+            {"id": server_id, "mode": mode, "pid": proc.pid, "status": "running", "overrides": overrides or {},
+             # As start_profile records it, so ownership checks recognise the process.
+             "process": server_manager.process_identity(proc.pid)}
         )
         return server_id
 

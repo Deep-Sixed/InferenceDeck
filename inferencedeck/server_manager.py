@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -26,6 +27,9 @@ STATE_FILENAME = "servers.json"
 # restart spec (mode + overrides) so Restore can bring it back.
 PARKED = "parked"
 RESTORING = "restoring"
+# A Start in progress: the profile is reserved before its process is launched.
+LAUNCHING = "launching"
+LAUNCH_RESERVATION_SECONDS = 120
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 LOG_DIRNAME = "logs"
 
@@ -161,6 +165,92 @@ def _windows_pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def process_identity(pid: int | None) -> dict[str, str] | None:
+    """Start time and executable name of ``pid``, or None if unreadable.
+
+    PIDs are reused (after a reboot, or once enough processes have come and
+    gone), so a stored PID alone can point at an unrelated program. The start
+    time pins down which process it was.
+    """
+
+    if not pid:
+        return None
+    try:
+        if is_windows():
+            return _windows_process_identity(int(pid))
+        stat_path = Path(f"/proc/{int(pid)}/stat")
+        if stat_path.exists():
+            # Fields after the ")" that closes the command name; starttime is field 22.
+            fields = stat_path.read_text(encoding="ascii", errors="replace").rpartition(")")[2].split()
+            argv0 = Path(f"/proc/{int(pid)}/cmdline").read_bytes().split(b"\0")[0].decode(errors="replace")
+            return {"start": fields[19], "image": Path(argv0).name.lower()}
+        # macOS/BSD: no /proc.
+        result = run_hidden(["ps", "-o", "lstart=", "-o", "comm=", "-p", str(int(pid))],
+                            capture_output=True, text=True, timeout=5, check=False)
+        parts = result.stdout.split()
+        if result.returncode != 0 or len(parts) < 6:
+            return None
+        return {"start": " ".join(parts[:5]), "image": Path(" ".join(parts[5:])).name.lower()}
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _windows_process_identity(pid: int) -> dict[str, str] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        size = wintypes.DWORD(1024)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        image = ""
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            image = Path(buffer.value).name.lower()
+        start = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return {"start": str(start), "image": image}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _expected_image(server: dict[str, Any]) -> str:
+    binary = server.get("binary")
+    if not binary:
+        # Records from before "binary" was stored: take argv[0] from the command line.
+        try:
+            binary = shlex.split(str(server.get("command_line") or ""), posix=not is_windows())[0]
+        except (ValueError, IndexError):
+            return ""
+    return Path(str(binary).strip('"')).name.lower()
+
+
+def owns_process(server: dict[str, Any]) -> bool:
+    """True only if the record's PID is still the process InferenceDeck started.
+
+    Anything that signals a PID (stop, pause, release) or reports it as running
+    goes through this, so a stale record can never kill or claim an unrelated
+    program that has since been given the same PID.
+    """
+
+    pid = server.get("pid")
+    if not pid_is_running(pid):
+        return False
+    current = process_identity(pid)
+    if current is None:
+        return False  # can't prove it's ours (e.g. another user's process)
+    stored = server.get("process") or {}
+    if stored.get("start"):
+        return stored["start"] == current["start"]
+    expected = _expected_image(server)
+    return bool(expected) and current["image"] == expected
+
+
 def pid_is_running(pid: int | None) -> bool:
     if not pid:
         return False
@@ -225,7 +315,7 @@ def list_servers() -> list[dict[str, Any]]:
     servers = []
     for server in state.get("servers", []):
         item = dict(server)
-        item["running"] = pid_is_running(item.get("pid"))
+        item["running"] = bool(item.get("pid")) and owns_process(item)
         servers.append(item)
     return servers
 
@@ -235,7 +325,16 @@ def prune_stale_servers() -> None:
 
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
-        kept = [s for s in servers if pid_is_running(s.get("pid")) or not s.get("pid")]
+        # Drops records whose PID has exited or now belongs to another program,
+        # and launch reservations abandoned by a Start that never finished.
+        now = time.time()
+        kept = [
+            s
+            for s in servers
+            if (owns_process(s) if s.get("pid") else not (
+                s.get("status") == LAUNCHING and now - float(s.get("reserved_at") or 0) >= LAUNCH_RESERVATION_SECONDS
+            ))
+        ]
         state["servers"] = kept
         return len(kept) != len(servers)
 
@@ -248,7 +347,7 @@ def trim_server_history(limit: int = 5) -> None:
     def change(state: dict[str, Any]) -> bool:
         servers = state["servers"]
         # Parked records are not history: they are how Restore finds the server.
-        running = [pid_is_running(s.get("pid")) or s.get("status") in (PARKED, RESTORING) for s in servers]
+        running = [pid_is_running(s.get("pid")) or s.get("status") in (PARKED, RESTORING, LAUNCHING) for s in servers]
         idle = [i for i, alive in enumerate(running) if not alive]
         excess = len(servers) - max(limit, running.count(True))
         if excess <= 0 or not idle:
@@ -284,9 +383,10 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
     if not raw_pid:
         return {"success": True, "message": "Tracked server has no PID to stop."}
     pid = int(raw_pid)
-    if not pid_is_running(pid):
+    if not owns_process(server):
+        # Exited, or the PID now belongs to something else: never signal it.
         _update_server(server["id"], {"status": "stopped", "running": False, "suspended": False, "stopped_at": _now()})
-        return {"success": True, "message": f"Tracked PID {pid} is no longer running."}
+        return {"success": True, "message": f"Tracked PID {pid} is no longer this server; nothing to stop."}
 
     if is_windows():
         cmd = ["taskkill", "/PID", str(pid), "/T", "/F"]
@@ -411,6 +511,8 @@ def suspend_server(server_id: str | None = None, mode: str | None = None) -> dic
     server = _find_server(server_id, mode)
     if not server:
         return {"success": False, "error": "No tracked server matched the request."}
+    if not owns_process(server):
+        return {"success": False, "error": "That PID is no longer this server; not signalling it.", "server": server}
     pid = int(server.get("pid") or 0)
     success, message = _set_process_suspended(pid, True)
     if success:
@@ -422,6 +524,8 @@ def resume_server(server_id: str | None = None, mode: str | None = None) -> dict
     server = _find_server(server_id, mode)
     if not server:
         return {"success": False, "error": "No tracked server matched the request."}
+    if not owns_process(server):
+        return {"success": False, "error": "That PID is no longer this server; not signalling it.", "server": server}
     pid = int(server.get("pid") or 0)
     success, message = _set_process_suspended(pid, False)
     if success:
@@ -575,6 +679,10 @@ def start_profile(
         if not stop_result.get("success"):
             return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
 
+    reservation, conflict = _reserve_launch(mode)
+    if conflict:
+        return {"success": False, "error": conflict, "server": _find_server(mode=mode)}
+
     command = LaunchCommand(
         argv=prepared["command"]["argv"],
         cwd=prepared["command"]["cwd"],
@@ -603,6 +711,7 @@ def start_profile(
     except Exception as exc:
         stdout_handle.close()
         stderr_handle.close()
+        _remove_server(reservation)
         return {"success": False, "error": str(exc), "prepared": prepared}
     finally:
         stdout_handle.close()
@@ -620,6 +729,9 @@ def start_profile(
         "port": int(params.get("port", 8080)),
         "model_path": prepared["profile"]["model"]["path"] if prepared["profile"].get("model") else None,
         "command_line": command.command_line,
+        "binary": command.argv[0],
+        # Checked before every signal, so a reused PID is never mistaken for this server.
+        "process": process_identity(proc.pid),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
         "started_at": _now(),
@@ -628,7 +740,10 @@ def start_profile(
         "overrides": dict(overrides or {}),
         "ctx_size": params.get("ctx_size"),
     }
-    _upsert_server(server)
+    def replace_reservation(state: dict[str, Any]) -> None:
+        state["servers"] = [r for r in state["servers"] if r.get("id") != reservation] + [server]
+
+    _mutate_state(replace_reservation)
     app_config = AppConfig.load()
     trim_server_history(app_config.server_history_limit)
 
@@ -651,6 +766,39 @@ def start_profile(
             }
 
     return {"success": True, "server": _find_server(server_id), "prepared": prepared}
+
+
+def _reserve_launch(mode: str) -> tuple[str | None, str | None]:
+    """Atomically claim ``mode`` for a new launch: (reservation id, None) or (None, error).
+
+    Checking for a running server and launching one are separate steps, so two
+    Start requests could both pass the check. The reservation is taken under the
+    state lock (which also covers other processes), so only one can win.
+    """
+
+    reservation = f"{mode}-launching-{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
+    error: list[str] = []
+
+    def change(state: dict[str, Any]) -> bool:
+        now = time.time()
+        kept = []
+        for record in state["servers"]:
+            if record.get("mode") == mode:
+                if record.get("status") == LAUNCHING:
+                    if now - float(record.get("reserved_at") or 0) < LAUNCH_RESERVATION_SECONDS:
+                        error.append(f"Profile '{mode}' is already starting.")
+                        return False
+                    continue  # an abandoned reservation (crashed mid-start): drop it
+                if record.get("pid") and owns_process(record):
+                    error.append(f"Profile '{mode}' already has a tracked running server.")
+                    return False
+            kept.append(record)
+        kept.append({"id": reservation, "mode": mode, "status": LAUNCHING, "pid": None, "reserved_at": now})
+        state["servers"] = kept
+        return True
+
+    _mutate_state(change)
+    return (None, error[0]) if error else (reservation, None)
 
 
 def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
