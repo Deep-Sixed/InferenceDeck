@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -20,8 +21,12 @@ from gi.repository import GLib, Gtk, Notify  # noqa: E402
 
 # inferencedeck-web serves both the API and the UI; it is the one process that owns server state.
 BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("/")
-TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 SYNC_SECONDS = 5
+# After a 401, sync less and less often (60 s doubling to 10 min): a stale token
+# then makes at most 3 failed attempts in the server's 5-minute window and never
+# trips the lockout that would also block the browser on this machine.
+AUTH_RETRY_SECONDS = 60
+AUTH_RETRY_MAX_SECONDS = 600
 # start waits for the model to load before replying: up to 600 s server-side
 # for MLC LLM (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
 # for finding and launching the runtime.
@@ -33,14 +38,37 @@ RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 
 
+class Unauthorized(RuntimeError):
+    """The control API rejected our token (or we have none)."""
+
+
+def configured_token() -> str:
+    """INFERENCEDECK_TOKEN, else INFERENCEDECK_TOKEN_FILE, as the server reads them.
+
+    Read per request, so a rotated token file is picked up without a restart.
+    """
+    direct = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
+    if direct:
+        return direct
+    token_file = os.environ.get("INFERENCEDECK_TOKEN_FILE", "").strip()
+    if not token_file:
+        return ""
+    try:
+        with open(os.path.expanduser(token_file), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 class ApiClient:
     def _request(self, path: str, body: dict[str, Any] | None = None, timeout: float = 5) -> dict[str, Any]:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if TOKEN:
-            headers["X-Auth-Token"] = TOKEN
+        token = configured_token()
+        if token:
+            headers["X-Auth-Token"] = token
         request = urllib.request.Request(
             BASE_URL + path,
             data=data,
@@ -51,6 +79,8 @@ class ApiClient:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise Unauthorized("unauthorized") from None
             # Surface the API's own error message instead of "HTTP Error 400".
             try:
                 payload = json.loads(exc.read().decode("utf-8"))
@@ -154,6 +184,8 @@ class TrayApplication:
         self.indicator.set_menu(menu)
         self.indicator.set_title("InferenceDeck")
         Notify.init("InferenceDeck")
+        self._auth_delay = 0
+        self._next_sync = 0.0
         GLib.timeout_add_seconds(SYNC_SECONDS, self._tick)
         self.refresh()
 
@@ -206,16 +238,24 @@ class TrayApplication:
             self.stop_item.set_sensitive(bool(self.active))
             self.command_item.set_sensitive(alive)
             self.profiles_item.set_sensitive(not self.remote_active)
+            self._auth_delay = 0
         except Exception as exc:
-            self.status_item.set_label("Control API unavailable")
-            self.indicator.set_title("InferenceDeck — API unavailable")
+            if isinstance(exc, Unauthorized):
+                self._auth_delay = min(self._auth_delay * 2, AUTH_RETRY_MAX_SECONDS) if self._auth_delay else AUTH_RETRY_SECONDS
+                self._next_sync = time.monotonic() + self._auth_delay
+                self.status_item.set_label("Not signed in — check INFERENCEDECK_TOKEN or INFERENCEDECK_TOKEN_FILE")
+                self.indicator.set_title("InferenceDeck — not signed in")
+            else:
+                self.status_item.set_label("Control API unavailable")
+                self.indicator.set_title("InferenceDeck — API unavailable")
             for item in [self.suspend_item, self.resume_item, self.release_item, self.restore_item,
                          self.restart_item, self.context_item, self.stop_item, self.command_item]:
                 item.set_sensitive(False)
             sys.stderr.write(f"inferencedeck tray refresh: {exc}\n")
 
     def _tick(self) -> bool:
-        self.refresh()
+        if time.monotonic() >= self._next_sync:  # backing off after a 401
+            self.refresh()
         return True
 
     def _clear(self, menu: Gtk.Menu) -> None:

@@ -19,7 +19,8 @@ FAILURE_WINDOW_SECONDS = 300
 MAX_TRACKED_CLIENTS = 1024
 
 
-def _token_from_environment() -> str:
+def token_from_environment() -> str:
+    """INFERENCEDECK_TOKEN, else the contents of INFERENCEDECK_TOKEN_FILE; "" when neither is set."""
     direct = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
     if direct:
         return direct
@@ -35,7 +36,7 @@ def _token_from_environment() -> str:
 @dataclass
 class AuthState:
     username: str = field(default_factory=lambda: os.environ.get("INFERENCEDECK_USER", "admin").strip() or "admin")
-    token: str = field(default_factory=_token_from_environment)
+    token: str = field(default_factory=token_from_environment)
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     # sid -> expiry; insertion order is issue order, so the oldest is evicted first.
     _sessions: OrderedDict[str, float] = field(default_factory=OrderedDict, init=False, repr=False)
