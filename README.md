@@ -8,12 +8,12 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 ### Core
 
-- Discover local `llama.cpp`, Ollama, LM Studio, vLLM, and MLX runtimes.
+- Discover local `llama.cpp`, `vllm.cpp`, Ollama, LM Studio, vLLM, and MLX runtimes.
 - Discover GGUF models from configured and common model locations.
 - Detect CPU, GPU, system memory, VRAM, and available acceleration backends.
 - Estimate model fit and performance, with `llama-fit-params` integration when available.
 - Resolve and manage portable model profiles.
-- Prepare `llama-server` launch commands and manage servers started by InferenceDeck.
+- Prepare `llama-server` or `vllm-server` (vllm.cpp) launch commands and manage servers started by InferenceDeck.
 - Pause/resume tracked servers without losing process state, or release the GPU (stop the server, keep its settings) and restore it later.
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
@@ -53,8 +53,8 @@ Do not bind the web/control service to a LAN or tailnet address without setting 
 
 ### Deliberately not owned
 
-- Bundled `llama.cpp` binaries or compiled AVX/CUDA builds.
-- `llama.cpp` source-build management. InferenceDeck consumes runtimes rather than owning their compiler/build toolchains.
+- Bundled `llama.cpp`/`vllm.cpp` binaries or compiled AVX/CUDA builds.
+- `llama.cpp`/`vllm.cpp` source-build management. InferenceDeck consumes runtimes rather than owning their compiler/build toolchains.
 - Machine-specific EVECOR paths, systemd units, Windows task definitions, credentials, or private endpoint addresses.
 
 ## Install
@@ -104,8 +104,8 @@ and `--no-manifest`.
 | Profiles (`models.json`) | The project root: `--project-root`, else the nearest parent of the working directory containing `models.json`, `llama-server`, `switch-model.ps1` or `pyproject.toml`. |
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
-`llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `default_host` and
-`default_port` (see `inferencedeck/config.py` for the full list and defaults).
+`llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
+`extra_vllm_cpp_args`, `default_host`, `default_port` and `idle_release_seconds` (see `inferencedeck/config.py` for the full list and defaults).
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -137,6 +137,43 @@ pins), under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root and working dire
   ```
 - the build's `CMakeCache.txt` (`GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_CUDA`);
 - otherwise it is assumed to be a standard build that needs AVX2.
+
+## Running a profile on vllm.cpp
+
+[vllm.cpp](https://github.com/mudler/vllm.cpp) is a standalone C++ engine (no Python)
+with vLLM's serving core: continuous batching, a paged KV cache and prefix caching.
+It loads the same GGUF files as llama.cpp, plus Safetensors. It is a second backend
+alongside llama.cpp, not a replacement, and it is still alpha: its CLI can change
+between releases.
+
+A profile runs on vllm.cpp when its `recommended_params` set `"runtime": "vllm.cpp"`.
+The runtime is part of the profile and can't be switched over the control API.
+
+```json
+{"mode": "qwen-vllm", "name": "Qwen3 8B (vllm.cpp)",
+ "recommended_params": {"runtime": "vllm.cpp", "ctx_size": 32768, "max_num_seqs": 8}}
+```
+
+`vllm-server` is found at `vllm_cpp_server_path` in config, `VLLM_CPP_SERVER` /
+`VLLM_CPP_SERVER_BIN`, under `VLLM_CPP_HOME` or `runtime_dirs` (`bin/` of a release
+archive or `build/examples/` of a source build), or on `PATH`.
+
+| Profile param | `vllm-server` flag |
+|---|---|
+| `ctx_size` | `--max-model-len`, and `--num-blocks` sized to hold one sequence that long |
+| `num_blocks` / `kv_cache_memory_mib` / `block_size` | `--num-blocks` / `--kv-cache-memory` / `--block-size` |
+| `max_num_seqs`, `max_num_batched_tokens` | `--max-num-seqs`, `--max-num-batched-tokens` |
+| `kv_cache_dtype` | `--kv-cache-dtype` (e.g. `fp8`) |
+| `reasoning` | `--enable-thinking` / `--no-enable-thinking` (unset: the chat template decides) |
+| `enable_prefix_caching` | `--enable-prefix-caching` / `--no-enable-prefix-caching` |
+| `speculative_config` | `--speculative-config` (JSON) |
+| `tool_call_parser`, `reasoning_parser`, `scheduling_policy`, `generation_config`, `mmproj` | the flag of the same name |
+
+llama.cpp-only settings (`gpu_layers`, `threads`, `cache_type_k`, …) and sampling
+values (vllm-server takes those per request) produce a warning rather than a flag.
+Start, Stop, Pause, Release GPU, Restart, the Context presets and Benchmark work the
+same as for llama.cpp; Start waits up to 180 s for readiness. Fit needs
+`llama-fit-params` and stays llama.cpp-only.
 
 ## Local control API and web UI
 
@@ -170,8 +207,8 @@ param or launch override named `idle_release_seconds` sets it at start.
 InferenceDeck is not in the request path, so `inferencedeck-web` polls each server's
 llama-server `/slots` every 15 seconds. A slot that is processing, or one that took a
 new task since the last poll, counts as activity. A server whose `/slots` cannot be
-read (started with `--no-slots` or `--api-key`, or not responding) is never
-auto-released. The idle clock restarts when `inferencedeck-web` restarts.
+read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
+which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
 
 ### Request defaults and sampling presets
 
@@ -203,7 +240,8 @@ These become llama-server launch flags, so they are **defaults**: a request that
 its own `temperature`, `max_tokens` or `chat_template_kwargs` still gets what it asked
 for. The web UI shows each running server's defaults. Forcing a value over the
 client's (llama-swap's `setParams`) would need InferenceDeck in the request path, which
-it is not.
+it is not. vllm.cpp servers take sampling per request only, so presets there only
+produce the usual "not applied" warning.
 
 For authenticated LAN/tailnet use:
 

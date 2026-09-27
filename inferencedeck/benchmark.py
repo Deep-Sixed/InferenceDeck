@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import DEFAULT_READY_TIMEOUT_SECONDS, list_servers, start_profile, stop_server
+from .server_manager import list_servers, start_profile, stop_server
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -176,7 +176,7 @@ def run_profile_benchmark(
     completion_tokens: int = 128,
     restart: bool = True,
     stop_after: bool = False,
-    ready_timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS,
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     params = dict(overrides or {})
     params["n_predict"] = int(completion_tokens)

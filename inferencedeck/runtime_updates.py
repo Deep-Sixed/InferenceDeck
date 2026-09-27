@@ -57,6 +57,7 @@ GITHUB_REPOS: dict[str, str] = {
     "wsl-llama.cpp": "ggml-org/llama.cpp",
     "ollama": "ollama/ollama",
     "vllm": "vllm-project/vllm",
+    "vllm.cpp": "mudler/vllm.cpp",
     "mlx": "ml-explore/mlx",
 }
 
@@ -67,6 +68,7 @@ def runtime_label(runtime_id: str) -> str:
         "wsl-llama.cpp": "llama.cpp (WSL)",
         "ollama": "Ollama",
         "vllm": "vLLM",
+        "vllm.cpp": "vllm.cpp",
         "mlx": "MLX",
         "lm-studio": "LM Studio",
     }.get(runtime_id, runtime_id)
