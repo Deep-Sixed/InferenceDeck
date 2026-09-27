@@ -125,19 +125,28 @@ def _best_model(profile: ModelProfile, models: list[ModelFile]) -> tuple[ModelFi
     return scored[0][1], scored[0][0], warnings
 
 
+def _is_vllm_cpp(params: dict[str, Any]) -> bool:
+    return str(params.get("runtime") or "").strip() == "vllm.cpp"
+
+
 def _resolved_params(profile: ModelProfile) -> dict[str, Any]:
     params = dict(profile.recommended_params)
     description = profile.description.lower()
     mode = profile.mode.lower()
     reasoning_disabled = any(token in description for token in ["no reasoning", "reasoning off", "non-reasoning"])
     reasoning_enabled = any(token in description for token in ["reasoning on", "reasoning mode"])
-    if not reasoning_disabled and (reasoning_enabled or mode.endswith("think") or "-think" in mode):
-        params.setdefault("reasoning", True)
-    else:
-        params.setdefault("reasoning", False)
+    wants_reasoning = not reasoning_disabled and (reasoning_enabled or mode.endswith("think") or "-think" in mode)
     params.setdefault("host", "127.0.0.1")
     params.setdefault("port", 8080)
     params.setdefault("alias", profile.mode or "local-model")
+    if _is_vllm_cpp(params):
+        # vllm-server takes vLLM-style flags; none of the llama-server defaults
+        # below apply. Reasoning is only forced when the profile says so, because
+        # leaving it unset lets the chat template pick its own default.
+        if wants_reasoning or reasoning_disabled:
+            params.setdefault("reasoning", wants_reasoning)
+        return params
+    params.setdefault("reasoning", wants_reasoning)
     params.setdefault("threads_batch", params.get("threads", 4))
     params.setdefault("batch_size", 512)
     params.setdefault("ubatch_size", min(int(params.get("batch_size", 512)), 512))
@@ -164,7 +173,9 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
         warnings.append(f"Low-confidence model match ({confidence:.2f}); confirm before launching.")
 
     text = " ".join([profile.mode, profile.name, profile.description]).lower()
-    if "mtp" in text:
+    # vllm.cpp runs MTP from the checkpoint's own heads via speculative_config,
+    # not from a separate draft GGUF.
+    if "mtp" in text and not _is_vllm_cpp(params):
         draft_model = str(params.get("draft_model", "")).strip()
         if not draft_model:
             missing.append("draft_model")
@@ -174,7 +185,11 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
         if model and "mtp" not in model.path.lower() and "gemma" not in text:
             warnings.append("MTP profile matched a non-MTP model path; this may require a WSL or custom backend.")
 
-    required = ["ctx_size", "threads", "cache_type_k", "cache_type_v", "gpu_layers"]
+    if _is_vllm_cpp(params):
+        # vllm.cpp sizes its KV pool from ctx_size; the rest are llama.cpp knobs.
+        required = ["ctx_size"]
+    else:
+        required = ["ctx_size", "threads", "cache_type_k", "cache_type_v", "gpu_layers"]
     for key in required:
         if key not in params:
             missing.append(f"param:{key}")

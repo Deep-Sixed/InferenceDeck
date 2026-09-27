@@ -27,8 +27,10 @@ SYNC_SECONDS = 5
 # trips the lockout that would also block the browser on this machine.
 AUTH_RETRY_SECONDS = 60
 AUTH_RETRY_MAX_SECONDS = 600
-# start waits for the model to load (up to 45 s server-side) before replying.
-START_TIMEOUT_SECONDS = 120
+# start waits for the model to load before replying: up to 180 s server-side
+# for vllm.cpp (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
+# for finding and launching the runtime.
+START_TIMEOUT_SECONDS = 240
 # stop allows 5 s for a clean exit plus 3 s after SIGKILL server-side.
 STOP_TIMEOUT_SECONDS = 20
 # restart stops and then starts, so it can take both.

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.request
@@ -13,9 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .backends import detect_llama_cpp, detect_runtime
+from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
 from .config import AppConfig
+from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .llama_args import LaunchCommand, build_llama_server_args
+from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
 from .proc import run as run_hidden
@@ -59,55 +60,13 @@ def read_state() -> dict[str, Any]:
 
 
 def write_state(state: dict[str, Any]) -> None:
-    path = state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # A unique temp name per write, so concurrent writers never share (and
-    # clobber) one staging file.
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(state, indent=2) + "\n")
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(state_path(), json.dumps(state, indent=2) + "\n")
 
 
 # Guards read-modify-write of servers.json. The RLock covers threads in this
 # process; the file lock covers other processes (e.g. the CLI next to the daemon).
 _STATE_LOCK = threading.RLock()
 _STATE_DEPTH = threading.local()
-
-
-def _lock_file(fh: Any) -> None:
-    if is_windows():
-        import msvcrt
-
-        fh.seek(0)
-        while True:
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                return
-            except OSError:
-                time.sleep(0.05)
-    import fcntl
-
-    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(fh: Any) -> None:
-    if is_windows():
-        import msvcrt
-
-        fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
@@ -500,9 +459,29 @@ def _remove_server(server_id: str) -> None:
     _delete_logs(removed)
 
 
+# vllm.cpp loads and warms the model before it binds, which takes noticeably
+# longer than llama-server (about 53 s cold for a 27B on its reference box).
+READY_TIMEOUT_SECONDS = {"llama.cpp": 45, "vllm.cpp": 180}
+
+
+def http_base(host: str | None, port: int) -> str:
+    """``http://host:port`` for reaching a server bound to ``host`` from this machine.
+
+    A wildcard bind is reached on the matching loopback address, and an IPv6
+    literal is bracketed, as URLs require (``http://[::1]:8080``).
+    """
+    host = str(host or "").strip().strip("[]")
+    if host in {"", "0.0.0.0"}:
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{int(port)}"
+
+
 def _health_url(host: str, port: int) -> str:
-    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
-    return f"http://{probe_host}:{int(port)}/v1/models"
+    return f"{http_base(host, port)}/v1/models"
 
 
 def wait_until_ready(host: str, port: int, pid: int, timeout_seconds: int = 45) -> bool:
@@ -551,18 +530,20 @@ def prepare_launch_command(
     params.setdefault("port", app_config.default_port)
 
     runtime = str(params.get("runtime") or "llama.cpp").strip() or "llama.cpp"
+    if runtime == "vllm.cpp":
+        return _prepare_vllm_cpp(resolved, params, app_config)
     if runtime != "llama.cpp":
         env = detect_runtime(runtime, root, config=app_config)
         if env is None:
             return {"success": False, "error": f"Unknown runtime: {runtime}"}
-        # llama.cpp is the only runtime wired into the launch path so far; report a
-        # clear error for the others instead of silently starting llama.cpp.
+        # Report a clear error for runtimes that aren't wired into the launch
+        # path instead of silently starting llama.cpp.
         return {
             "success": False,
             "error": (
                 f"{env.name} is selected but cannot be launched from here yet — "
-                "only llama.cpp is wired into Start/Fit. Switch the Runtime back to "
-                "llama.cpp to launch this profile."
+                f"only {' and '.join(LAUNCHABLE_RUNTIMES)} can be started. Switch the "
+                "profile's runtime to one of those to launch it."
             ),
             "environment": env.to_dict(),
             "profile": resolved.to_dict(),
@@ -581,11 +562,33 @@ def prepare_launch_command(
     warnings = resolved.warnings + command.warnings
     return {
         "success": True,
+        "runtime": "llama.cpp",
         "profile": resolved.to_dict(),
         "environment": llama.to_dict(),
         "command": command.to_dict(),
         "params": params,
         "warnings": warnings,
+    }
+
+
+def _prepare_vllm_cpp(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+    env = detect_vllm_cpp(config=app_config)
+    if not env.binary_path:
+        return {"success": False, "error": "vllm-server (vllm.cpp) was not found.", "environment": env.to_dict()}
+    command = build_vllm_cpp_server_args(
+        env.binary_path,
+        resolved.model["path"],
+        params,
+        extra_args=app_config.extra_vllm_cpp_args,
+    )
+    return {
+        "success": True,
+        "runtime": "vllm.cpp",
+        "profile": resolved.to_dict(),
+        "environment": env.to_dict(),
+        "command": command.to_dict(),
+        "params": params,
+        "warnings": resolved.warnings + command.warnings,
     }
 
 
@@ -596,11 +599,13 @@ def start_profile(
     overrides: dict[str, Any] | None = None,
     stop_existing: bool = False,
     wait_ready: bool = True,
-    ready_timeout_seconds: int = 45,
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
     if not prepared.get("success"):
         return prepared
+    if ready_timeout_seconds is None:
+        ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", 45)
 
     existing = _find_server(mode=mode)
     if existing and existing.get("running"):
@@ -657,6 +662,7 @@ def start_profile(
     server = {
         "id": server_id,
         "mode": mode,
+        "runtime": prepared.get("runtime") or "llama.cpp",
         "pid": proc.pid,
         "status": "starting",
         "running": True,

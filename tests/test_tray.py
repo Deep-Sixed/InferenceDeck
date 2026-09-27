@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest import mock
 
-from inferencedeck import tray
+from inferencedeck import server_manager, tray
 from inferencedeck.auth import AuthState
 from inferencedeck.control import ControlPlane
 from inferencedeck.control_api import ControlRequestHandler
@@ -154,6 +156,24 @@ class ControllerTests(unittest.TestCase):
         c.toggle_remote({"name": "oai", "enabled": False})
         c.toggle_remote({"name": "oai", "enabled": True})
         self.assertEqual(api.remote.call_args_list, [mock.call("enable", "oai"), mock.call("disable")])
+
+
+class TimeoutTests(unittest.TestCase):
+    """A tray must wait at least as long as the server may take to start a model."""
+
+    SLOWEST_READY = max(server_manager.READY_TIMEOUT_SECONDS.values())
+
+    def test_tray_outwaits_the_slowest_runtime(self) -> None:
+        for action in ("start", "restore"):
+            self.assertGreater(tray.TIMEOUTS[action], self.SLOWEST_READY, action)
+        self.assertGreater(tray.TIMEOUTS["restart"], tray.TIMEOUTS["stop"] + self.SLOWEST_READY)
+
+    def test_linux_tray_outwaits_the_slowest_runtime(self) -> None:
+        # The Linux tray needs GTK to import, so read its constant from the source.
+        source = (Path(__file__).resolve().parents[1] / "frontends" / "linux" / "inferencedeck_tray.py").read_text(encoding="utf-8")
+        start = int(re.search(r"^START_TIMEOUT_SECONDS = (\d+)$", source, re.M).group(1))
+        self.assertGreater(start, self.SLOWEST_READY)
+        self.assertIn("RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS", source)
 
 
 class StartWebTests(unittest.TestCase):
