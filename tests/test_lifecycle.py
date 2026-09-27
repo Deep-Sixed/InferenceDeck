@@ -184,10 +184,14 @@ class StartLockTests(_LifecycleBase):
 
     def _slow_popen(self):
         real = subprocess.Popen
+        server_argv = self._prepared()["command"]["argv"]
 
-        def popen(*args, **kwargs):
+        def popen(args, *rest, **kwargs):
+            # Helpers (e.g. ps on macOS) also go through Popen; only count server launches.
+            if args != server_argv:
+                return real(args, *rest, **kwargs)
             time.sleep(0.3)  # widen the window between the check and the record
-            proc = real(*args, **kwargs)
+            proc = real(args, *rest, **kwargs)
             self.procs.append(proc)
             return proc
 
