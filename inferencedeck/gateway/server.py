@@ -3,7 +3,7 @@
 Endpoints:
   POST /v1/chat/completions  OpenAI Chat Completions
   POST /v1/messages          Anthropic Messages
-  GET  /v1/models            the model currently routed to
+  GET  /v1/models            every model name the gateway can route (see router.py)
   GET  /healthz
 
 Binding follows the control API's rule: loopback without a token, anything
@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
-from .router import Target, resolve_target
+from .router import Router
 
 DEFAULT_PORT = 8717
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for inline images
@@ -60,7 +60,7 @@ APIS = {
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     auth_state = AuthState()
-    resolve: Callable[[], Target] = staticmethod(resolve_target)
+    router: Router = Router()
     server_version = "InferenceDeckGateway/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -154,12 +154,13 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/v1/models":
             try:
-                target = self.resolve()
+                targets = self.router.catalog()
             except GatewayError:
-                self._send(HTTPStatus.OK, {"object": "list", "data": []})
-                return
+                targets = []
             self._send(HTTPStatus.OK, {"object": "list", "data": [
-                {"id": target.model_id, "object": "model", "owned_by": "inferencedeck", "description": target.label},
+                {"id": t.model_id, "object": "model", "owned_by": "inferencedeck", "description": t.label,
+                 "aliases": [name for name in t.names if name != t.model_id], "default": t.default}
+                for t in targets
             ]})
         else:
             self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
@@ -175,7 +176,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             request: ChatRequest = api.parse(body)
-            target = self.resolve()
+            target = self.router.resolve(request.model)
             model = request.model or target.model_id
             if request.stream:
                 events = target.engine.stream(request)
@@ -192,12 +193,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
-                resolve: Callable[[], Target] | None = None) -> ThreadingHTTPServer:
+                router: Router | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     attrs: dict[str, Any] = {"auth_state": auth}
-    if resolve is not None:
-        attrs["resolve"] = staticmethod(resolve)
+    if router is not None:
+        attrs["router"] = router
     handler = type("BoundGatewayRequestHandler", (GatewayRequestHandler,), attrs)
     return ThreadingHTTPServer((host, port), handler)
 

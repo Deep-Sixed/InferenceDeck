@@ -292,12 +292,40 @@ The example above is illustrative; do not commit the token to the repository or 
 inferencedeck-gateway --host 127.0.0.1 --port 8717
 ```
 
-The gateway gives applications one stable inference API, whatever is serving the model. It sends each request to the current target:
+The gateway gives applications one stable inference API, whatever is serving the model. The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+
+### Routing by model name
+
+The gateway picks a target from the `model` name in each request. It can route to:
+
+- every running (not paused) local server;
+- every self-hosted (`remote_host`) endpoint;
+- cloud endpoints that opt in with `"routable": true`. Cloud endpoints are left out by default, so no request leaves your machines unless you allow it.
+
+A self-hosted endpoint can opt out with `"routable": false`. A cloud endpoint whose API key is not set is left out.
+
+Names are matched without regard to case:
+
+| Target | Names that route to it |
+|---|---|
+| Remote endpoint | its `aliases`, its `model`, and its file name (`thanatos.json` → `thanatos`) |
+| Local server | its profile name, its server id, and its model file name without `.gguf` |
+
+To use any model on a particular endpoint, write `<endpoint>/<model>`. For example, `openrouter/meta-llama/llama-3.3-70b-instruct` sends `meta-llama/llama-3.3-70b-instruct` to the endpoint in `openrouter.json`.
+
+A request with no model name, or one that matches nothing, goes to the **default target**:
 
 1. the enabled remote/cloud endpoint, if there is one;
-2. otherwise the running (not paused) local server.
+2. otherwise the first running local server.
 
-The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+This means clients with a hard-coded model name keep working. An enabled endpoint that cannot be used (for example, its key is missing) returns an error rather than silently sending the request somewhere else.
+
+`GET /v1/models` lists every target the gateway can route to, with its aliases, and marks the default. Replies report the model name the client asked for.
+
+```json
+{ "provider": "llamacpp", "lane": "remote_host", "host": "Thanatos",
+  "baseUrl": "http://thanatos:8080", "model": "qwen3-32b", "aliases": ["big-qwen"] }
+```
 
 | Client API | Path |
 |---|---|

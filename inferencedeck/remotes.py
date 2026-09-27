@@ -59,6 +59,10 @@ class RemoteEndpoint:
     tags: tuple[str, ...] = ()
     host: str = ""
     transport: str = ""
+    # Gateway name routing: extra model names clients may request, and whether
+    # the endpoint takes name-routed requests while it is not the enabled one.
+    aliases: tuple[str, ...] = ()
+    routable: bool = False
 
     @property
     def name(self) -> str:
@@ -166,6 +170,17 @@ def _parse(path: Path) -> RemoteEndpoint:
         context_size = None
         error = error or "contextSize must be an integer"
     tags = tuple(str(tag) for tag in (data.get("tags") or []) if str(tag).strip())
+    raw_aliases = data.get("aliases") or []
+    if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
+        error = error or "aliases must be a list of strings"
+        raw_aliases = []
+    aliases = tuple(a.strip() for a in raw_aliases if a.strip())
+    # Self-hosted endpoints are routable by name unless opted out; a cloud
+    # endpoint must opt in, so no request leaves your machines by accident.
+    raw_routable = data.get("routable", lane == LANE_REMOTE_HOST)
+    if not isinstance(raw_routable, bool):
+        error = error or "routable must be true/false"
+        raw_routable = False
     return RemoteEndpoint(
         path=path,
         provider=provider,
@@ -181,6 +196,8 @@ def _parse(path: Path) -> RemoteEndpoint:
         tags=tags,
         host=host,
         transport=transport,
+        aliases=aliases,
+        routable=raw_routable,
     )
 
 

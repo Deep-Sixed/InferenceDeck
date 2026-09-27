@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -15,6 +17,7 @@ from inferencedeck.gateway import anthropic_api, ollama_api, openai_api, router
 from inferencedeck.gateway.engines import OllamaEngine, OpenAICompatibleEngine
 from inferencedeck.gateway.ir import GatewayError, StreamEvent, Usage
 from inferencedeck.gateway.router import Target
+from inferencedeck.remotes import list_endpoints
 from inferencedeck.gateway.server import make_server
 
 
@@ -31,6 +34,30 @@ def _sse_events(raw: bytes) -> list[tuple[str, Any]]:
         if data:
             events.append((name, data if data == "[DONE]" else json.loads(data)))
     return events
+
+
+class _StubRouter:
+    """Router stand-in: every request goes to whatever ``pick()`` returns."""
+
+    def __init__(self, pick) -> None:
+        self.pick = pick
+        self.requested: list[str] = []
+
+    def resolve(self, model: str = "") -> Target:
+        self.requested.append(model)
+        target = self.pick()
+        if target is None:
+            raise GatewayError(503, "no inference target", "overloaded")
+        return target
+
+    def catalog(self) -> list[Target]:
+        target = self.pick()
+        return [target] if target is not None else []
+
+
+def _write_endpoints(root: Path, **configs: dict[str, Any]) -> None:
+    for name, config in configs.items():
+        (root / f"{name}.json").write_text(json.dumps(config))
 
 
 class OpenAIAdapterTests(unittest.TestCase):
@@ -193,11 +220,7 @@ class GatewayServerTests(unittest.TestCase):
         self.start_gateway(AuthState(token=""))
 
     def start_gateway(self, auth: AuthState) -> None:
-        def resolve() -> Target:
-            if self.target is None:
-                raise GatewayError(503, "no inference target", "overloaded")
-            return self.target
-        gateway = make_server("127.0.0.1", 0, auth, resolve)
+        gateway = make_server("127.0.0.1", 0, auth, _StubRouter(lambda: self.target))
         threading.Thread(target=gateway.serve_forever, daemon=True).start()
         self.addCleanup(gateway.server_close)
         self.addCleanup(gateway.shutdown)
@@ -302,43 +325,162 @@ class GatewayServerTests(unittest.TestCase):
             make_server("0.0.0.0", 0, AuthState(token=""))
 
 
+class NameRoutingGatewayTests(unittest.TestCase):
+    def _upstream(self) -> int:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeUpstream)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def setUp(self) -> None:
+        _FakeUpstream.received, _FakeUpstream.headers_seen, _FakeUpstream.reply_tool = [], [], False
+        self.big, self.small = self._upstream(), self._upstream()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        _write_endpoints(root,
+                         thanatos={"provider": "llamacpp", "enabled": True, "model": "qwen3-32b",
+                                   "aliases": ["big"], "baseUrl": f"http://127.0.0.1:{self.big}"},
+                         friday={"provider": "llamacpp", "model": "qwen3-4b", "aliases": ["small"],
+                                 "baseUrl": f"http://127.0.0.1:{self.small}/v1"})
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""),
+                              router.Router(endpoints=lambda: list_endpoints(root), servers=lambda: []))
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        self.base = f"http://127.0.0.1:{gateway.server_address[1]}"
+
+    post = GatewayServerTests.post
+
+    def test_requests_reach_the_named_target(self) -> None:
+        for name, port, upstream_model in (("small", self.small, "qwen3-4b"), ("big", self.big, "qwen3-32b"),
+                                           ("unknown", self.big, "qwen3-32b")):
+            status, raw = self.post("/v1/chat/completions", {"model": name, "messages": [{"role": "user", "content": "x"}]})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["model"], name)  # the client sees the name it asked for
+            self.assertTrue(_FakeUpstream.headers_seen[-1]["Host"].endswith(f":{port}"), name)
+            self.assertEqual(_FakeUpstream.received[-1]["model"], upstream_model)
+
+    def test_models_lists_every_routable_target(self) -> None:
+        with urllib.request.urlopen(self.base + "/v1/models", timeout=10) as response:
+            data = json.loads(response.read())["data"]
+        self.assertEqual([(m["id"], m["aliases"], m["default"]) for m in data],
+                         [("big", ["qwen3-32b", "thanatos"], True), ("small", ["qwen3-4b", "friday"], False)])
+
+
 class RouterTests(unittest.TestCase):
-    def test_remote_endpoint_wins_and_carries_key(self) -> None:
-        remote = mock.Mock(valid=True, api_key_env="OR_KEY", key_required=True, display_name="OpenRouter model",
-                           summary="OpenRouter · Cloud", base_url="https://openrouter.ai/api/v1", model="vendor/model")
-        remote.name = "openrouter"
-        with mock.patch.object(router, "active_endpoint", return_value=remote), \
-                mock.patch.dict(os.environ, {"OR_KEY": "k"}):
-            target = router.resolve_target()
+    """Routing over real endpoint configs and stubbed local servers."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.servers: list[dict[str, Any]] = []
+        self.router = router.Router(endpoints=lambda: list_endpoints(self.root), servers=lambda: self.servers)
+
+    def test_enabled_remote_is_default_and_carries_key(self) -> None:
+        _write_endpoints(self.root, openrouter={
+            "provider": "openrouter", "lane": "true_cloud", "enabled": True, "model": "vendor/model",
+            "baseUrl": "https://openrouter.ai/api/v1", "apiKeyEnv": "OR_KEY", "displayName": "OpenRouter model"})
+        with mock.patch.dict(os.environ, {"OR_KEY": "k"}):
+            target = self.router.resolve()
         self.assertEqual(target.engine.api_base, "https://openrouter.ai/api/v1")
         self.assertEqual((target.engine.api_key, target.engine.model), ("k", "vendor/model"))
         self.assertEqual(target.label, "OpenRouter model (OpenRouter · Cloud)")
+        self.assertTrue(target.default)
+
+    def test_enabled_remote_missing_key_is_an_error_not_a_fallback(self) -> None:
+        _write_endpoints(self.root, openrouter={
+            "provider": "openrouter", "lane": "true_cloud", "enabled": True,
+            "baseUrl": "https://openrouter.ai/api/v1", "apiKeyEnv": "UNSET_ROUTER_TEST_KEY"})
+        self.servers = [{"mode": "qwen", "running": True, "host": "127.0.0.1", "port": 8080}]
+        os.environ.pop("UNSET_ROUTER_TEST_KEY", None)
+        with self.assertRaises(GatewayError) as ctx:
+            self.router.resolve("qwen")
+        self.assertEqual(ctx.exception.status, 503)
 
     def test_keyless_self_hosted_endpoint(self) -> None:
-        remote = mock.Mock(valid=True, api_key_env="", key_required=False, display_name="Qwen",
-                           summary="Thanatos · Tailscale · Self-hosted", base_url="http://thanatos:8080", model="")
-        remote.name = "thanatos"
-        with mock.patch.object(router, "active_endpoint", return_value=remote):
-            target = router.resolve_target()
-        self.assertEqual(target.engine.api_base, "http://thanatos:8080/v1")
-        self.assertEqual(target.engine.api_key, "")
+        _write_endpoints(self.root, thanatos={"provider": "llamacpp", "enabled": True,
+                                              "baseUrl": "http://thanatos:8080"})
+        target = self.router.resolve()
+        self.assertEqual((target.engine.api_base, target.engine.api_key), ("http://thanatos:8080/v1", ""))
 
     def test_local_server_skips_paused(self) -> None:
-        servers = [{"mode": "paused", "running": True, "suspended": True, "host": "127.0.0.1", "port": 1},
-                   {"mode": "qwen", "running": True, "suspended": False, "host": "0.0.0.0", "port": 8080}]
-        with mock.patch.object(router, "active_endpoint", return_value=None), \
-                mock.patch.object(router, "list_servers", return_value=servers):
-            target = router.resolve_target()
+        self.servers = [{"mode": "paused", "running": True, "suspended": True, "host": "127.0.0.1", "port": 1},
+                        {"mode": "qwen", "running": True, "suspended": False, "host": "0.0.0.0", "port": 8080}]
+        target = self.router.resolve()
         self.assertEqual(target.engine.api_base, "http://127.0.0.1:8080/v1")
         self.assertEqual(target.model_id, "qwen")
 
     def test_nothing_running(self) -> None:
-        with mock.patch.object(router, "active_endpoint", return_value=None), \
-                mock.patch.object(router, "list_servers", return_value=[]):
-            with self.assertRaises(GatewayError) as ctx:
-                router.resolve_target()
+        with self.assertRaises(GatewayError) as ctx:
+            self.router.resolve()
         self.assertEqual(ctx.exception.status, 503)
 
+    def _estate(self) -> None:
+        """A local server, a self-hosted box, a cloud endpoint opted in, and one not."""
+        self.servers = [{"id": "qwen-1-x", "mode": "qwen", "running": True, "host": "127.0.0.1", "port": 8080,
+                         "model_path": "/models/Qwen3-8B-Q4_K_M.gguf"}]
+        _write_endpoints(
+            self.root,
+            thanatos={"provider": "llamacpp", "baseUrl": "http://thanatos:8080", "model": "qwen3-32b",
+                      "aliases": ["big-qwen"]},
+            openrouter={"provider": "openrouter", "lane": "true_cloud", "routable": True, "model": "vendor/default",
+                        "baseUrl": "https://openrouter.ai/api/v1", "apiKeyEnv": "OR_KEY"},
+            private_cloud={"provider": "openai", "lane": "true_cloud", "model": "gpt-private",
+                           "baseUrl": "https://example.invalid/v1", "apiKeyEnv": "OR_KEY"},
+        )
+
+    def test_routes_by_name_across_targets(self) -> None:
+        self._estate()
+        with mock.patch.dict(os.environ, {"OR_KEY": "k"}):
+            self.assertEqual(self.router.resolve("big-qwen").engine.api_base, "http://thanatos:8080/v1")
+            self.assertEqual(self.router.resolve("QWEN3-32B").engine.api_base, "http://thanatos:8080/v1")
+            self.assertEqual(self.router.resolve("Qwen3-8B-Q4_K_M").engine.api_base, "http://127.0.0.1:8080/v1")
+            self.assertEqual(self.router.resolve("vendor/default").engine.api_base, "https://openrouter.ai/api/v1")
+            # Unknown names and no name go to the default (the local server here).
+            self.assertEqual(self.router.resolve("gpt-4o").engine.api_base, "http://127.0.0.1:8080/v1")
+            self.assertEqual(self.router.resolve("").engine.api_base, "http://127.0.0.1:8080/v1")
+
+    def test_cloud_endpoint_needs_opt_in(self) -> None:
+        self._estate()
+        with mock.patch.dict(os.environ, {"OR_KEY": "k"}):
+            names = [t.model_id for t in self.router.catalog()]
+            target = self.router.resolve("gpt-private")
+        self.assertNotIn("gpt-private", names)
+        self.assertEqual(target.engine.api_base, "http://127.0.0.1:8080/v1")
+
+    def test_endpoint_prefix_picks_any_model_on_that_endpoint(self) -> None:
+        self._estate()
+        with mock.patch.dict(os.environ, {"OR_KEY": "k"}):
+            target = self.router.resolve("openrouter/meta-llama/llama-3.3-70b-instruct")
+            catalog_engine = next(t for t in self.router.catalog() if t.endpoint == "openrouter").engine
+        self.assertEqual(target.engine.api_base, "https://openrouter.ai/api/v1")
+        self.assertEqual(target.engine.model, "meta-llama/llama-3.3-70b-instruct")
+        self.assertEqual(catalog_engine.model, "vendor/default")  # the catalog entry is untouched
+
+    def test_routable_endpoint_without_key_is_skipped(self) -> None:
+        self._estate()
+        os.environ.pop("OR_KEY", None)
+        names = [t.model_id for t in self.router.catalog()]
+        self.assertNotIn("vendor/default", names)
+        self.assertEqual(self.router.resolve("vendor/default").engine.api_base, "http://127.0.0.1:8080/v1")
+
+    def test_enabled_remote_stays_default_but_others_route_by_name(self) -> None:
+        self._estate()
+        _write_endpoints(self.root, thanatos={"provider": "llamacpp", "baseUrl": "http://thanatos:8080",
+                                              "model": "qwen3-32b", "enabled": True})
+        catalog = self.router.catalog()
+        self.assertTrue(catalog[0].default)
+        self.assertEqual(catalog[0].endpoint, "thanatos")
+        self.assertEqual(self.router.resolve("anything").engine.api_base, "http://thanatos:8080/v1")
+        self.assertEqual(self.router.resolve("qwen").engine.api_base, "http://127.0.0.1:8080/v1")
+
+    def test_self_hosted_can_opt_out(self) -> None:
+        _write_endpoints(self.root, thanatos={"provider": "llamacpp", "baseUrl": "http://thanatos:8080",
+                                              "model": "qwen3-32b", "routable": False})
+        self.assertEqual(self.router.catalog(), [])
 
 
 class OllamaAdapterTests(unittest.TestCase):
@@ -446,7 +588,7 @@ class OllamaGatewayTests(unittest.TestCase):
         self.addCleanup(upstream.shutdown)
         engine = OllamaEngine(f"http://127.0.0.1:{upstream.server_address[1]}", model="qwen3:32b")
         self.target = Target(engine, "Remote Ollama", "qwen3:32b")
-        gateway = make_server("127.0.0.1", 0, AuthState(token=""), lambda: self.target)
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""), _StubRouter(lambda: self.target))
         threading.Thread(target=gateway.serve_forever, daemon=True).start()
         self.addCleanup(gateway.server_close)
         self.addCleanup(gateway.shutdown)
@@ -483,19 +625,14 @@ class OllamaGatewayTests(unittest.TestCase):
 class OllamaRoutingTests(unittest.TestCase):
     def test_ollama_endpoint_uses_native_engine_at_server_root(self) -> None:
         for url in ("http://thanatos:11434", "http://thanatos:11434/v1", "http://thanatos:11434/api/"):
-            remote = mock.Mock(valid=True, api_key_env="", key_required=False, display_name="Ollama", summary="",
-                               base_url=url, model="qwen3:32b", provider="ollama")
-            remote.name = "ollama"
-            with mock.patch.object(router, "active_endpoint", return_value=remote):
-                target = router.resolve_target()
+            with tempfile.TemporaryDirectory() as tmp:
+                _write_endpoints(Path(tmp), ollama={"provider": "ollama", "enabled": True, "baseUrl": url,
+                                                    "model": "qwen3:32b"})
+                target = router.Router(endpoints=lambda: list_endpoints(Path(tmp)), servers=lambda: []).resolve()
             self.assertIsInstance(target.engine, OllamaEngine)
             self.assertEqual(target.engine.api_base, "http://thanatos:11434", url)
 
     def test_ollama_config_without_lane_is_self_hosted(self) -> None:
-        import tempfile
-        from pathlib import Path
-
-        from inferencedeck.remotes import list_endpoints
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "o.json").write_text(json.dumps({"provider": "ollama", "baseUrl": "http://thanatos:11434"}))
             cfg = list_endpoints(Path(tmp))[0]
