@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any
 from .estimates import recommend_jinja
 from .inventory import build_inventory
 from .manifest import load_profiles
+from .mlc_llm_args import is_hf_model
 from .models import discover_models
 from .paths import find_project_root
 from .schema import ModelFile, ModelProfile
@@ -125,8 +127,35 @@ def _best_model(profile: ModelProfile, models: list[ModelFile]) -> tuple[ModelFi
     return scored[0][1], scored[0][0], warnings
 
 
-def _is_vllm_cpp(params: dict[str, Any]) -> bool:
-    return str(params.get("runtime") or "").strip() == "vllm.cpp"
+def _runtime(params: dict[str, Any]) -> str:
+    return str(params.get("runtime") or "").strip() or "llama.cpp"
+
+
+def _mlc_model(params: dict[str, Any]) -> tuple[ModelFile | None, float, list[str]]:
+    """An MLC LLM profile's model: an MLC weight folder or an HF:// id, never a GGUF match."""
+
+    raw = str(params.get("mlc_model") or "").strip()
+    if not raw:
+        return None, 0.0, ["MLC LLM profiles name their model with mlc_model: an MLC weight folder or an HF:// id."]
+    if is_hf_model(raw):
+        name = raw.split("://", 1)[1].rstrip("/").split("/")[-1] or raw
+        # mlc_llm serve downloads it into its own cache on first start.
+        return _mlc_model_file(raw, name, "huggingface"), 1.0, []
+    folder = Path(raw).expanduser()
+    if not (folder / "mlc-chat-config.json").is_file():
+        return None, 0.0, [f"mlc_model is not an MLC weight folder (no mlc-chat-config.json): {raw}"]
+    return _mlc_model_file(str(folder), folder.name, "local"), 1.0, []
+
+
+def _mlc_model_file(path: str, name: str, source: str) -> ModelFile:
+    return ModelFile(
+        id=hashlib.sha1(path.encode("utf-8")).hexdigest()[:16],
+        name=name,
+        path=path,
+        source=source,
+        format="mlc",
+        size_bytes=0,
+    )
 
 
 def _resolved_params(profile: ModelProfile) -> dict[str, Any]:
@@ -139,9 +168,9 @@ def _resolved_params(profile: ModelProfile) -> dict[str, Any]:
     params.setdefault("host", "127.0.0.1")
     params.setdefault("port", 8080)
     params.setdefault("alias", profile.mode or "local-model")
-    if _is_vllm_cpp(params):
-        # vllm-server takes vLLM-style flags; none of the llama-server defaults
-        # below apply. Reasoning is only forced when the profile says so, because
+    if _runtime(params) != "llama.cpp":
+        # vllm-server and mlc_llm serve take their own flags; none of the
+        # llama-server defaults below apply. Reasoning is only forced when the profile says so, because
         # leaving it unset lets the chat template pick its own default.
         if wants_reasoning or reasoning_disabled:
             params.setdefault("reasoning", wants_reasoning)
@@ -175,7 +204,7 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
     text = " ".join([profile.mode, profile.name, profile.description]).lower()
     # vllm.cpp runs MTP from the checkpoint's own heads via speculative_config,
     # not from a separate draft GGUF.
-    if "mtp" in text and not _is_vllm_cpp(params):
+    if "mtp" in text and _runtime(params) == "llama.cpp":
         draft_model = str(params.get("draft_model", "")).strip()
         if not draft_model:
             missing.append("draft_model")
@@ -185,9 +214,13 @@ def _validate_resolved(profile: ModelProfile, model: ModelFile | None, params: d
         if model and "mtp" not in model.path.lower() and "gemma" not in text:
             warnings.append("MTP profile matched a non-MTP model path; this may require a WSL or custom backend.")
 
-    if _is_vllm_cpp(params):
+    runtime = _runtime(params)
+    if runtime == "vllm.cpp":
         # vllm.cpp sizes its KV pool from ctx_size; the rest are llama.cpp knobs.
         required = ["ctx_size"]
+    elif runtime == "mlc-llm":
+        # The model's mlc-chat-config.json supplies the context window.
+        required = []
     else:
         required = ["ctx_size", "threads", "cache_type_k", "cache_type_v", "gpu_layers"]
     for key in required:
@@ -207,8 +240,11 @@ def resolve_profiles(
     models = discover_models(model_paths, root)
     resolved: list[ResolvedProfile] = []
     for profile in profiles:
-        model, confidence, match_warnings = _best_model(profile, models)
         params = _resolved_params(profile)
+        if _runtime(params) == "mlc-llm":
+            model, confidence, match_warnings = _mlc_model(params)
+        else:
+            model, confidence, match_warnings = _best_model(profile, models)
         launchable, warnings, missing = _validate_resolved(profile, model, params, confidence)
         warnings = match_warnings + warnings
         resolved.append(

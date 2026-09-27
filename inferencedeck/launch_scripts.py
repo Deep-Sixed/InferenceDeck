@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ from typing import Any
 from .capabilities import resolve_projector
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
+from .mlc_llm_args import build_mlc_llm_serve_args
 from .models import discover_models
 from .paths import (
     find_project_root,
@@ -160,6 +162,15 @@ MANIFEST_PARAM_KEYS = (
     "tool_call_parser",
     "reasoning_parser",
     "speculative_config",
+    # MLC LLM profiles (runtime: mlc-llm); see mlc_llm_args.
+    "mlc_model",
+    "mlc_mode",
+    "model_lib",
+    "max_total_seq_length",
+    "prefill_chunk_size",
+    "gpu_memory_utilization",
+    "tensor_parallel_shards",
+    "sliding_window_size",
 )
 
 
@@ -312,12 +323,43 @@ def _autotune_params_from_size(model: dict[str, Any], params: dict[str, Any]) ->
     return overrides
 
 
+def _split_at_model(command_argv: list[str], model_path: str) -> tuple[list[str], list[str]]:
+    """Split argv around the model argument: (invocation up to it, args after it).
+
+    The scripts assign the model to a ``$model`` variable the manifest parser
+    reads, so the model token itself is re-emitted as that variable. Everything
+    before it is the invocation: ``llama-server -m``, ``vllm-server --model``
+    or ``mlc_llm serve`` (possibly ``python -m mlc_llm serve``).
+    """
+
+    index = command_argv.index(model_path)
+    return command_argv[:index], command_argv[index + 1 :]
+
+
+def _model_is_hf_id(model_path: str) -> bool:
+    return model_path.strip().upper().startswith("HF://")
+
+
+def _script_model_value(model_path: str) -> str:
+    # An HF:// id isn't a filesystem path; Path() would collapse its "//".
+    return model_path if _model_is_hf_id(model_path) else Path(model_path).as_posix()
+
+
+def _render_ps1_token(token: str) -> str:
+    if token.startswith("-") or token in {"on", "off"}:
+        return token
+    if token.replace(".", "", 1).isdigit() or token.replace("_", "").isalnum():
+        # Numbers, quant names like q4_0, cache types, hosts, etc.
+        needs_quotes = " " in token or "/" in token or "\\" in token
+        return f"'{token}'" if needs_quotes else token
+    escaped = token.replace("'", "''")
+    return f"'{escaped}'"
+
+
 def _render_ps1_classic(
-    binary_path: str,
     model_path: str,
     command_argv: list[str],
     params: dict[str, Any],
-    model_flag: str = "-m",
 ) -> str:
     """Render a Windows PowerShell launch script in the existing project style.
 
@@ -325,76 +367,41 @@ def _render_ps1_classic(
     ``start-gemma4-26b-a4b-q6k-server.ps1``): a top ``$model`` assignment
     that the manifest parser reads, a ``Test-Path`` guard, and an
     ``& llama-server -m $model ...`` invocation (``& vllm-server --model
-    $model ...`` for vllm.cpp profiles). Drops the leading binary
-    path and the ``-m``/``--model`` token (and its argument) from the
-    supplied argv because those are emitted explicitly in the script body.
+    $model ...`` for vllm.cpp, ``& mlc_llm serve $model ...`` for MLC LLM).
+    An ``HF://`` model id has no guard: the server downloads it.
     """
 
-    filtered = _strip_binary_and_model_args(command_argv, binary_path)
-
-    rendered_tokens: list[str] = []
-    for token in filtered:
-        if not token:
-            continue
-        if token.startswith("-") or token in {"on", "off"}:
-            rendered_tokens.append(token)
-        elif token.replace(".", "", 1).isdigit() or token.replace("_", "").isalnum():
-            # Numbers, quant names like q4_0, cache types, hosts, etc.
-            needs_quotes = " " in token or "/" in token or "\\" in token
-            rendered_tokens.append(f"'{token}'" if needs_quotes else token)
-        else:
-            escaped = token.replace("'", "''")
-            rendered_tokens.append(f"'{escaped}'")
-
-    body = " ".join(rendered_tokens).strip()
+    head, tail = _split_at_model(command_argv, model_path)
+    binary, *invocation = head
+    invocation_text = "".join(f" {_render_ps1_token(token)}" for token in invocation if token)
+    body = " ".join(_render_ps1_token(token) for token in tail if token).strip()
+    guard = (
+        ""
+        if _model_is_hf_id(model_path)
+        else "if (-not (Test-Path -LiteralPath $model)) { throw \"Missing model: $model\" }\n"
+    )
     # Single-quoted PowerShell strings escape ' by doubling it; a model or
     # binary path with an apostrophe must not end the string early.
-    posix_model = Path(model_path).as_posix().replace("'", "''")
-    posix_binary = Path(binary_path).as_posix().replace("'", "''")
+    posix_model = _script_model_value(model_path).replace("'", "''")
+    posix_binary = Path(binary).as_posix().replace("'", "''")
     return (
         "$ErrorActionPreference = 'Stop'\n"
         + SCRIPT_HEADER_COMMENT
         + f"$model = '{posix_model}'\n"
-        + "if (-not (Test-Path -LiteralPath $model)) { throw \"Missing model: $model\" }\n"
-        + f"& '{posix_binary}' {model_flag} $model"
+        + guard
+        + f"& '{posix_binary}'{invocation_text} $model"
         + (f" {body}\n" if body else "\n")
     )
 
 
-def _strip_binary_and_model_args(command_argv: list[str], binary_path: str) -> list[str]:
-    """Drop the leading binary token and the explicit ``-m``/``--model`` arg.
-
-    The launch script renders the binary invocation explicitly (``& 'path'``)
-    and the model assignment explicitly (``$model``), so those entries must
-    not appear again in the body argv.
-    """
-
-    filtered: list[str] = []
-    skip_next = False
-    for idx, token in enumerate(command_argv):
-        if skip_next:
-            skip_next = False
-            continue
-        if idx == 0 and token and Path(token).name == Path(binary_path).name:
-            # Drop the binary path the argv builders insert at argv[0].
-            continue
-        if token in {"-m", "--model"}:
-            skip_next = True
-            continue
-        filtered.append(token)
-    return filtered
-
-
 def _render_sh(
-    binary_path: str,
     model_path: str,
     command_argv: list[str],
     params: dict[str, Any],
-    model_flag: str = "-m",
 ) -> str:
     """Render a POSIX shell launch script for Linux/macOS."""
 
-    filtered = _strip_binary_and_model_args(command_argv, binary_path)
+    head, tail = _split_at_model(command_argv, model_path)
 
     def shlex_quote(value: str) -> str:
         if value and all(ch.isalnum() or ch in "-_./:=," for ch in value):
@@ -402,14 +409,21 @@ def _render_sh(
         escaped = value.replace("'", "'\\''")
         return f"'{escaped}'"
 
-    body = " ".join(shlex_quote(token) for token in filtered if token)
+    if _model_is_hf_id(model_path):
+        guard = ""
+    else:
+        # GGUF models are files; vllm.cpp and MLC models can be folders.
+        test = "-f" if Path(model_path).suffix.lower() == ".gguf" else "-e"
+        guard = f"if [[ ! {test} \"$model\" ]]; then echo \"Missing model: $model\" >&2; exit 1; fi\n"
+    invocation = " ".join(shlex_quote(token) for token in head if token)
+    body = " ".join(shlex_quote(token) for token in tail if token)
     return (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         + SCRIPT_HEADER_COMMENT
         + f"model={shlex_quote(model_path)}\n"
-        + "if [[ ! -f \"$model\" ]]; then echo \"Missing model: $model\" >&2; exit 1; fi\n"
-        + f"exec {shlex_quote(binary_path)} {model_flag} \"$model\""
+        + guard
+        + f"exec {invocation} \"$model\""
         + (f" {body}\n" if body else "\n")
     )
 
@@ -434,8 +448,25 @@ def _vllm_cpp_binary_for_generation(config: AppConfig) -> str | None:
     return detect_vllm_cpp(config).binary_path
 
 
+def _mlc_llm_binary_for_generation(config: AppConfig) -> str | None:
+    """Resolve the MLC LLM command used inside generated scripts.
+
+    When only the Python package is installed this is the interpreter, and
+    :func:`_build_script_command` runs it as ``python -m mlc_llm``.
+    """
+
+    from .backends import mlc_llm_invocation
+
+    invocation = mlc_llm_invocation(config)
+    return invocation[0] if invocation else None
+
+
+SCRIPT_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm")
+
+
 def _script_runtime(params: dict[str, Any]) -> str:
-    return "vllm.cpp" if str(params.get("runtime") or "").strip() == "vllm.cpp" else "llama.cpp"
+    runtime = str(params.get("runtime") or "").strip()
+    return runtime if runtime in SCRIPT_RUNTIMES else "llama.cpp"
 
 
 def _binary_path_for_script(
@@ -446,6 +477,12 @@ def _binary_path_for_script(
     """Return the binary path to embed for ``runtime`` and any warnings about it."""
 
     warnings: list[str] = []
+    if runtime == "mlc-llm":
+        binary = config.mlc_llm_path or _mlc_llm_binary_for_generation(config)
+        if not binary:
+            warnings.append("mlc_llm was not found; generated scripts use an 'mlc_llm' placeholder.")
+            binary = "mlc_llm"
+        return binary, warnings
     if runtime == "vllm.cpp":
         binary = config.vllm_cpp_server_path or _vllm_cpp_binary_for_generation(config)
         if not binary:
@@ -469,14 +506,15 @@ def _build_script_command(
     model_path: str,
     params: dict[str, Any],
     config: AppConfig,
-) -> tuple[LaunchCommand, str]:
-    """Build the server argv for ``runtime`` and the flag that names the model."""
+) -> LaunchCommand:
+    """Build the server argv for ``runtime``."""
 
+    if runtime == "mlc-llm":
+        invocation = [binary, "-m", "mlc_llm"] if binary == sys.executable else [binary]
+        return build_mlc_llm_serve_args(invocation, model_path, params, extra_args=config.extra_mlc_llm_args)
     if runtime == "vllm.cpp":
-        command = build_vllm_cpp_server_args(binary, model_path, params, extra_args=config.extra_vllm_cpp_args)
-        return command, "--model"
-    command = build_llama_server_args(binary, model_path, params, extra_args=config.extra_llama_args)
-    return command, "-m"
+        return build_vllm_cpp_server_args(binary, model_path, params, extra_args=config.extra_vllm_cpp_args)
+    return build_llama_server_args(binary, model_path, params, extra_args=config.extra_llama_args)
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
@@ -515,7 +553,7 @@ def generate_launch_script(
     safe_params.setdefault("port", int(app_config.default_port or 8080))
     safe_params.setdefault("alias", Path(model_path).stem or mode)
 
-    command, model_flag = _build_script_command(runtime, binary, model_path, safe_params, app_config)
+    command = _build_script_command(runtime, binary, model_path, safe_params, app_config)
     warnings.extend(command.warnings)
 
     slug = _safe_slug(mode or Path(model_path).stem)
@@ -555,7 +593,7 @@ def generate_launch_script(
             "skipped": True,
         }
 
-    ps1_text = _render_ps1_classic(binary, model_path, command.argv, safe_params, model_flag)
+    ps1_text = _render_ps1_classic(model_path, command.argv, safe_params)
     _write_text_atomic(ps1_path, ps1_text)
 
     # The POSIX companion is only useful off-Windows. On Windows the embedded
@@ -563,7 +601,7 @@ def generate_launch_script(
     # skip it to avoid shipping dead files.
     wrote_sh = not is_windows()
     if wrote_sh:
-        sh_text = _render_sh(binary, model_path, command.argv, safe_params, model_flag)
+        sh_text = _render_sh(model_path, command.argv, safe_params)
         _write_text_atomic(sh_path, sh_text)
 
     record = GeneratedScript(

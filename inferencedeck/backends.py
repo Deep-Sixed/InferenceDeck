@@ -4,9 +4,11 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 import importlib.util
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -290,6 +292,62 @@ def detect_vllm_cpp(config: AppConfig | None = None) -> Environment:
     )
 
 
+def _mlc_llm_package_version() -> str | None:
+    """Version of the installed mlc-llm wheel (nightly and CUDA builds use suffixed names)."""
+
+    for dist in metadata.distributions():
+        name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
+        if name == "mlc-llm" or name.startswith("mlc-llm-"):
+            return dist.version
+    return None
+
+
+def mlc_llm_invocation(config: AppConfig | None = None) -> list[str] | None:
+    """How to run the MLC LLM CLI: its console script, else ``python -m mlc_llm``."""
+
+    app_config = config or AppConfig.load()
+    script = _configured_file(app_config.mlc_llm_path) or _find_executable("mlc_llm", ["MLC_LLM_BIN"])
+    if script:
+        return [script]
+    if importlib.util.find_spec("mlc_llm") is not None:
+        return [sys.executable, "-m", "mlc_llm"]
+    return None
+
+
+def detect_mlc_llm(config: AppConfig | None = None) -> Environment:
+    """MLC LLM's ``mlc_llm serve``: TVM-compiled models on CUDA, Metal, Vulkan, ROCm or OpenCL."""
+
+    invocation = mlc_llm_invocation(config)
+    api_url = _normalize_base_url(os.environ.get("MLC_LLM_SERVER_URL"), "http://127.0.0.1:8000")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    warnings: list[str] = []
+    if not invocation:
+        warnings.append(
+            "MLC LLM was not found. Install the mlc-llm package, or set mlc_llm_path in config "
+            "or MLC_LLM_BIN to its mlc_llm command."
+        )
+    return Environment(
+        id="mlc-llm",
+        kind="local_binary",
+        name="MLC LLM",
+        available=bool(invocation or ok),
+        binary_path=invocation[0] if invocation else None,
+        api_url=api_url if ok else None,
+        version=_mlc_llm_package_version() if invocation else None,
+        model_count=model_count,
+        details={
+            "invocation": invocation,
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "model_format": "MLC weight folders (mlc-chat-config.json) or HF:// ids, not GGUF",
+        },
+        warnings=warnings,
+    )
+
+
 def detect_mlx() -> Environment:
     module_available = importlib.util.find_spec("mlx_lm") is not None
     is_macos = os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
@@ -373,13 +431,14 @@ def detect_all(project_root: Path | None = None, config: AppConfig | None = None
         detect_lm_studio(),
         detect_vllm(),
         detect_vllm_cpp(config),
+        detect_mlc_llm(config),
         detect_mlx(),
     ]
 
 
 # Runtimes whose launch path is actually wired into prepare_launch_command.
 # Others are detectable (and selectable in the UI) but cannot be started yet.
-LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp")
+LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm")
 
 
 def detect_runtime(
@@ -395,6 +454,8 @@ def detect_runtime(
         return detect_wsl_llama_cpp()
     if runtime_id == "vllm.cpp":
         return detect_vllm_cpp(config)
+    if runtime_id == "mlc-llm":
+        return detect_mlc_llm(config)
     detectors = {
         "ollama": detect_ollama,
         "lm-studio": detect_lm_studio,

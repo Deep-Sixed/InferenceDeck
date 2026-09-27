@@ -8,16 +8,17 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 ### Core
 
-- Discover local `llama.cpp`, `vllm.cpp`, Ollama, LM Studio, vLLM, and MLX runtimes.
+- Discover local `llama.cpp`, `vllm.cpp`, MLC LLM, Ollama, LM Studio, vLLM, and MLX runtimes.
 - Discover GGUF models from configured and common model locations.
 - Detect CPU, GPU, system memory, VRAM, and available acceleration backends.
 - Estimate model fit and performance, with `llama-fit-params` integration when available.
 - Resolve and manage portable model profiles.
-- Prepare `llama-server` or `vllm-server` (vllm.cpp) launch commands and manage servers started by InferenceDeck.
+- Prepare `llama-server`, `vllm-server` (vllm.cpp) or `mlc_llm serve` (MLC LLM) launch commands and manage servers started by InferenceDeck.
 - Pause/resume tracked servers without losing process state, or release the GPU (stop the server, keep its settings) and restore it later.
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
 - Generate portable launch scripts without overwriting hand-written scripts.
+- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`).
 
 ### Frontends
 
@@ -107,7 +108,7 @@ and `--no-manifest`.
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
-`extra_vllm_cpp_args`, `default_host`, `default_port`, `idle_release_seconds` and `concurrent_vram_check` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `default_host`, `default_port`, `idle_release_seconds` and `concurrent_vram_check` (see `inferencedeck/config.py` for the full list and defaults).
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -184,6 +185,39 @@ Start, Stop, Pause, Release GPU, Restart, the Context presets and Benchmark work
 same as for llama.cpp; Start waits up to 180 s for readiness. Generated launch scripts
 call `vllm-server --model …` for these profiles. Fit needs `llama-fit-params` and
 stays llama.cpp-only.
+
+## Running a profile on MLC LLM
+
+[MLC LLM](https://github.com/mlc-ai/mlc-llm) compiles models ahead of time with Apache
+TVM and serves them on CUDA, Metal, Vulkan, ROCm or OpenCL. It does **not** load GGUF:
+it serves MLC weight folders (those with an `mlc-chat-config.json`, such as the
+`mlc-ai/*-MLC` repos on Hugging Face). So an MLC profile names its model with
+`mlc_model` instead of being matched against discovered GGUF files:
+
+```json
+{"mode": "qwen-mlc", "name": "Qwen3 8B (MLC LLM)",
+ "recommended_params": {"runtime": "mlc-llm", "mlc_model": "HF://mlc-ai/Qwen3-8B-q4f16_1-MLC",
+                        "ctx_size": 16384, "mlc_mode": "server"}}
+```
+
+`mlc_model` is a local MLC folder or an `HF://org/repo` id, which `mlc_llm serve`
+downloads into its own cache on first start. InferenceDeck runs the `mlc_llm` command
+from `mlc_llm_path` in config, `MLC_LLM_BIN` or `PATH`, or `python -m mlc_llm` when
+the package is installed in its own Python environment.
+
+| Profile param | `mlc_llm serve` argument |
+|---|---|
+| `mlc_model` | the model (positional) |
+| `mlc_mode` | `--mode` (`local`, `interactive` or `server`) |
+| `device` | `--device` (e.g. `cuda:0`, `metal`, `vulkan`; default `auto`) |
+| `model_lib` | `--model-lib` (otherwise MLC JIT-compiles one) |
+| `enable_prefix_caching` | `--prefix-cache-mode radix` / `disable` |
+| `ctx_size`, `max_num_seqs`, `max_total_seq_length`, `prefill_chunk_size`, `gpu_memory_utilization`, `tensor_parallel_shards`, `sliding_window_size` | `--overrides` (`context_window_size`, `max_num_sequence`, … ) |
+
+As with vllm.cpp, llama.cpp-only settings and sampling values produce a warning.
+Start waits up to 600 s, since the first start may download weights and compile a
+model library. Generated launch scripts call `mlc_llm serve $model …`; Fit stays
+llama.cpp-only.
 
 ## Local control API and web UI
 
@@ -326,6 +360,44 @@ inferencedeck-web --host 0.0.0.0 --port 8716
 ```
 
 The example above is illustrative; do not commit the token to the repository or a config file.
+
+## Inference gateway (API mapping)
+
+```bash
+inferencedeck-gateway --host 127.0.0.1 --port 8717
+```
+
+The gateway gives applications one stable inference API, whatever is serving the model. It sends each request to the current target:
+
+1. the enabled remote/cloud endpoint, if there is one;
+2. otherwise the running (not paused) local server.
+
+The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
+
+| Client API | Path |
+|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| Anthropic Messages | `POST /v1/messages` |
+| Model list (the current target) | `GET /v1/models` |
+
+Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
+
+The translation covers:
+
+- messages and system prompts
+- images
+- tool definitions, tool calls and tool results
+- sampling (`temperature`, `top_p`, `top_k`, `min_p`, penalties, seed, stop sequences)
+- streaming, finish reasons and token usage
+- errors, returned in the caller's own format
+
+For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
+
+The only engine adapter so far is OpenAI-compatible. It covers `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter. The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
+
+API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
 
 ## Development
 
