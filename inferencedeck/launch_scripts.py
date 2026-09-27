@@ -13,6 +13,8 @@ script the project has always shipped (a tiny ``$ErrorActionPreference = 'Stop'`
 PowerShell file that calls ``llama-server`` with the resolved arguments),
 so generated scripts are interchangeable with the hand-written ones and the
 existing :mod:`inferencedeck.manifest` parser picks them up unchanged.
+Profiles whose params set ``"runtime": "vllm.cpp"`` get the same style of
+script calling vllm.cpp's ``vllm-server`` instead.
 
 The module also writes a POSIX ``.sh`` companion on every generation so the
 same generated set works on Linux/macOS without an extra conversion step.
@@ -41,6 +43,7 @@ from typing import Any
 
 from .config import AppConfig
 from .llama_args import build_llama_server_args
+from .vllm_cpp_args import build_vllm_cpp_server_args
 from .models import discover_models
 from .paths import (
     find_project_root,
@@ -144,7 +147,23 @@ MANIFEST_PARAM_KEYS = (
     "cache_ram_mib",
     "cache_reuse",
     "slot_prompt_similarity",
+    # vllm.cpp profiles (runtime: vllm.cpp); see vllm_cpp_args.
+    "block_size",
+    "num_blocks",
+    "kv_cache_memory_mib",
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "kv_cache_dtype",
+    "enable_prefix_caching",
+    "scheduling_policy",
+    "tool_call_parser",
+    "reasoning_parser",
+    "speculative_config",
 )
+
+
+def _is_vllm_cpp(params: dict[str, Any]) -> bool:
+    return str(params.get("runtime") or "").strip() == "vllm.cpp"
 
 
 def _manifest_params(params: dict[str, Any]) -> dict[str, Any]:
@@ -301,15 +320,17 @@ def _render_ps1_classic(
     model_path: str,
     command_argv: list[str],
     params: dict[str, Any],
+    model_flag: str = "-m",
 ) -> str:
     """Render a Windows PowerShell launch script in the existing project style.
 
     The output matches the format of the existing hand-written scripts (e.g.
     ``start-gemma4-26b-a4b-q6k-server.ps1``): a top ``$model`` assignment
     that the manifest parser reads, a ``Test-Path`` guard, and an
-    ``& llama-server -m $model ...`` invocation. Drops the leading binary
-    path and the ``-m``/``--model`` token (and its argument) from the
-    supplied argv because those are emitted explicitly in the script body.
+    ``& llama-server -m $model ...`` invocation (``--model`` for vllm-server,
+    via ``model_flag``). Drops the leading binary path and the
+    ``-m``/``--model`` token (and its argument) from the supplied argv
+    because those are emitted explicitly in the script body.
     """
 
     filtered = _strip_binary_and_model_args(command_argv, binary_path)
@@ -336,7 +357,7 @@ def _render_ps1_classic(
         + SCRIPT_HEADER_COMMENT
         + f"$model = '{posix_model}'\n"
         + "if (-not (Test-Path -LiteralPath $model)) { throw \"Missing model: $model\" }\n"
-        + f"& '{posix_binary}' -m $model"
+        + f"& '{posix_binary}' {model_flag} $model"
         + (f" {body}\n" if body else "\n")
     )
 
@@ -356,7 +377,7 @@ def _strip_binary_and_model_args(command_argv: list[str], binary_path: str) -> l
             skip_next = False
             continue
         if idx == 0 and token and Path(token).name == Path(binary_path).name:
-            # Drop the binary path that build_llama_server_args inserts at argv[0].
+            # Drop the binary path the args builders insert at argv[0].
             continue
         if token in {"-m", "--model"}:
             skip_next = True
@@ -370,6 +391,7 @@ def _render_sh(
     model_path: str,
     command_argv: list[str],
     params: dict[str, Any],
+    model_flag: str = "-m",
 ) -> str:
     """Render a POSIX shell launch script for Linux/macOS."""
 
@@ -388,7 +410,7 @@ def _render_sh(
         + SCRIPT_HEADER_COMMENT
         + f"model={shlex_quote(model_path)}\n"
         + "if [[ ! -f \"$model\" ]]; then echo \"Missing model: $model\" >&2; exit 1; fi\n"
-        + f"exec {shlex_quote(binary_path)} -m \"$model\""
+        + f"exec {shlex_quote(binary_path)} {model_flag} \"$model\""
         + (f" {body}\n" if body else "\n")
     )
 
@@ -421,6 +443,21 @@ def _binary_path_for_script(
     return binary, warnings
 
 
+def _vllm_cpp_binary_path_for_script(config: AppConfig) -> tuple[str, list[str]]:
+    """Return the vllm-server binary path to embed and any warnings about it."""
+
+    from .backends import detect_vllm_cpp
+
+    warnings: list[str] = []
+    binary = detect_vllm_cpp(config).binary_path
+    if not binary:
+        warnings.append(
+            "vllm-server was not found; generated scripts use a 'vllm-server' placeholder."
+        )
+        binary = "vllm-server"
+    return binary, warnings
+
+
 def _write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -448,20 +485,36 @@ def generate_launch_script(
 
     app_config = config or AppConfig.load()
     root = Path(project_root).expanduser().resolve() if project_root else find_project_root()
-    resolved_binary, warnings = _binary_path_for_script(root, app_config)
-    binary = binary_path or resolved_binary
+    vllm_cpp = _is_vllm_cpp(params)
+    warnings: list[str] = []
+    if binary_path:
+        binary = binary_path
+    elif vllm_cpp:
+        binary, warnings = _vllm_cpp_binary_path_for_script(app_config)
+    else:
+        binary, warnings = _binary_path_for_script(root, app_config)
 
     safe_params = dict(params)
     safe_params.setdefault("host", app_config.default_host or "127.0.0.1")
     safe_params.setdefault("port", int(app_config.default_port or 8080))
     safe_params.setdefault("alias", Path(model_path).stem or mode)
 
-    command = build_llama_server_args(
-        binary,
-        model_path,
-        safe_params,
-        extra_args=app_config.extra_llama_args,
-    )
+    if vllm_cpp:
+        command = build_vllm_cpp_server_args(
+            binary,
+            model_path,
+            safe_params,
+            extra_args=app_config.extra_vllm_cpp_args,
+        )
+        model_flag = "--model"
+    else:
+        command = build_llama_server_args(
+            binary,
+            model_path,
+            safe_params,
+            extra_args=app_config.extra_llama_args,
+        )
+        model_flag = "-m"
     warnings.extend(command.warnings)
 
     slug = _safe_slug(mode or Path(model_path).stem)
@@ -501,7 +554,7 @@ def generate_launch_script(
             "skipped": True,
         }
 
-    ps1_text = _render_ps1_classic(binary, model_path, command.argv, safe_params)
+    ps1_text = _render_ps1_classic(binary, model_path, command.argv, safe_params, model_flag)
     _write_text_atomic(ps1_path, ps1_text)
 
     # The POSIX companion is only useful off-Windows. On Windows the embedded
@@ -509,7 +562,7 @@ def generate_launch_script(
     # skip it to avoid shipping dead files.
     wrote_sh = not is_windows()
     if wrote_sh:
-        sh_text = _render_sh(binary, model_path, command.argv, safe_params)
+        sh_text = _render_sh(binary, model_path, command.argv, safe_params, model_flag)
         _write_text_atomic(sh_path, sh_text)
 
     record = GeneratedScript(
@@ -614,7 +667,8 @@ def generate_all_launch_scripts(
                 params=dict(profile.params),
                 project_root=root,
                 config=app_config,
-                binary_path=binary,
+                # vllm.cpp profiles resolve their own vllm-server binary.
+                binary_path=None if _is_vllm_cpp(profile.params) else binary,
                 name=profile.name or profile.mode,
                 overwrite=overwrite,
             )
