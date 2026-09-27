@@ -386,7 +386,7 @@ The translation covers:
 
 For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
 
-There are two engine adapters:
+There are three engine adapters:
 
 - **OpenAI-compatible**, for `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter.
 - **Native Ollama** (`/api/chat`), used for endpoints with `"provider": "ollama"`. Its `baseUrl` is the server root, e.g. `http://thanatos:11434`; a URL ending in `/v1` or `/api` also works.
@@ -395,6 +395,14 @@ There are two engine adapters:
   - `response_format` becomes Ollama's `format` (JSON mode or a JSON schema).
   - Images must be inline (base64); image URLs are refused with a 400.
   - Ollama has no `tool_choice`. `none` is honoured by not offering the tools; a forced or required choice is left to the model.
+- **Anthropic Messages API** (`/v1/messages`), used for endpoints with `"provider": "anthropic"`. Its `baseUrl` is the API root, `https://api.anthropic.com`; a URL ending in `/v1` or `/v1/messages` also works. The key from `apiKeyEnv` is sent as `x-api-key`. See `examples/remote_endpoints/anthropic.example.json`.
+  - System messages are combined into the top-level `system` prompt.
+  - Tool results become `tool_result` blocks, and results for parallel calls share one user turn. Tool-call ids are rewritten to the characters the API allows.
+  - `max_tokens` is required by the API. When the client leaves it out, the gateway sends 16000, or 64000 for a streamed request.
+  - Only `temperature`, `top_p`, `top_k` and stop sequences are forwarded, because the API rejects unknown fields. `min_p`, penalties, `seed` and engine-specific fields are dropped. Newer Claude models also reject `temperature`/`top_p`/`top_k`; that error reaches the client unchanged.
+  - A JSON-schema `response_format` becomes `output_config.format`. JSON mode without a schema has no equivalent and is ignored.
+  - `required` becomes `tool_choice` `any`, and a named tool becomes `tool`. Some newer models reject forced tool use; that error also reaches the client unchanged.
+  - Thinking blocks in replies are not passed on. Prompt caching counts toward the reported input tokens. A 529 (overloaded) reaches the client as a 503.
 
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
