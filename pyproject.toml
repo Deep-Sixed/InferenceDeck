@@ -10,9 +10,16 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["gguf"]
 
+[project.optional-dependencies]
+tray = ["pystray>=0.19", "Pillow>=9"]
+
 [project.scripts]
 inferencedeck = "inferencedeck.cli:main"
 inferencedeck-web = "inferencedeck.webui:main"
+
+# A GUI program on Windows: no console window.
+[project.gui-scripts]
+inferencedeck-tray = "inferencedeck.tray:main"
 
 [tool.setuptools.packages.find]
 include = ["inferencedeck*"]
