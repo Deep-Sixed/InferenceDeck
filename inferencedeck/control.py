@@ -121,9 +121,7 @@ class ControlPlane:
                 raise ValueError(f"Unknown runtime: {runtime}")
             if not match["compatible"]:
                 raise ValueError(f"{match['label']} can't run on this machine: {match['incompatible_reason']}")
-        config = self._config()
-        config.llama_runtime = runtime
-        config.save()
+        AppConfig.update(lambda config: setattr(config, "llama_runtime", runtime))
         return {"success": True, "runtime": self.runtime()}
 
     def remote_endpoints(self) -> dict[str, Any]:

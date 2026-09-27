@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import list_servers, start_profile, stop_server
+from .fileio import atomic_write_text, locked
+from .server_manager import http_base, list_servers, start_profile, stop_server
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -37,13 +38,12 @@ def load_benchmark_results() -> list[dict[str, Any]]:
 
 
 def save_benchmark_result(result: dict[str, Any]) -> None:
-    results = load_benchmark_results()
-    results.append(result)
-    results = results[-100:]
     path = benchmark_results_path()
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    # Locked read-modify-write: two benchmarks finishing together keep both results.
+    with locked(path.with_name(path.name + ".lock")):
+        results = load_benchmark_results()
+        results.append(result)
+        atomic_write_text(path, json.dumps(results[-100:], indent=2) + "\n")
 
 
 def _server_for_mode(mode: str) -> dict[str, Any] | None:
@@ -54,10 +54,7 @@ def _server_for_mode(mode: str) -> dict[str, Any] | None:
 
 
 def _api_base(server: dict[str, Any]) -> str:
-    host = str(server.get("host") or "127.0.0.1")
-    if host in {"0.0.0.0", "::"}:
-        host = "127.0.0.1"
-    return f"http://{host}:{int(server.get('port') or 8080)}"
+    return http_base(server.get("host"), int(server.get("port") or 8080))
 
 
 def _completion_text(payload: dict[str, Any]) -> str:
