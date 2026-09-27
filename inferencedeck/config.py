@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .fileio import atomic_write_text, locked
 from .paths import config_dir
 
 
 CONFIG_FILENAME = "config.json"
+
+
+def _config_path(path: str | Path | None) -> Path:
+    return Path(path).expanduser() if path else config_dir() / CONFIG_FILENAME
 
 
 @dataclass
@@ -29,6 +34,9 @@ class AppConfig:
     # vllm.cpp's vllm-server; found under runtime_dirs, VLLM_CPP_HOME or PATH when unset.
     vllm_cpp_server_path: str = ""
     extra_vllm_cpp_args: list[str] = field(default_factory=list)
+    # MLC LLM's mlc_llm command; found on PATH or run as python -m mlc_llm when unset.
+    mlc_llm_path: str = ""
+    extra_mlc_llm_args: list[str] = field(default_factory=list)
     update_channel: str = "stable"
     profile_names: dict[str, str] = field(default_factory=dict)
     server_history_limit: int = 5
@@ -37,7 +45,7 @@ class AppConfig:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
-        config_path = Path(path).expanduser() if path else config_dir() / CONFIG_FILENAME
+        config_path = _config_path(path)
         if not config_path.is_file():
             return cls()
         try:
@@ -49,12 +57,19 @@ class AppConfig:
         return cls(**values)
 
     def save(self, path: str | Path | None = None) -> Path:
-        config_path = Path(path).expanduser() if path else config_dir() / CONFIG_FILENAME
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = config_path.with_suffix(f"{config_path.suffix}.tmp")
-        tmp_path.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(config_path)
+        config_path = _config_path(path)
+        atomic_write_text(config_path, json.dumps(asdict(self), indent=2) + "\n")
         return config_path
+
+    @classmethod
+    def update(cls, change: Callable[["AppConfig"], None], path: str | Path | None = None) -> "AppConfig":
+        """Load, apply ``change`` and save under a lock, so concurrent updates don't undo each other."""
+        config_path = _config_path(path)
+        with locked(config_path.with_name(config_path.name + ".lock")):
+            config = cls.load(config_path)
+            change(config)
+            config.save(config_path)
+        return config
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
