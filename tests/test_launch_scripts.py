@@ -6,7 +6,9 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from inferencedeck import backends
 from inferencedeck import launch_scripts as launch_scripts_module
 from inferencedeck import paths as paths_module
 from inferencedeck.config import AppConfig
@@ -127,6 +129,79 @@ class GenerateSingleLaunchScriptTests(_IsolatedDirs):
             overwrite=False,
         )
         self.assertTrue(second["skipped"])
+
+
+class VllmCppLaunchScriptTests(_IsolatedDirs):
+    def setUp(self) -> None:
+        super().setUp()
+        self.vllm_bin = self.project_root / ("vllm-server.exe" if paths_module.is_windows() else "vllm-server")
+        self.vllm_bin.write_bytes(b"binary")
+        self.config = AppConfig(vllm_cpp_server_path=str(self.vllm_bin))
+        # Keep detection off the network; nothing here needs a running server.
+        patcher = mock.patch.object(backends, "_request_json", return_value=(False, None, "offline"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_vllm_cpp_profile_renders_vllm_server_invocation(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={"runtime": "vllm.cpp", "ctx_size": 16384, "max_num_seqs": 4},
+            project_root=self.project_root,
+            config=self.config,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", ps1)
+        self.assertIn("--max-model-len 16384", ps1)
+        self.assertIn("--num-blocks 512", ps1)
+        self.assertIn("--max-num-seqs 4", ps1)
+        for llama_flag in (" -m ", "--ctx-size", "--flash-attn", "llama-server"):
+            self.assertNotIn(llama_flag, ps1)
+        # The manifest parser still pins the exact model from the script.
+        self.assertTrue(_parse_model_path(Path(payload["ps1_path"])).endswith("Qwen3-8B-Q4_K_M.gguf"))
+        if not paths_module.is_windows():
+            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
+            self.assertIn(f'--model "$model"', sh)
+            self.assertIn("--max-model-len 16384", sh)
+
+    def test_missing_vllm_server_uses_placeholder_with_warning(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        with mock.patch.object(launch_scripts_module, "_vllm_cpp_binary_for_generation", return_value=None):
+            payload = generate_launch_script(
+                mode="qwen-vllm",
+                model_path=str(model_path),
+                params={"runtime": "vllm.cpp", "ctx_size": 8192},
+                project_root=self.project_root,
+                config=AppConfig(),
+            )
+        self.assertIn("& 'vllm-server' --model $model", Path(payload["ps1_path"]).read_text(encoding="utf-8"))
+        self.assertTrue(any("vllm-server was not found" in w for w in payload["warnings"]))
+
+    def test_scan_picks_the_binary_for_each_profiles_runtime(self) -> None:
+        manifest = {
+            "models": [
+                {
+                    "mode": "tiny",
+                    "name": "Tiny",
+                    "description": "llama.cpp profile",
+                    "recommended_params": {"ctx_size": 4096, "threads": 4, "gpu_layers": 999, "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+                },
+                {
+                    "mode": "qwen-vllm",
+                    "name": "Qwen on vllm.cpp",
+                    "description": "vllm.cpp profile",
+                    "recommended_params": {"runtime": "vllm.cpp", "ctx_size": 8192},
+                },
+            ]
+        }
+        (self.project_root / "models.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self._seed_model("Tiny-1B-Q8_0.gguf")
+        self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        result = generate_all_launch_scripts(project_root=self.project_root, model_dirs=[self.model_dir], config=self.config)
+        scripts = {item.mode: Path(item.ps1_path).read_text(encoding="utf-8") for item in result.generated}
+        self.assertIn(f"& '{self.server_bin.as_posix()}' -m $model", scripts["tiny"])
+        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", scripts["qwen-vllm"])
 
 
 class ScanAllLaunchScriptsTests(_IsolatedDirs):
