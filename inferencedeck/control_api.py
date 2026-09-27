@@ -1,13 +1,19 @@
+"""HTTP handler for the InferenceDeck control API.
+
+Served by ``inferencedeck-web`` (see webui.py), the single process that owns
+server state. Browsers and both trays talk to that one process.
+"""
+
 from __future__ import annotations
 
-import argparse
 import json
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from .api_params import validate_overrides
+from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState
 from .control import ControlPlane
 
 MAX_BODY_BYTES = 1024 * 1024
@@ -40,17 +46,47 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             name = host.rpartition(":")[0] if host.count(":") == 1 else host
         return name.lower() in LOOPBACK_HOSTS
 
-    def _authed(self) -> bool:
-        if not self.auth_state.enabled:
-            return True
-        return self.auth_state.session_ok(self._cookie("sid")) or self.auth_state.supplied_token_ok(self.path, self.headers)
+    def _client(self) -> str:
+        return str(self.client_address[0])
 
-    def _json(self, status: int, payload: Any, cookies: list[str] | None = None) -> None:
+    def _throttled(self, retry_after: int) -> None:
+        self._json(
+            HTTPStatus.TOO_MANY_REQUESTS,
+            {"success": False, "error": f"too many failed attempts; retry in {retry_after}s"},
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    def _require_auth(self) -> bool:
+        """True when the request may proceed; otherwise the error response has been sent."""
+        if not self.auth_state.enabled or self.auth_state.session_ok(self._cookie("sid")):
+            return True
+        client = self._client()
+        wait = self.auth_state.retry_after(client)
+        if wait:
+            self._throttled(wait)
+            return False
+        if self.headers.get("X-Auth-Token"):
+            if self.auth_state.supplied_token_ok(self.headers):
+                return True
+            # A wrong token is a failed guess, same as a wrong login password.
+            self.auth_state.record_failure(client)
+        self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "unauthorized"})
+        return False
+
+    def _json(
+        self,
+        status: int,
+        payload: Any,
+        cookies: list[str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         for cookie in cookies or []:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
@@ -86,8 +122,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/auth":
             self._json(HTTPStatus.OK, {"required": self.auth_state.enabled, "username": self.auth_state.username})
             return
-        if not self._authed():
-            self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "unauthorized"})
+        if not self._require_auth():
             return
         try:
             if parsed.path == "/api/status":
@@ -135,27 +170,33 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 if not self.auth_state.enabled:
                     self._json(HTTPStatus.OK, {"success": True})
                     return
+                client = self._client()
+                wait = self.auth_state.retry_after(client)
+                if wait:
+                    self._throttled(wait)
+                    return
                 if not self.auth_state.credentials_ok(str(body.get("username", "")), str(body.get("password", ""))):
+                    self.auth_state.record_failure(client)
                     self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "invalid credentials"})
                     return
+                self.auth_state.record_success(client)
                 sid = self.auth_state.issue_session()
-                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"])
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}"])
                 return
             if parsed.path == "/api/logout":
                 self.auth_state.revoke_session(self._cookie("sid"))
                 self._json(HTTPStatus.OK, {"success": True}, cookies=["sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"])
                 return
-            if not self._authed():
-                self._json(HTTPStatus.UNAUTHORIZED, {"success": False, "error": "unauthorized"})
+            if not self._require_auth():
                 return
             if parsed.path == "/api/prepare":
                 mode = str(body.get("mode") or "")
-                payload = self.control_plane.prepare(mode, body.get("overrides"))
+                payload = self.control_plane.prepare(mode, validate_overrides(body.get("overrides")))
             elif parsed.path == "/api/start":
                 mode = str(body.get("mode") or "")
                 payload = self.control_plane.start(
                     mode,
-                    body.get("overrides"),
+                    validate_overrides(body.get("overrides")),
                     stop_existing=bool(body.get("stop_existing", False)),
                 )
             elif parsed.path == "/api/stop":
@@ -167,13 +208,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/fit":
                 payload = self.control_plane.fit(
                     str(body.get("mode") or ""),
-                    body.get("overrides"),
+                    validate_overrides(body.get("overrides")),
                     target_mib=max(0, min(int(body.get("target_mib", 1024)), 65536)),
                 )
             elif parsed.path == "/api/benchmark":
                 payload = self.control_plane.benchmark(
                     str(body.get("mode") or ""),
-                    body.get("overrides"),
+                    validate_overrides(body.get("overrides")),
                     completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
                 )
             elif parsed.path == "/api/remote":
@@ -193,30 +234,3 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"success": False, "error": str(exc)})
-
-
-def serve(
-    host: str = "127.0.0.1",
-    port: int = 8717,
-    control_plane: ControlPlane | None = None,
-    auth_state: AuthState | None = None,
-) -> None:
-    auth = auth_state or AuthState()
-    validate_bind_security(host, auth)
-    handler = type("BoundControlRequestHandler", (ControlRequestHandler,), {})
-    handler.control_plane = control_plane or ControlPlane()
-    handler.auth_state = auth
-    ThreadingHTTPServer((host, port), handler).serve_forever()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="InferenceDeck local frontend/control API")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8717)
-    args = parser.parse_args()
-    serve(args.host, args.port)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

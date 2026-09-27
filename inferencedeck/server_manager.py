@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.request
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,9 +53,83 @@ def read_state() -> dict[str, Any]:
 def write_state(state: dict[str, Any]) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-    tmp_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    # A unique temp name per write, so concurrent writers never share (and
+    # clobber) one staging file.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state, indent=2) + "\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# Guards read-modify-write of servers.json. The RLock covers threads in this
+# process; the file lock covers other processes (e.g. the CLI next to the daemon).
+_STATE_LOCK = threading.RLock()
+_STATE_DEPTH = threading.local()
+
+
+def _lock_file(fh: Any) -> None:
+    if is_windows():
+        import msvcrt
+
+        fh.seek(0)
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    import fcntl
+
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(fh: Any) -> None:
+    if is_windows():
+        import msvcrt
+
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def state_lock() -> Iterator[None]:
+    with _STATE_LOCK:
+        depth = getattr(_STATE_DEPTH, "value", 0)
+        _STATE_DEPTH.value = depth + 1
+        try:
+            if depth:
+                # Re-entered from this thread: the file lock is already held.
+                yield
+                return
+            lock_path = state_path().with_suffix(".lock")
+            with open(lock_path, "a+b") as fh:
+                _lock_file(fh)
+                try:
+                    yield
+                finally:
+                    _unlock_file(fh)
+        finally:
+            _STATE_DEPTH.value = depth
+
+
+def _mutate_state(change: Callable[[dict[str, Any]], bool | None]) -> None:
+    """Apply ``change`` to the current state under the lock; write unless it returns False."""
+    with state_lock():
+        state = read_state()
+        state.setdefault("servers", [])
+        if change(state) is not False:
+            write_state(state)
 
 
 def pid_is_running(pid: int | None) -> bool:
@@ -135,22 +213,31 @@ def list_servers() -> list[dict[str, Any]]:
 
 def prune_stale_servers() -> None:
     """Remove entries for PIDs that are no longer running."""
-    state = read_state()
-    servers = state.get("servers", [])
-    kept = [s for s in servers if pid_is_running(s.get("pid")) or not s.get("pid")]
-    if len(kept) != len(servers):
+
+    def change(state: dict[str, Any]) -> bool:
+        servers = state["servers"]
+        kept = [s for s in servers if pid_is_running(s.get("pid")) or not s.get("pid")]
         state["servers"] = kept
-        write_state(state)
+        return len(kept) != len(servers)
+
+    _mutate_state(change)
 
 
 def trim_server_history(limit: int = 5) -> None:
-    state = read_state()
-    servers = state.get("servers", [])
-    if len(servers) <= limit:
-        return
-    kept = servers[:limit]
-    state["servers"] = kept
-    write_state(state)
+    """Cap non-running records at ``limit``, keeping the newest. Running servers are never dropped."""
+
+    def change(state: dict[str, Any]) -> bool:
+        servers = state["servers"]
+        running = [pid_is_running(s.get("pid")) for s in servers]
+        idle = [i for i, alive in enumerate(running) if not alive]
+        excess = len(servers) - max(limit, running.count(True))
+        if excess <= 0 or not idle:
+            return False
+        dropped = set(idle[: min(excess, len(idle))])
+        state["servers"] = [s for i, s in enumerate(servers) if i not in dropped]
+        return True
+
+    _mutate_state(change)
 
 
 def _find_server(server_id: str | None = None, mode: str | None = None) -> dict[str, Any] | None:
@@ -316,25 +403,27 @@ def resume_server(server_id: str | None = None, mode: str | None = None) -> dict
     return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
 
 def _update_server(server_id: str, patch: dict[str, Any]) -> None:
-    state = read_state()
-    servers = state.setdefault("servers", [])
-    for idx, server in enumerate(servers):
-        if server.get("id") == server_id:
-            servers[idx] = {**server, **patch}
-            write_state(state)
-            return
+    def change(state: dict[str, Any]) -> bool:
+        servers = state["servers"]
+        for idx, server in enumerate(servers):
+            if server.get("id") == server_id:
+                servers[idx] = {**server, **patch}
+                return True
+        return False
+
+    _mutate_state(change)
 
 
 def _upsert_server(server: dict[str, Any]) -> None:
-    state = read_state()
-    servers = state.setdefault("servers", [])
-    for idx, existing in enumerate(servers):
-        if existing.get("id") == server.get("id"):
-            servers[idx] = server
-            write_state(state)
-            return
-    servers.append(server)
-    write_state(state)
+    def change(state: dict[str, Any]) -> None:
+        servers = state["servers"]
+        for idx, existing in enumerate(servers):
+            if existing.get("id") == server.get("id"):
+                servers[idx] = server
+                return
+        servers.append(server)
+
+    _mutate_state(change)
 
 
 def _health_url(host: str, port: int) -> str:

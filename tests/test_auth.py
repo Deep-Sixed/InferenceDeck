@@ -63,3 +63,72 @@ class AuthHttpTests(unittest.TestCase):
             cookie = response.headers.get("Set-Cookie", "")
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
+
+    def _code(self, req: urllib.request.Request) -> int:
+        try:
+            with urllib.request.urlopen(req, timeout=2) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def _login(self, password: str) -> urllib.request.Request:
+        return urllib.request.Request(
+            self.base + "/api/login",
+            data=json.dumps({"username": "admin", "password": password}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def test_query_string_token_is_not_accepted(self) -> None:
+        self.assertEqual(self._code(urllib.request.Request(self.base + "/api/status?token=secret")), 401)
+
+    def test_repeated_bad_logins_are_throttled(self) -> None:
+        for _ in range(5):
+            self.assertEqual(self._code(self._login("wrong")), 401)
+        # Locked out now, even with the right password.
+        self.assertEqual(self._code(self._login("secret")), 429)
+
+    def test_wrong_header_tokens_count_as_failures(self) -> None:
+        for _ in range(5):
+            req = urllib.request.Request(self.base + "/api/status", headers={"X-Auth-Token": "guess"})
+            self.assertEqual(self._code(req), 401)
+        req = urllib.request.Request(self.base + "/api/status", headers={"X-Auth-Token": "secret"})
+        self.assertEqual(self._code(req), 429)
+
+
+class SessionLimitTests(unittest.TestCase):
+    def test_sessions_expire(self) -> None:
+        now = [1000.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        sid = auth.issue_session()
+        now[0] += 7 * 24 * 3600 - 1
+        self.assertTrue(auth.session_ok(sid))
+        now[0] += 2
+        self.assertFalse(auth.session_ok(sid))
+
+    def test_session_count_is_capped_oldest_first(self) -> None:
+        from inferencedeck.auth import MAX_SESSIONS
+
+        auth = AuthState(username="admin", token="secret")
+        first = auth.issue_session()
+        rest = [auth.issue_session() for _ in range(MAX_SESSIONS)]
+        self.assertFalse(auth.session_ok(first))
+        self.assertTrue(all(auth.session_ok(sid) for sid in rest))
+
+    def test_throttle_lifts_after_window(self) -> None:
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        for _ in range(5):
+            auth.record_failure("10.0.0.5")
+        self.assertGreater(auth.retry_after("10.0.0.5"), 0)
+        self.assertEqual(auth.retry_after("10.0.0.6"), 0)  # other clients unaffected
+        now[0] += 301
+        self.assertEqual(auth.retry_after("10.0.0.5"), 0)
+
+    def test_success_clears_failures(self) -> None:
+        auth = AuthState(username="admin", token="secret")
+        for _ in range(4):
+            auth.record_failure("c")
+        auth.record_success("c")
+        auth.record_failure("c")
+        self.assertEqual(auth.retry_after("c"), 0)

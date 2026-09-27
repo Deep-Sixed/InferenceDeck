@@ -3,12 +3,20 @@ from __future__ import annotations
 import os
 import secrets
 import threading
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+SESSION_TTL_SECONDS = 7 * 24 * 3600  # matches the cookie Max-Age
+MAX_SESSIONS = 128
+MAX_FAILURES = 5
+FAILURE_WINDOW_SECONDS = 300
+MAX_TRACKED_CLIENTS = 1024
 
 
 def _token_from_environment() -> str:
@@ -28,7 +36,11 @@ def _token_from_environment() -> str:
 class AuthState:
     username: str = field(default_factory=lambda: os.environ.get("INFERENCEDECK_USER", "admin").strip() or "admin")
     token: str = field(default_factory=_token_from_environment)
-    _sessions: set[str] = field(default_factory=set, init=False, repr=False)
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    # sid -> expiry; insertion order is issue order, so the oldest is evicted first.
+    _sessions: OrderedDict[str, float] = field(default_factory=OrderedDict, init=False, repr=False)
+    # client -> recent failure times, for login/token throttling.
+    _failures: OrderedDict[str, deque[float]] = field(default_factory=OrderedDict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
@@ -47,26 +59,63 @@ class AuthState:
     def issue_session(self) -> str:
         sid = secrets.token_urlsafe(32)
         with self._lock:
-            self._sessions.add(sid)
+            self._sessions[sid] = self.clock() + SESSION_TTL_SECONDS
+            while len(self._sessions) > MAX_SESSIONS:
+                self._sessions.popitem(last=False)
         return sid
 
     def session_ok(self, sid: str) -> bool:
         if not self.enabled:
             return True
+        if not sid:
+            return False
         with self._lock:
-            return bool(sid) and sid in self._sessions
+            expiry = self._sessions.get(sid)
+            if expiry is None:
+                return False
+            if expiry <= self.clock():
+                del self._sessions[sid]
+                return False
+            return True
 
     def revoke_session(self, sid: str) -> None:
         if not sid:
             return
         with self._lock:
-            self._sessions.discard(sid)
+            self._sessions.pop(sid, None)
 
-    def supplied_token_ok(self, path: str, headers) -> bool:
+    def supplied_token_ok(self, headers) -> bool:
+        # Header only: a ?token= query parameter would leak into logs and history.
         supplied = headers.get("X-Auth-Token", "")
-        if not supplied:
-            supplied = (parse_qs(urlparse(path).query).get("token") or [""])[0]
         return bool(supplied) and self.enabled and secrets.compare_digest(supplied, self.token)
+
+    def retry_after(self, client: str) -> int:
+        """Seconds until ``client`` may try credentials again; 0 when not throttled."""
+        with self._lock:
+            recent = self._recent_failures(client)
+            if len(recent) < MAX_FAILURES:
+                return 0
+            return max(1, int(recent[0] + FAILURE_WINDOW_SECONDS - self.clock()) + 1)
+
+    def record_failure(self, client: str) -> None:
+        with self._lock:
+            recent = self._recent_failures(client)
+            recent.append(self.clock())
+            self._failures[client] = recent
+            self._failures.move_to_end(client)
+            while len(self._failures) > MAX_TRACKED_CLIENTS:
+                self._failures.popitem(last=False)
+
+    def record_success(self, client: str) -> None:
+        with self._lock:
+            self._failures.pop(client, None)
+
+    def _recent_failures(self, client: str) -> deque[float]:
+        cutoff = self.clock() - FAILURE_WINDOW_SECONDS
+        recent = self._failures.get(client, deque())
+        while recent and recent[0] <= cutoff:
+            recent.popleft()
+        return recent
 
 
 def validate_bind_security(host: str, auth: AuthState) -> None:

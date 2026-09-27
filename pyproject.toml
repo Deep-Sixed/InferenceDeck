@@ -12,7 +12,6 @@ dependencies = ["gguf"]
 
 [project.scripts]
 inferencedeck = "inferencedeck.cli:main"
-inferencedeck-control = "inferencedeck.control_api:main"
 inferencedeck-web = "inferencedeck.webui:main"
 
 [tool.setuptools.packages.find]
