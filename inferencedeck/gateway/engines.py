@@ -1,8 +1,8 @@
 """Engine adapters: canonical requests -> an inference server's own API.
 
-Only the OpenAI-compatible engine exists so far. llama.cpp, vllm.cpp, vLLM,
-LM Studio and OpenRouter all speak it, which covers every target InferenceDeck
-can route to today.
+- ``OpenAICompatibleEngine``: llama.cpp, vllm.cpp, vLLM, LM Studio, OpenRouter.
+- ``OllamaEngine``: Ollama's native ``/api/chat``, which keeps its own options
+  (``num_ctx``, ``keep_alive``, ...) and ``format`` structured output.
 """
 
 from __future__ import annotations
@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
-from . import openai_api
+from . import ollama_api, openai_api
 from .ir import ChatRequest, ChatResult, GatewayError, StreamEvent
 
 # Local models can take minutes to prefill a long prompt.
@@ -36,19 +36,27 @@ def _upstream_error(exc: urllib.error.HTTPError) -> GatewayError:
 
 
 @dataclass
-class OpenAICompatibleEngine:
-    api_base: str  # ends in /v1
+class _HTTPEngine:
+    api_base: str
     model: str = ""  # sent upstream; empty -> the client's model name
     api_key: str = ""
     timeout: float = DEFAULT_TIMEOUT_SECONDS
 
+    # Set by subclasses.
+    path: ClassVar[str] = ""
+    stream_accept: ClassVar[str] = ""
+    to_wire: ClassVar[Callable[[ChatRequest, str], dict[str, Any]]]
+    from_wire: ClassVar[Callable[[dict[str, Any], str], ChatResult]]
+    parse_stream: ClassVar[Callable[[Iterable[bytes]], Iterator[StreamEvent]]]
+
     def _open(self, request: ChatRequest) -> Any:
-        body = openai_api.to_wire(request, self.model or request.model)
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if request.stream else "application/json"}
+        body = type(self).to_wire(request, self.model or request.model)
+        headers = {"Content-Type": "application/json",
+                   "Accept": self.stream_accept if request.stream else "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         http_request = urllib.request.Request(
-            f"{self.api_base.rstrip('/')}/chat/completions",
+            f"{self.api_base.rstrip('/')}{self.path}",
             data=json.dumps(body).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -67,18 +75,41 @@ class OpenAICompatibleEngine:
                 payload = json.loads(response.read())
             except json.JSONDecodeError as exc:
                 raise GatewayError(502, "upstream returned invalid JSON") from exc
-        return openai_api.from_wire(payload, self.model or request.model)
+        return type(self).from_wire(payload, self.model or request.model)
 
     def stream(self, request: ChatRequest) -> Iterator[StreamEvent]:
         # Opened eagerly so connection and HTTP errors surface before the
         # gateway commits to a 200 streaming response.
         response = self._open(request)
+        parse = type(self).parse_stream
 
         def events() -> Iterator[StreamEvent]:
             with response:
                 try:
-                    yield from openai_api.stream_events(response)
+                    yield from parse(response)
                 except OSError as exc:
                     raise GatewayError(502, f"upstream stream interrupted: {exc}") from exc
 
         return events()
+
+
+@dataclass
+class OpenAICompatibleEngine(_HTTPEngine):
+    """``api_base`` ends in /v1."""
+
+    path = "/chat/completions"
+    stream_accept = "text/event-stream"
+    to_wire = staticmethod(openai_api.to_wire)
+    from_wire = staticmethod(openai_api.from_wire)
+    parse_stream = staticmethod(openai_api.stream_events)
+
+
+@dataclass
+class OllamaEngine(_HTTPEngine):
+    """``api_base`` is the server root, e.g. http://host:11434."""
+
+    path = "/api/chat"
+    stream_accept = "application/x-ndjson"
+    to_wire = staticmethod(ollama_api.to_wire)
+    from_wire = staticmethod(ollama_api.from_wire)
+    parse_stream = staticmethod(ollama_api.stream_events)

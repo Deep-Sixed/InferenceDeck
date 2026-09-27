@@ -52,6 +52,8 @@ class AppConfig:
             data = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return cls()
+        if not isinstance(data, dict):
+            return cls()  # valid JSON but not a settings object; fall back to defaults like unreadable JSON
         allowed = {field_name for field_name in cls.__dataclass_fields__}
         values = {key: value for key, value in data.items() if key in allowed}
         return cls(**values)

@@ -31,10 +31,10 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 InferenceDeck supports two endpoint lanes, which say who runs the model:
 
-- `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet.
+- `remote_host` — a self-hosted runtime on another machine you control, such as `llama.cpp` on a GPU box reached over a LAN or tailnet. An endpoint whose `provider` is `llamacpp` or `ollama` defaults to this lane when `lane` is omitted.
 - `true_cloud` — a hosted API such as OpenRouter, where the request leaves your infrastructure.
 
-How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and `100.64.0.0/10` addresses count as Tailscale, and `true_cloud` endpoints default to HTTPS. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
+How requests reach the endpoint is a separate, optional `transport` field: `tailscale`, `lan`, or `https`. Tailscale is a transport, not a provider. When `transport` is omitted, it is inferred from `baseUrl`: `*.ts.net` names and tailnet addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) count as Tailscale, `true_cloud` endpoints default to HTTPS, and anything else is left unlabelled. Any other `transport` value makes the endpoint invalid. The optional `host` field names the machine; it defaults to the hostname in `baseUrl`. The tray and web UI label each endpoint from these fields, for example `Qwen3-32B (Thanatos · Tailscale · Self-hosted)` or `Claude Sonnet (OpenRouter · Cloud)`.
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
@@ -49,10 +49,19 @@ Environment variables:
 - `INFERENCEDECK_USER` — login name, default `admin`.
 - `INFERENCEDECK_TOKEN` — shared password/token.
 - `INFERENCEDECK_TOKEN_FILE` — file containing the shared password/token.
+- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated addresses of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes); behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. The header is ignored from any other address, so clients can't use it to dodge the throttle.
 
-Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie. Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
+Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie (also `Secure` when served over HTTPS). Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
 
 Do not bind the web/control service to a LAN or tailnet address without setting a token; InferenceDeck will fail closed rather than expose unauthenticated process controls.
+
+Over plain HTTP the token and session cookie cross the network unencrypted. For a LAN bind, serve HTTPS (a tailnet already encrypts traffic between its devices):
+
+```bash
+inferencedeck-web --host 0.0.0.0 --certfile cert.pem --keyfile key.pem
+```
+
+The trays verify the certificate, so use one they trust (for example a Tailscale or internal-CA certificate) and point `INFERENCEDECK_URL` at `https://`.
 
 ### Deliberately not owned
 
@@ -139,8 +148,8 @@ root and working directory, common home folders (`~/models`, `~/llms`, …), LM 
 model folders and the Hugging Face cache (`HF_HOME`). A whole drive is never scanned.
 
 Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` (or
-`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST` and
-`VLLM_CPP_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
+`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST`,
+`VLLM_CPP_SERVER_URL` and `MLC_LLM_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
 metadata requests when set.
 
 ## Choosing a llama.cpp build
@@ -226,7 +235,8 @@ it serves MLC weight folders (those with an `mlc-chat-config.json`, such as the
 `mlc_model` is a local MLC folder or an `HF://org/repo` id, which `mlc_llm serve`
 downloads into its own cache on first start. InferenceDeck runs the `mlc_llm` command
 from `mlc_llm_path` in config, `MLC_LLM_BIN` or `PATH`, or `python -m mlc_llm` when
-the package is installed in its own Python environment.
+the `mlc-llm` package is installed in InferenceDeck's own Python environment. Discovery
+also probes a running MLC server at `MLC_LLM_SERVER_URL` (default `http://127.0.0.1:8000`).
 
 | Profile param | `mlc_llm serve` argument |
 |---|---|
@@ -261,6 +271,10 @@ Server controls (the same in the web UI and both trays):
 | **Reload & restart** | Stops and starts the server with the same settings. |
 | **Context 8K–128K** | Restarts the server (or restores a released one) at that context size. |
 | **Stop** | Stops the server. On a released server it forgets the saved settings. |
+
+Starts run one at a time. Start is refused when the profile already has a running server
+(unless the caller asks to stop it first) or when another tracked server is using the same
+port.
 
 For authenticated LAN/tailnet use:
 
@@ -304,7 +318,17 @@ The translation covers:
 
 For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
 
-The only engine adapter so far is OpenAI-compatible. It covers `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter. The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
+There are two engine adapters:
+
+- **OpenAI-compatible**, for `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter.
+- **Native Ollama** (`/api/chat`), used for endpoints with `"provider": "ollama"`. Its `baseUrl` is the server root, e.g. `http://thanatos:11434`; a URL ending in `/v1` or `/api` also works.
+  - Sampling settings become Ollama `options`, with `max_tokens` sent as `num_predict`.
+  - Other engine fields go into `options` (e.g. `num_ctx`, `repeat_penalty`), except `keep_alive` and `think`, which go at the top level. OpenAI-only fields such as `parallel_tool_calls` are dropped.
+  - `response_format` becomes Ollama's `format` (JSON mode or a JSON schema).
+  - Images must be inline (base64); image URLs are refused with a 400.
+  - Ollama has no `tool_choice`. `none` is honoured by not offering the tools; a forced or required choice is left to the model.
+
+The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 

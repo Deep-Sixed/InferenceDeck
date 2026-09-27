@@ -1,6 +1,6 @@
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,body){const opt=body?{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)}:{credentials:'same-origin'};const r=await fetch(path,opt);const j=await r.json();if(r.status===401){showLogin(true);throw new Error('unauthorized')}if(!r.ok)throw new Error(j.error||j.message||r.statusText);return j}
+async function api(path,body){const opt=body?{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)}:{credentials:'same-origin'};const r=await fetch(path,opt);const j=await r.json().catch(()=>({}));if(r.status===401){showLogin(true);throw new Error('unauthorized')}if(!r.ok)throw new Error(j.error||j.message||r.statusText);return j}
 function showLogin(v){$('login').classList.toggle('hidden',!v)}
 async function login(user,password){const r=await fetch('/api/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password})});if(r.ok)return '';const j=await r.json().catch(()=>({}));return r.status===429?(j.error||'Too many attempts; try again later'):'Invalid username or password'}
 function toast(msg){$('toast').textContent=msg;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',3500)}
@@ -27,4 +27,4 @@ async function loadUpdates(refresh){$('updates-check').disabled=true;try{const r
 $('updates-check').addEventListener('click',()=>loadUpdates(true));
 loadRuntime();loadDetails();loadUpdates(false);setInterval(refresh,5000);setInterval(loadDetails,60000);setInterval(()=>loadUpdates(false),30*60000);
 
-$('login-form').addEventListener('submit',async e=>{e.preventDefault();const err=await login($('login-user').value,$('login-password').value);if(!err){$('login-password').value='';$('login-error').textContent='';showLogin(false);loadDetails();loadRuntime();loadUpdates(false)}else{$('login-error').textContent=err}});fetch('/api/auth').then(r=>r.json()).then(a=>{if(a.username)$('login-user').value=a.username;if(!a.required)showLogin(false)});
+$('login-form').addEventListener('submit',async e=>{e.preventDefault();const err=await login($('login-user').value,$('login-password').value);if(!err){$('login-password').value='';$('login-error').textContent='';showLogin(false);loadDetails();loadRuntime();loadUpdates(false)}else{$('login-error').textContent=err}});fetch('/api/auth').then(r=>r.json()).then(a=>{if(!a.required)showLogin(false)});
