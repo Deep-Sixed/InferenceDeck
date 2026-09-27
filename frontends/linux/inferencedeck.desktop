@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=InferenceDeck Tray
+Comment=InferenceDeck local inference control tray
+Exec=/usr/bin/env python3 /path/to/InferenceDeck/frontends/linux/inferencedeck_tray.py
+Terminal=false
+Categories=Utility;Development;
