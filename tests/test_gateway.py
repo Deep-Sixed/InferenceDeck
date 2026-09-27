@@ -235,6 +235,33 @@ class GatewayServerTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
+    def test_cross_site_style_posts_never_reach_upstream(self) -> None:
+        # What a web page can send without a CORS preflight: text/plain, or a form.
+        chat = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        anthropic = {"model": "qwen", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
+            for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"):
+                with self.subTest(path=path, content_type=content_type):
+                    status, raw = self.post(path, body, {"Content-Type": content_type})
+                    self.assertEqual(status, 415)
+                    self.assertIn("application/json", raw.decode())
+        # urllib's default for a body with no Content-Type is the form type.
+        request = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(chat).encode(), method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(ctx.exception.code, 415)
+        self.assertEqual(_FakeUpstream.received, [])
+
+    def test_json_with_a_charset_is_accepted(self) -> None:
+        status, _raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+                                 {"Content-Type": "application/json; charset=utf-8"})
+        self.assertEqual(status, 200)
+
+    def test_missing_token_is_401_before_the_content_type_check(self) -> None:
+        self.start_gateway(AuthState(token="secret"))
+        status, _raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": []}, {"Content-Type": "text/plain"})
+        self.assertEqual(status, 401)
+
     def test_openai_request_is_forwarded_with_server_side_key(self) -> None:
         status, raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": [{"role": "user", "content": "hi"}],
                                                          "min_p": 0.1}, {"Authorization": "Bearer client-key"})
