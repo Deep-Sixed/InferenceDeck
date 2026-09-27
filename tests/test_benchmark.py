@@ -46,6 +46,39 @@ class RunProfileBenchmarkTests(unittest.TestCase):
         self.assertNotIn("n_predict", overrides)
         self.assertFalse(start.call_args.kwargs["stop_existing"])
 
+    def test_start_waits_as_long_as_the_runtime_needs(self) -> None:
+        with mock.patch.object(benchmark, "list_servers", return_value=[]), \
+                mock.patch.object(benchmark, "start_profile", return_value={"success": True, "server": RUNNING}) as start, \
+                mock.patch.object(benchmark.urllib.request, "urlopen", side_effect=_fake_urlopen):
+            benchmark.run_profile_benchmark("demo")
+        # None lets start_profile use the runtime's own ready timeout.
+        self.assertIsNone(start.call_args.kwargs["ready_timeout_seconds"])
+
+    def test_vllm_cpp_start_gets_its_full_ready_timeout(self) -> None:
+        from inferencedeck import server_manager
+
+        prepared = {
+            "success": True,
+            "runtime": "vllm.cpp",
+            "command": {"argv": ["vllm-server"], "cwd": None, "warnings": []},
+            "params": {"host": "127.0.0.1", "port": 18095},
+            "profile": {"model": None},
+            "warnings": [],
+        }
+        waits: list[int] = []
+
+        def fake_wait(host, port, pid, timeout_seconds=45):
+            waits.append(timeout_seconds)
+            return True
+
+        with mock.patch.object(benchmark, "list_servers", return_value=[]), \
+                mock.patch.object(server_manager, "prepare_launch_command", return_value=prepared), \
+                mock.patch.object(server_manager.subprocess, "Popen", return_value=mock.Mock(pid=424242)), \
+                mock.patch.object(server_manager, "wait_until_ready", side_effect=fake_wait), \
+                mock.patch.object(benchmark.urllib.request, "urlopen", side_effect=_fake_urlopen):
+            benchmark.run_profile_benchmark("demo")
+        self.assertEqual(waits, [server_manager.READY_TIMEOUT_SECONDS["vllm.cpp"]])
+
     def test_paused_server_is_refused(self) -> None:
         paused = {**RUNNING, "suspended": True}
         with mock.patch.object(benchmark, "list_servers", return_value=[paused]), \

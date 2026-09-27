@@ -143,7 +143,9 @@ def run_profile_benchmark(
     completion_tokens: int = 128,
     restart: bool = False,
     stop_after: bool = False,
-    ready_timeout_seconds: int = 90,
+    # None: wait as long as this profile's runtime needs to load (see
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp takes far longer than llama.cpp).
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Time one chat completion against the profile's server.
 
