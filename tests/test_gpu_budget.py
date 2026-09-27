@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -117,7 +119,6 @@ class StartProfileVramTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.addCleanup(self._reap)
         self.procs: list[subprocess.Popen] = []
         self.config = AppConfig()
         sleeper = [sys.executable, "-c", "import time;time.sleep(60)"]
@@ -142,11 +143,16 @@ class StartProfileVramTests(unittest.TestCase):
         patcher = mock.patch.object(server_manager.AppConfig, "load", side_effect=lambda *a, **k: self.config)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Cleanups run last-in first-out: reap while the state dir is still patched,
+        # so started servers are stopped before Windows is asked to delete their logs.
+        self.addCleanup(self._reap)
 
     def _reap(self) -> None:
         for server in server_manager.read_state().get("servers", []):
-            if server.get("pid") and server_manager.pid_is_running(server["pid"]):
-                server_manager.stop_server(server_id=server["id"])
+            pid = server.get("pid")
+            if pid and server_manager.pid_is_running(pid):
+                if not server_manager.stop_server(server_id=server["id"]).get("success"):
+                    os.kill(int(pid), signal.SIGTERM)
         for p in self.procs:
             if p.poll() is None:
                 p.kill()
