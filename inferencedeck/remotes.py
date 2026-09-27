@@ -14,6 +14,9 @@ from .paths import config_dir
 LANE_REMOTE_HOST = "remote_host"
 LANE_TRUE_CLOUD = "true_cloud"
 VALID_LANES = {LANE_REMOTE_HOST, LANE_TRUE_CLOUD}
+# Providers that are always someone's own server, so a config without a lane
+# is treated as remote_host (and may omit apiKeyEnv).
+SELF_HOSTED_PROVIDERS = {"llamacpp", "ollama"}
 
 # Transport is how requests reach the endpoint, independent of the lane (who
 # runs the model). A self-hosted llama.cpp on another box is remote_host
@@ -138,7 +141,7 @@ def _parse(path: Path) -> RemoteEndpoint:
     api_key_env = str(data.get("apiKeyEnv") or "").strip()
     display_name = str(data.get("displayName") or model or path.stem).strip()
     raw_enabled = data.get("enabled", False)
-    lane = str(data.get("lane") or (LANE_REMOTE_HOST if provider == "llamacpp" else LANE_TRUE_CLOUD)).strip().lower()
+    lane = str(data.get("lane") or (LANE_REMOTE_HOST if provider in SELF_HOSTED_PROVIDERS else LANE_TRUE_CLOUD)).strip().lower()
     error = ""
     if "apiKey" in data or "api_key" in data:
         error = "API keys must not be stored in endpoint configuration"
