@@ -112,6 +112,22 @@ class GenerateSingleLaunchScriptTests(_IsolatedDirs):
         self.assertIsNotNone(parsed)
         self.assertTrue(parsed.replace("\\", "/").endswith("models/Tiny-1B-Q8_0.gguf".replace("/", os.sep).replace("\\", "/")) or parsed.endswith("Tiny-1B-Q8_0.gguf"))
 
+    def test_ps1_escapes_apostrophes_in_paths(self) -> None:
+        model_path = self._seed_model("O'Brien's-1B-Q8_0.gguf")
+        payload = generate_launch_script(
+            mode="obrien",
+            model_path=str(model_path),
+            params={"ctx_size": 4096},
+            project_root=self.project_root,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        model_line = next(line for line in ps1.splitlines() if line.startswith("$model ="))
+        # Every ' inside the quoted value is doubled, so the string can't end early.
+        self.assertIn("O''Brien''s-1B-Q8_0.gguf'", model_line)
+        self.assertNotIn("O'Brien", model_line.replace("''", ""))
+        parsed = _parse_model_path(Path(payload["ps1_path"]))
+        self.assertTrue(parsed.endswith("O'Brien's-1B-Q8_0.gguf"))
+
     def test_overwrite_false_skips_existing(self) -> None:
         model_path = self._seed_model("Tiny-1B-Q8_0.gguf")
         first = generate_launch_script(
