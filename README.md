@@ -18,7 +18,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
 - Generate portable launch scripts without overwriting hand-written scripts.
-- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`).
+- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`), optionally loading the profile each request names.
 
 ### Frontends
 
@@ -347,7 +347,8 @@ inferencedeck-gateway --host 127.0.0.1 --port 8717
 The gateway gives applications one stable inference API, whatever is serving the model. It sends each request to the current target:
 
 1. the enabled remote/cloud endpoint, if there is one;
-2. otherwise the running (not paused) local server.
+2. otherwise the running (not paused) local server the request's `model` names (a profile's mode);
+3. otherwise the running local server, so clients that always send a fixed name such as `gpt-4o` keep working.
 
 The app keeps the same URL whether the model is on this machine, on another box over Tailscale, or on OpenRouter.
 
@@ -355,7 +356,7 @@ The app keeps the same URL whether the model is on this machine, on another box 
 |---|---|
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | Anthropic Messages | `POST /v1/messages` |
-| Model list (the current target) | `GET /v1/models` |
+| Model list (loaded models, plus every profile when switching is on) | `GET /v1/models` |
 
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
@@ -383,6 +384,35 @@ There are two engine adapters:
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+### Switching models on demand
+
+```bash
+inferencedeck-gateway --switch-models   # or "gateway_model_switching": true in config.json
+```
+
+With switching on, a request can name any launchable profile, by its mode, display name
+or `alias`, and the gateway loads it, as Ollama does. A client can move between models
+just by changing `model`:
+
+1. every other running local server is released (stopped; its settings are kept, so
+   Restore in the web UI or tray brings it back);
+2. the named profile is resumed if paused, restored if released, or started;
+3. the request is answered once the server reports ready.
+
+Only one model is loaded at a time, since profiles usually share the GPU and the
+default port. Switches are serialized: concurrent requests for the same model load it
+once. Before releasing a server, the gateway waits up to two minutes for requests it
+is still answering from that server, including streams. It can't see clients that
+talk to `llama-server` directly.
+
+The gateway does not start processes itself. Like the trays, it asks the
+`inferencedeck-web` control API at `INFERENCEDECK_URL` (default
+`http://127.0.0.1:8716`, with `INFERENCEDECK_TOKEN` when set), so that process remains
+the only owner of server state. If the control API can't be reached, a switch fails
+with a 503 that says so. A model name that matches no profile is not an error: it goes
+to the running server as before. While a remote endpoint is enabled it serves every
+request and no local model is loaded.
 
 The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
 

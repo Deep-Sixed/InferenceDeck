@@ -193,7 +193,7 @@ class GatewayServerTests(unittest.TestCase):
         self.start_gateway(AuthState(token=""))
 
     def start_gateway(self, auth: AuthState) -> None:
-        def resolve() -> Target:
+        def resolve(model: str | None = None) -> Target:
             if self.target is None:
                 raise GatewayError(503, "no inference target", "overloaded")
             return self.target
@@ -446,7 +446,7 @@ class OllamaGatewayTests(unittest.TestCase):
         self.addCleanup(upstream.shutdown)
         engine = OllamaEngine(f"http://127.0.0.1:{upstream.server_address[1]}", model="qwen3:32b")
         self.target = Target(engine, "Remote Ollama", "qwen3:32b")
-        gateway = make_server("127.0.0.1", 0, AuthState(token=""), lambda: self.target)
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""), lambda model=None: self.target)
         threading.Thread(target=gateway.serve_forever, daemon=True).start()
         self.addCleanup(gateway.server_close)
         self.addCleanup(gateway.shutdown)

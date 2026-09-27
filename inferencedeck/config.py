@@ -42,6 +42,8 @@ class AppConfig:
     server_history_limit: int = 5
     auto_generate_launch_scripts: bool = True
     auto_scan_on_startup: bool = True
+    # Gateway loads the profile a request's model names, releasing the loaded one.
+    gateway_model_switching: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

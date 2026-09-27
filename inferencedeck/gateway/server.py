@@ -3,8 +3,11 @@
 Endpoints:
   POST /v1/chat/completions  OpenAI Chat Completions
   POST /v1/messages          Anthropic Messages
-  GET  /v1/models            the model currently routed to
+  GET  /v1/models            the loaded model(s), plus every profile when switching is on
   GET  /healthz
+
+A request's ``model`` picks the local server it names; ``--switch-models`` (or
+``gateway_model_switching`` in config) also loads a named profile on demand.
 
 Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
@@ -24,9 +27,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from ..config import AppConfig
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
-from .router import Target, resolve_target
+from .router import Target, list_models, resolve_target
+from .switching import ModelSwitcher
 
 DEFAULT_PORT = 8717
 MAX_BODY_BYTES = 32 * 1024 * 1024  # room for inline images
@@ -60,7 +65,8 @@ APIS = {
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     auth_state = AuthState()
-    resolve: Callable[[], Target] = staticmethod(resolve_target)
+    resolve: Callable[[str | None], Target] = staticmethod(resolve_target)
+    models: Callable[[], list[dict[str, Any]]] = staticmethod(list_models)
     server_version = "InferenceDeckGateway/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -97,19 +103,25 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_stream(self, chunks: Iterator[bytes]) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
+    def _send_stream(self, chunks: Iterator[bytes], lease: Any = None) -> None:
         try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
             for chunk in chunks:
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; closing the generator closes the upstream
+        finally:
+            close = getattr(chunks, "close", None)
+            if close is not None:
+                close()
+            if lease is not None:
+                lease.__exit__(None, None, None)
 
     def _guard(self, render_error: Callable[[GatewayError], Any]) -> bool:
         if not self._host_ok():
@@ -153,13 +165,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._guard(openai_api.render_error):
             return
         if path == "/v1/models":
-            try:
-                target = self.resolve()
-            except GatewayError:
-                self._send(HTTPStatus.OK, {"object": "list", "data": []})
-                return
             self._send(HTTPStatus.OK, {"object": "list", "data": [
-                {"id": target.model_id, "object": "model", "owned_by": "inferencedeck", "description": target.label},
+                {"id": m["id"], "object": "model", "owned_by": "inferencedeck",
+                 "description": m["description"], "loaded": m["loaded"]}
+                for m in self.models()
             ]})
         else:
             self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
@@ -175,29 +184,54 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._body()
             request: ChatRequest = api.parse(body)
-            target = self.resolve()
+            target = self.resolve(request.model or None)
             model = request.model or target.model_id
-            if request.stream:
-                events = target.engine.stream(request)
-                self._send_stream(api.render_stream(events, model, body))
-            else:
-                result = target.engine.complete(request)
-                # Report the model the client asked for, so aliases stay stable.
-                result.model = model
-                self._send(HTTPStatus.OK, api.render_result(result))
+            # The lease tells a model switch this server is still busy; for a
+            # stream it is held until the last chunk is written.
+            lease = target.lease()
+            lease.__enter__()
+            try:
+                if request.stream:
+                    events = target.engine.stream(request)
+                    stream_lease, lease = lease, None
+                    self._send_stream(api.render_stream(events, model, body), stream_lease)
+                else:
+                    result = target.engine.complete(request)
+                    # Report the model the client asked for, so aliases stay stable.
+                    result.model = model
+                    self._send(HTTPStatus.OK, api.render_result(result))
+            finally:
+                if lease is not None:
+                    lease.__exit__(None, None, None)
         except GatewayError as exc:
             self._send(exc.status, api.render_error(exc))
         except Exception as exc:  # pragma: no cover - last-resort guard
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, api.render_error(GatewayError(500, str(exc))))
 
 
+def _models_from(resolve: Callable[[str | None], Target]) -> Callable[[], list[dict[str, Any]]]:
+    def models() -> list[dict[str, Any]]:
+        try:
+            target = resolve(None)
+        except GatewayError:
+            return []
+        return [{"id": target.model_id, "description": target.label, "loaded": True}]
+    return models
+
+
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
-                resolve: Callable[[], Target] | None = None) -> ThreadingHTTPServer:
+                resolve: Callable[[str | None], Target] | None = None,
+                switcher: ModelSwitcher | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     attrs: dict[str, Any] = {"auth_state": auth}
     if resolve is not None:
         attrs["resolve"] = staticmethod(resolve)
+        attrs["models"] = staticmethod(_models_from(resolve))
+    elif switcher is not None:
+        attrs["resolve"] = staticmethod(lambda model=None: resolve_target(model, switcher))
+    if switcher is not None:
+        attrs["models"] = staticmethod(lambda: list_models(switcher))
     handler = type("BoundGatewayRequestHandler", (GatewayRequestHandler,), attrs)
     return ThreadingHTTPServer((host, port), handler)
 
@@ -206,8 +240,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="InferenceDeck API-mapping gateway (OpenAI and Anthropic APIs)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--switch-models", action=argparse.BooleanOptionalAction, default=None,
+        help="Load the profile a request's model names, releasing the loaded one "
+             "(needs inferencedeck-web; default: gateway_model_switching in config).",
+    )
     args = parser.parse_args()
-    make_server(args.host, args.port).serve_forever()
+    switching = AppConfig.load().gateway_model_switching if args.switch_models is None else args.switch_models
+    make_server(args.host, args.port, switcher=ModelSwitcher() if switching else None).serve_forever()
     return 0
 
 
