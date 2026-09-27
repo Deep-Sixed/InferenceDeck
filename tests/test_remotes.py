@@ -101,3 +101,39 @@ class EndpointLocationTests(unittest.TestCase):
         self.assertTrue(configs)
         for cfg in configs:
             self.assertTrue(cfg.valid, f"{cfg.name}: {cfg.error}")
+
+
+class OptionalKeyTests(unittest.TestCase):
+    def _root(self, tmp: str, **fields) -> Path:
+        root = Path(tmp)
+        (root / "ep.json").write_text(json.dumps({"baseUrl": "http://thanatos:8080/v1", **fields}))
+        return root
+
+    def test_remote_host_without_key_is_selectable_and_enables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host")
+            cfg = list_endpoints(root)[0]
+            self.assertTrue(cfg.valid, cfg.error)
+            self.assertFalse(cfg.key_required)
+            self.assertTrue(cfg.selectable)
+            self.assertFalse(cfg.to_dict()["key_required"])
+            self.assertTrue(enable_endpoint("ep", root).enabled)
+
+    def test_remote_host_with_named_key_still_requires_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host", apiKeyEnv="UNSET_TEST_KEY_VAR")
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("UNSET_TEST_KEY_VAR", None)
+                self.assertFalse(list_endpoints(root)[0].selectable)
+                with self.assertRaises(ValueError):
+                    enable_endpoint("ep", root)
+
+    def test_cloud_without_key_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="openrouter", lane="true_cloud")
+            cfg = list_endpoints(root)[0]
+            self.assertFalse(cfg.valid)
+            self.assertIn("apiKeyEnv", cfg.error)
+            # A config with no lane falls back to true_cloud unless it is llama.cpp.
+            (Path(tmp) / "ep.json").write_text(json.dumps({"provider": "openai", "baseUrl": "https://x/v1"}))
+            self.assertFalse(list_endpoints(root)[0].valid)

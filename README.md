@@ -37,7 +37,7 @@ How requests reach the endpoint is a separate, optional `transport` field: `tail
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
-Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`.
+Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` is required for `true_cloud` endpoints and optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
 
 ### Web/control authentication
 

@@ -61,12 +61,18 @@ class RemoteEndpoint:
         return self.path.stem
 
     @property
+    def key_required(self) -> bool:
+        # Cloud endpoints always name a key variable; a self-hosted endpoint
+        # (e.g. llama-server without --api-key on a tailnet) may omit it.
+        return bool(self.api_key_env)
+
+    @property
     def key_present(self) -> bool:
-        return bool(self.api_key_env) and bool(os.environ.get(self.api_key_env, "").strip())
+        return self.key_required and bool(os.environ.get(self.api_key_env, "").strip())
 
     @property
     def selectable(self) -> bool:
-        return self.valid and self.key_present
+        return self.valid and (self.key_present or not self.key_required)
 
     @property
     def summary(self) -> str:
@@ -84,6 +90,7 @@ class RemoteEndpoint:
         payload["path"] = str(self.path)
         payload["name"] = self.name
         payload["summary"] = self.summary
+        payload["key_required"] = self.key_required
         payload["key_present"] = self.key_present
         payload["selectable"] = self.selectable
         # Never serialize the actual environment value.
@@ -138,10 +145,10 @@ def _parse(path: Path) -> RemoteEndpoint:
         error = "enabled must be true/false"
     elif not base_url:
         error = "baseUrl is required"
-    elif not api_key_env:
-        error = "apiKeyEnv is required"
     elif lane not in VALID_LANES:
         error = "lane must be remote_host or true_cloud"
+    elif not api_key_env and lane != LANE_REMOTE_HOST:
+        error = "apiKeyEnv is required for true_cloud endpoints"
     transport = str(data.get("transport") or "").strip().lower()
     if transport and transport not in VALID_TRANSPORTS:
         error = error or "transport must be tailscale, lan or https"
@@ -201,7 +208,7 @@ def enable_endpoint(name: str, directory: Path | None = None) -> RemoteEndpoint:
         raise ValueError(f"Unknown remote endpoint: {name}")
     if not target.valid:
         raise ValueError(f"Invalid endpoint {name}: {target.error}")
-    if not target.key_present:
+    if target.key_required and not target.key_present:
         raise ValueError(f"{target.display_name}: set ${target.api_key_env} before enabling")
     for cfg in configs:
         desired = cfg.name == name
