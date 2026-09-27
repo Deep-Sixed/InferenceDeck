@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>InferenceDeck</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header><strong>InferenceDeck</strong><span id="api-state">connecting…</span></header>
+<main>
+  <section class="card">
+    <h2>Status</h2>
+    <div id="status" class="muted">Loading…</div>
+    <div id="server-actions"></div>
+  </section>
+  <section class="card">
+    <h2>Profiles</h2>
+    <div id="profiles" class="list"></div>
+  </section>
+  <section class="card">
+    <h2>Tracked servers</h2>
+    <div id="servers" class="list"></div>
+  </section>
+  <section class="card">
+    <h2>Active command</h2>
+    <pre id="command">—</pre>
+  </section>
+  <section class="card">
+    <h2>Runtime inventory</h2>
+    <div id="inventory" class="muted">Loading…</div>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+<script src="/app.js"></script>
+</body>
+</html>
