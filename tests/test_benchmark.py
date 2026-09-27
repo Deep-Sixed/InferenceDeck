@@ -74,6 +74,7 @@ class RunProfileBenchmarkTests(unittest.TestCase):
         with mock.patch.object(benchmark, "list_servers", return_value=[]), \
                 mock.patch.object(server_manager, "prepare_launch_command", return_value=prepared), \
                 mock.patch.object(server_manager.subprocess, "Popen", return_value=mock.Mock(pid=424242)), \
+                mock.patch.object(server_manager, "process_identity", return_value=None), \
                 mock.patch.object(server_manager, "wait_until_ready", side_effect=fake_wait), \
                 mock.patch.object(benchmark.urllib.request, "urlopen", side_effect=_fake_urlopen):
             benchmark.run_profile_benchmark("demo")
