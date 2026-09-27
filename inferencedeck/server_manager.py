@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .backends import detect_llama_cpp, detect_runtime
+from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
 from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .llama_args import LaunchCommand, build_llama_server_args
+from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
 from .proc import run as run_hidden
@@ -419,6 +420,11 @@ def _remove_server(server_id: str) -> None:
     _mutate_state(change)
 
 
+# vllm.cpp loads and warms the model before it binds, which takes noticeably
+# longer than llama-server (about 53 s cold for a 27B on its reference box).
+READY_TIMEOUT_SECONDS = {"llama.cpp": 45, "vllm.cpp": 180}
+
+
 def http_base(host: str | None, port: int) -> str:
     """``http://host:port`` for reaching a server bound to ``host`` from this machine.
 
@@ -485,18 +491,20 @@ def prepare_launch_command(
     params.setdefault("port", app_config.default_port)
 
     runtime = str(params.get("runtime") or "llama.cpp").strip() or "llama.cpp"
+    if runtime == "vllm.cpp":
+        return _prepare_vllm_cpp(resolved, params, app_config)
     if runtime != "llama.cpp":
         env = detect_runtime(runtime, root, config=app_config)
         if env is None:
             return {"success": False, "error": f"Unknown runtime: {runtime}"}
-        # llama.cpp is the only runtime wired into the launch path so far; report a
-        # clear error for the others instead of silently starting llama.cpp.
+        # Report a clear error for runtimes that aren't wired into the launch
+        # path instead of silently starting llama.cpp.
         return {
             "success": False,
             "error": (
                 f"{env.name} is selected but cannot be launched from here yet — "
-                "only llama.cpp is wired into Start/Fit. Switch the Runtime back to "
-                "llama.cpp to launch this profile."
+                f"only {' and '.join(LAUNCHABLE_RUNTIMES)} can be started. Switch the "
+                "profile's runtime to one of those to launch it."
             ),
             "environment": env.to_dict(),
             "profile": resolved.to_dict(),
@@ -515,11 +523,33 @@ def prepare_launch_command(
     warnings = resolved.warnings + command.warnings
     return {
         "success": True,
+        "runtime": "llama.cpp",
         "profile": resolved.to_dict(),
         "environment": llama.to_dict(),
         "command": command.to_dict(),
         "params": params,
         "warnings": warnings,
+    }
+
+
+def _prepare_vllm_cpp(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+    env = detect_vllm_cpp(config=app_config)
+    if not env.binary_path:
+        return {"success": False, "error": "vllm-server (vllm.cpp) was not found.", "environment": env.to_dict()}
+    command = build_vllm_cpp_server_args(
+        env.binary_path,
+        resolved.model["path"],
+        params,
+        extra_args=app_config.extra_vllm_cpp_args,
+    )
+    return {
+        "success": True,
+        "runtime": "vllm.cpp",
+        "profile": resolved.to_dict(),
+        "environment": env.to_dict(),
+        "command": command.to_dict(),
+        "params": params,
+        "warnings": resolved.warnings + command.warnings,
     }
 
 
@@ -530,11 +560,13 @@ def start_profile(
     overrides: dict[str, Any] | None = None,
     stop_existing: bool = False,
     wait_ready: bool = True,
-    ready_timeout_seconds: int = 45,
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
     if not prepared.get("success"):
         return prepared
+    if ready_timeout_seconds is None:
+        ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", 45)
 
     existing = _find_server(mode=mode)
     if existing and existing.get("running"):
@@ -586,6 +618,7 @@ def start_profile(
     server = {
         "id": server_id,
         "mode": mode,
+        "runtime": prepared.get("runtime") or "llama.cpp",
         "pid": proc.pid,
         "status": "starting",
         "running": True,

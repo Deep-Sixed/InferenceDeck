@@ -285,6 +285,12 @@ def run_fit_test(
     prepared = prepare_launch_command(mode, project_root=project_root, model_dirs=model_dirs, overrides=overrides)
     if not prepared.get("success"):
         return prepared
+    if prepared.get("runtime", "llama.cpp") != "llama.cpp":
+        return {
+            "success": False,
+            "error": f"Fit uses llama-fit-params, which only sizes llama.cpp profiles; this profile runs on {prepared['runtime']}.",
+            "prepared": prepared,
+        }
 
     fit_binary = prepared.get("environment", {}).get("details", {}).get("llama_fit_params")
     if not fit_binary or not Path(fit_binary).is_file():
