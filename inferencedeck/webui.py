@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ssl
 import sys
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
@@ -42,32 +43,57 @@ class WebRequestHandler(ControlRequestHandler):
         super().do_GET()
 
 
-def serve(
+def make_server(
     host: str = "127.0.0.1",
     port: int = 8716,
     control_plane: ControlPlane | None = None,
     auth_state: AuthState | None = None,
-) -> None:
+    certfile: str | None = None,
+    keyfile: str | None = None,
+) -> ThreadingHTTPServer:
+    """Build the server; with ``certfile`` it speaks HTTPS and marks the session cookie Secure."""
     auth = auth_state or AuthState()
     validate_bind_security(host, auth)
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
-    httpd = ThreadingHTTPServer((host, port), handler)
+    handler.secure_cookies = bool(certfile)
+    server = ThreadingHTTPServer((host, port), handler)
+    if certfile:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(certfile, keyfile or None)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    return server
+
+
+def serve(
+    host: str = "127.0.0.1",
+    port: int = 8716,
+    control_plane: ControlPlane | None = None,
+    auth_state: AuthState | None = None,
+    certfile: str | None = None,
+    keyfile: str | None = None,
+) -> None:
+    server = make_server(host, port, control_plane, auth_state, certfile, keyfile)
     # This process owns server state, so it is the one that releases idle servers.
     start_idle_monitor()
-    httpd.serve_forever()
+    server.serve_forever()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="InferenceDeck local web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8716)
+    parser.add_argument("--certfile", help="PEM certificate (with chain) to serve HTTPS; recommended for LAN/tailnet binds")
+    parser.add_argument("--keyfile", help="PEM private key, if not included in --certfile")
     parser.add_argument(
         "--check-config", action="store_true",
         help="Validate config.json, models.json and remote endpoints, print the result and exit.",
     )
     args = parser.parse_args()
+    if args.keyfile and not args.certfile:
+        parser.error("--keyfile needs --certfile")
     report = check_all()
     if args.check_config:
         print(format_report(report))
@@ -75,7 +101,7 @@ def main() -> int:
     if report["errors"] or report["warnings"]:
         # A broken config.json silently falls back to defaults, so say so up front.
         print(format_report(report), file=sys.stderr)
-    serve(args.host, args.port)
+    serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile)
     return 0
 
 

@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .api_params import validate_overrides
-from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState
+from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState, client_address
 from .control import ControlPlane
 from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
 
@@ -23,6 +23,18 @@ MAX_BODY_BYTES = 1024 * 1024
 # Each live log stream holds a handler thread open; cap how many run at once.
 MAX_LOG_STREAMS = 8
 MAX_LOG_HISTORY_BYTES = 256 * 1024
+
+
+def _bounded_int(body: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    """An integer field clamped to [low, high]; anything else is a 400, not a 500."""
+    value = body.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be an integer") from None
+    return max(low, min(number, high))
 
 
 class ControlRequestHandler(BaseHTTPRequestHandler):
@@ -36,6 +48,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     log_check_seconds = 2.0
     # Streams end after this long; EventSource reconnects on its own.
     log_max_seconds = 3600.0
+    # Set when served over TLS, so the session cookie is never sent over plain HTTP.
+    secure_cookies = False
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -59,8 +73,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             name = host.rpartition(":")[0] if host.count(":") == 1 else host
         return name.lower() in LOOPBACK_HOSTS
 
+    def _cookie_attrs(self) -> str:
+        return "HttpOnly; SameSite=Strict; Path=/" + ("; Secure" if self.secure_cookies else "")
+
     def _client(self) -> str:
-        return str(self.client_address[0])
+        return client_address(
+            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
+        )
 
     def _throttled(self, retry_after: int) -> None:
         self._json(
@@ -198,7 +217,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"ok": True})
             return
         if parsed.path == "/api/auth":
-            self._json(HTTPStatus.OK, {"required": self.auth_state.enabled, "username": self.auth_state.username})
+            # Not the login name: that would hand an unauthenticated caller half the credentials.
+            self._json(HTTPStatus.OK, {"required": self.auth_state.enabled})
             return
         if not self._require_auth():
             return
@@ -230,6 +250,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.config_check())
             elif parsed.path == "/api/sampling":
                 self._json(HTTPStatus.OK, self.control_plane.sampling_presets())
+            elif parsed.path == "/api/updates":
+                refresh = (query.get("refresh") or ["0"])[0] in ("1", "true")
+                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=refresh))
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -274,11 +297,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     return
                 self.auth_state.record_success(client)
                 sid = self.auth_state.issue_session()
-                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECONDS}"])
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid={sid}; {self._cookie_attrs()}; Max-Age={SESSION_TTL_SECONDS}"])
                 return
             if parsed.path == "/api/logout":
                 self.auth_state.revoke_session(self._cookie("sid"))
-                self._json(HTTPStatus.OK, {"success": True}, cookies=["sid=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"])
+                self._json(HTTPStatus.OK, {"success": True}, cookies=[f"sid=; {self._cookie_attrs()}; Max-Age=0"])
                 return
             if not self._require_auth():
                 return
@@ -328,13 +351,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 payload = self.control_plane.fit(
                     str(body.get("mode") or ""),
                     validate_overrides(body.get("overrides")),
-                    target_mib=max(0, min(int(body.get("target_mib", 1024)), 65536)),
+                    target_mib=_bounded_int(body, "target_mib", 1024, 0, 65536),
                 )
             elif parsed.path == "/api/benchmark":
                 payload = self.control_plane.benchmark(
                     str(body.get("mode") or ""),
                     validate_overrides(body.get("overrides")),
-                    completion_tokens=max(16, min(int(body.get("completion_tokens", 128)), 2048)),
+                    completion_tokens=_bounded_int(body, "completion_tokens", 128, 16, 2048),
                 )
             elif parsed.path == "/api/runtime":
                 payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))

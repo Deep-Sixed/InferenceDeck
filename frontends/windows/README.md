@@ -24,7 +24,11 @@ On Windows `inferencedeck-tray.exe` is a GUI program (no console window). If
 
 Status · Open Web UI (also the tray icon's default click) · Start profile · Remote & cloud
 models · Pause / Resume · Release GPU / Restore · Reload & restart · Context size
-(8K-128K) · Stop / Forget released server · Copy active command · Exit.
+(8K-128K) · Stop / Forget released server · Copy active command · Runtime updates · Exit.
+
+**Runtime updates** says how many runtimes have a newer release, checked at startup and
+then hourly. Its submenu lists each one (clicking opens the GitHub release page) and has
+**Check now**. InferenceDeck never downloads or installs an update itself.
 
 The icon colour follows the state: green running, amber paused, grey idle or released,
 red when InferenceDeck can't be reached.
