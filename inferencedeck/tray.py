@@ -32,13 +32,13 @@ BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("
 TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 POLL_SECONDS = 5
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
-# Server-side waits: start waits for the model to load (up to 180 s for
-# vllm.cpp, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
+# Server-side waits: start waits for the model to load (up to 600 s for
+# MLC LLM, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
 # and launching it; stop allows 5 s for a clean exit plus 3 s after a forced
 # kill; restart does both. Each client timeout is the server's longest wait
 # plus a minute of headroom, so the tray never gives up on a start that is
 # still going to succeed.
-START_TIMEOUT_SECONDS = 240
+START_TIMEOUT_SECONDS = 660
 STOP_TIMEOUT_SECONDS = 20
 TIMEOUTS = {
     "start": START_TIMEOUT_SECONDS,

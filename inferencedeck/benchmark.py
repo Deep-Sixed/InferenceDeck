@@ -141,7 +141,7 @@ def run_profile_benchmark(
     restart: bool = False,
     stop_after: bool = False,
     # None: wait as long as this profile's runtime needs to load (see
-    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp takes far longer than llama.cpp).
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp and MLC LLM take far longer than llama.cpp).
     ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Time one chat completion against the profile's server.

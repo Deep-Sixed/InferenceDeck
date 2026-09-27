@@ -12,10 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_runtime, detect_vllm_cpp
+from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_mlc_llm, detect_runtime, detect_vllm_cpp
 from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .llama_args import LaunchCommand, build_llama_server_args
+from .mlc_llm_args import build_mlc_llm_serve_args
 from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
@@ -422,7 +423,8 @@ def _remove_server(server_id: str) -> None:
 
 # vllm.cpp loads and warms the model before it binds, which takes noticeably
 # longer than llama-server (about 53 s cold for a 27B on its reference box).
-READY_TIMEOUT_SECONDS = {"llama.cpp": 45, "vllm.cpp": 180}
+# MLC LLM may first download HF:// weights and JIT-compile a model library.
+READY_TIMEOUT_SECONDS = {"llama.cpp": 45, "vllm.cpp": 180, "mlc-llm": 600}
 
 
 def http_base(host: str | None, port: int) -> str:
@@ -493,6 +495,8 @@ def prepare_launch_command(
     runtime = str(params.get("runtime") or "llama.cpp").strip() or "llama.cpp"
     if runtime == "vllm.cpp":
         return _prepare_vllm_cpp(resolved, params, app_config)
+    if runtime == "mlc-llm":
+        return _prepare_mlc_llm(resolved, params, app_config)
     if runtime != "llama.cpp":
         env = detect_runtime(runtime, root, config=app_config)
         if env is None:
@@ -503,7 +507,7 @@ def prepare_launch_command(
             "success": False,
             "error": (
                 f"{env.name} is selected but cannot be launched from here yet — "
-                f"only {' and '.join(LAUNCHABLE_RUNTIMES)} can be started. Switch the "
+                f"only {', '.join(LAUNCHABLE_RUNTIMES)} can be started. Switch the "
                 "profile's runtime to one of those to launch it."
             ),
             "environment": env.to_dict(),
@@ -545,6 +549,28 @@ def _prepare_vllm_cpp(resolved: ResolvedProfile, params: dict[str, Any], app_con
     return {
         "success": True,
         "runtime": "vllm.cpp",
+        "profile": resolved.to_dict(),
+        "environment": env.to_dict(),
+        "command": command.to_dict(),
+        "params": params,
+        "warnings": resolved.warnings + command.warnings,
+    }
+
+
+def _prepare_mlc_llm(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+    env = detect_mlc_llm(config=app_config)
+    invocation = env.details.get("invocation")
+    if not invocation:
+        return {"success": False, "error": "MLC LLM (mlc_llm) was not found.", "environment": env.to_dict()}
+    command = build_mlc_llm_serve_args(
+        invocation,
+        resolved.model["path"],
+        params,
+        extra_args=app_config.extra_mlc_llm_args,
+    )
+    return {
+        "success": True,
+        "runtime": "mlc-llm",
         "profile": resolved.to_dict(),
         "environment": env.to_dict(),
         "command": command.to_dict(),
