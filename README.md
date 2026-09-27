@@ -140,7 +140,10 @@ asks GitHub again. Each update links to its GitHub release page.
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
-`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `default_host`, `default_port`
+and `server_history_limit` (see `inferencedeck/config.py` for the full list and defaults).
+Stopped servers stay listed, with their logs, as history; `server_history_limit` (default
+5) sets how many are kept before the oldest records and their log files are deleted.
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -304,6 +307,7 @@ The app keeps the same URL whether the model is on this machine, on another box 
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | Anthropic Messages | `POST /v1/messages` |
 | Model list (the current target) | `GET /v1/models` |
+| Health check (no token needed) | `GET /healthz` |
 
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
@@ -332,7 +336,9 @@ The Anthropic API's `thinking` setting is dropped, and its server tools (such as
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
-The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged.
+The gateway uses the same bind rule as the control API: loopback only, unless a token is set (`INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE`). With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`, or `X-Auth-Token`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled the same way as web logins (5 per 5 minutes per client address).
+
+The gateway serves plain HTTP only; it has no `--certfile` option. For use across a LAN, reach it over a tailnet or put it behind a TLS reverse proxy. The gateway does not read `INFERENCEDECK_TRUSTED_PROXIES`, so behind a proxy all clients share the proxy's throttle.
 
 ## Development
 
