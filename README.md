@@ -112,6 +112,11 @@ GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR
 root and working directory, common home folders (`~/models`, `~/llms`, …), LM Studio's
 model folders and the Hugging Face cache (`HF_HOME`). A whole drive is never scanned.
 
+Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` (or
+`LLAMA_SERVER_HOST`/`LLAMA_SERVER_PORT`), `OLLAMA_HOST`, `LMSTUDIO_HOST`, `VLLM_HOST` and
+`VLLM_CPP_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
+metadata requests when set.
+
 ## Choosing a llama.cpp build
 
 InferenceDeck picks the llama-server build this CPU can run:
@@ -156,7 +161,8 @@ The runtime is part of the profile and can't be switched over the control API.
 
 `vllm-server` is found at `vllm_cpp_server_path` in config, `VLLM_CPP_SERVER` /
 `VLLM_CPP_SERVER_BIN`, under `VLLM_CPP_HOME` or `runtime_dirs` (`bin/` of a release
-archive or `build/examples/` of a source build), or on `PATH`.
+archive or `build/examples/` of a source build), or on `PATH`. Discovery also probes a running vllm.cpp server at
+`VLLM_CPP_SERVER_URL` (default `http://127.0.0.1:8000`, the same port vLLM's probe uses).
 
 | Profile param | `vllm-server` flag |
 |---|---|
@@ -167,13 +173,14 @@ archive or `build/examples/` of a source build), or on `PATH`.
 | `reasoning` | `--enable-thinking` / `--no-enable-thinking` (unset: the chat template decides) |
 | `enable_prefix_caching` | `--enable-prefix-caching` / `--no-enable-prefix-caching` |
 | `speculative_config` | `--speculative-config` (JSON) |
-| `tool_call_parser`, `reasoning_parser`, `scheduling_policy`, `generation_config`, `mmproj` | the flag of the same name |
+| `tool_call_parser`, `reasoning_parser`, `scheduling_policy`, `generation_config`, `tokenizer_config`, `mmproj` | the flag of the same name |
 
 llama.cpp-only settings (`gpu_layers`, `threads`, `cache_type_k`, …) and sampling
 values (vllm-server takes those per request) produce a warning rather than a flag.
 Start, Stop, Pause, Release GPU, Restart, the Context presets and Benchmark work the
 same as for llama.cpp; Start waits up to 180 s for readiness. Fit needs
-`llama-fit-params` and stays llama.cpp-only.
+`llama-fit-params` and stays llama.cpp-only. Generated launch scripts are
+llama.cpp-only too: a vllm.cpp profile currently gets a `llama-server` script.
 
 ## Local control API and web UI
 
