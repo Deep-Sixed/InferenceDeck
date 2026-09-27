@@ -239,7 +239,7 @@ def _extract_kv_dims(reader, arch: str | None, n_layer: int | None) -> tuple[int
 # (keyed by size+mtime) survives restarts, so a profiles refresh never re-parses.
 _GGUF_META_CACHE_FILENAME = "gguf_meta_cache.json"
 _KV_META_CACHE_VERSION = 2  # bump when kv_dims computation changes to invalidate stale entries
-_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None]] = {}
+_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None, int | None]] = {}
 
 # Substrings that, in a GGUF chat template, indicate the model was trained to emit
 # tool calls (Qwen/Hermes use ``tool_call`` + a ``tools`` list; Mistral/Devstral use
@@ -285,7 +285,14 @@ def _load_meta_cache() -> dict[str, Any]:
         return {}
 
 
-def _store_meta_cache(model_path: str, sig: tuple[int, int], n_layer: int | None, kv_dims: tuple | None, supports_tools: bool | None) -> None:
+def _store_meta_cache(
+    model_path: str,
+    sig: tuple[int, int],
+    n_layer: int | None,
+    kv_dims: tuple | None,
+    supports_tools: bool | None,
+    n_ctx_train: int | None = None,
+) -> None:
     path = _meta_cache_file()
     if not path:
         return
@@ -299,6 +306,7 @@ def _store_meta_cache(model_path: str, sig: tuple[int, int], n_layer: int | None
             "n_layer": n_layer,
             "kv_dims": list(kv_dims) if kv_dims else None,
             "supports_tools": supports_tools,
+            "n_ctx_train": n_ctx_train,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -307,11 +315,12 @@ def _store_meta_cache(model_path: str, sig: tuple[int, int], n_layer: int | None
         pass
 
 
-def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | None]:
-    """One GGUF reader pass: (n_layer, kv_dims, supports_tools). Empty on failure.
+def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | None, int | None]:
+    """One GGUF reader pass: (n_layer, kv_dims, supports_tools, n_ctx_train). Empty on failure.
 
-    ``supports_tools`` reads ``tokenizer.chat_template`` from the same (slow) header
-    pass we already do for dims, so jinja detection adds no extra GGUF reads.
+    ``supports_tools`` reads ``tokenizer.chat_template`` and ``n_ctx_train`` reads
+    ``{arch}.context_length`` from the same (slow) header pass we already do for
+    dims, so neither adds an extra GGUF read.
     """
     try:
         import gguf as _gguf
@@ -323,50 +332,54 @@ def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | 
         kv_dims = _extract_kv_dims(reader, arch, n_layer)
         template = _gguf_field_value(reader.get_field("tokenizer.chat_template"))
         supports_tools = _template_supports_tools(template)
-        return (n_layer, kv_dims, supports_tools)
+        n_ctx_train = _gguf_field_value(reader.get_field(f"{arch}.context_length")) if arch else None
+        if not isinstance(n_ctx_train, int) or n_ctx_train <= 0:
+            n_ctx_train = None
+        return (n_layer, kv_dims, supports_tools, n_ctx_train)
     except Exception:
-        return (None, None, None)
+        return (None, None, None, None)
 
 
-def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple | None, bool | None]:
-    """Resolve (n_layer, kv_dims, supports_tools) for a GGUF via memory/disk cache.
+def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple | None, bool | None, int | None]:
+    """Resolve (n_layer, kv_dims, supports_tools, n_ctx_train) for a GGUF via memory/disk cache.
 
     When ``parse`` is False, never opens the GGUF — returns cached values or
-    ``(None, None, None)`` so callers (e.g. the profiles-list fit badge) stay fast
+    all ``None`` so callers (e.g. the profiles-list fit badge) stay fast
     and fall back to heuristics. When True, parses once on a miss and persists the
     result for every later process.
     """
     if not model_path:
-        return (None, None, None)
+        return (None, None, None, None)
     key = str(model_path)
     sig = _file_signature(key)
 
     mem = _gguf_meta_mem.get(key)
     if mem and sig and mem[0] == sig:
-        return (mem[1], mem[2], mem[3])
+        return mem[1:]
 
     if sig:
         disk = _load_meta_cache().get(key)
         if disk and disk.get("size") == sig[0] and disk.get("mtime") == sig[1]:
-            # Pre-jinja cache entries lack the tool flag; re-parse to backfill it
-            # when a parsing caller asks, otherwise serve the cached dims as-is.
-            if parse and "supports_tools" not in disk:
-                pass
-            else:
+            # Older cache entries lack the tool flag / trained context; re-parse to
+            # backfill them when a parsing caller asks, otherwise serve them as-is.
+            # Only complete entries are memoized, so a later probe can still backfill.
+            complete = "supports_tools" in disk and "n_ctx_train" in disk
+            if complete or not parse:
                 kv = tuple(disk["kv_dims"]) if disk.get("kv_dims") else None
-                tools = disk.get("supports_tools")
-                _gguf_meta_mem[key] = (sig, disk.get("n_layer"), kv, tools)
-                return (disk.get("n_layer"), kv, tools)
+                meta = (disk.get("n_layer"), kv, disk.get("supports_tools"), disk.get("n_ctx_train"))
+                if complete:
+                    _gguf_meta_mem[key] = (sig, *meta)
+                return meta
 
     if not parse:
         # Don't cache the negative: a later parse=True call must still read it.
-        return (None, None, None)
+        return (None, None, None, None)
 
-    n_layer, kv_dims, supports_tools = _parse_gguf_meta(key)
+    meta = _parse_gguf_meta(key)
     if sig:
-        _gguf_meta_mem[key] = (sig, n_layer, kv_dims, supports_tools)
-        _store_meta_cache(key, sig, n_layer, kv_dims, supports_tools)
-    return (n_layer, kv_dims, supports_tools)
+        _gguf_meta_mem[key] = (sig, *meta)
+        _store_meta_cache(key, sig, *meta)
+    return meta
 
 
 def _read_gguf_n_layer(model_path: str | None) -> int | None:
@@ -386,6 +399,31 @@ def model_supports_tools(model_path: str | None, probe: bool = True) -> bool | N
     ``probe`` False, never opens the GGUF (cache-only) so callers can stay fast.
     """
     return _gguf_meta(model_path, parse=probe)[2]
+
+
+def model_context_length(model: dict[str, Any] | str | None, probe: bool = False) -> int | None:
+    """The context length a model was trained for (GGUF ``{arch}.context_length``).
+
+    ``None`` when unknown. With ``probe`` False, never opens the GGUF (cache-only).
+    """
+    if isinstance(model, str):
+        path: str | None = model
+    elif model:
+        cached = _int_positive(model.get("n_ctx_train"))
+        if cached:
+            return cached
+        path = model.get("path") or model.get("model_path")
+    else:
+        path = None
+    return _gguf_meta(path, parse=probe)[3] if path else None
+
+
+def _int_positive(value: Any) -> int | None:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
 
 
 def recommend_jinja(model: dict[str, Any] | str | None, probe: bool = True) -> dict[str, Any]:
@@ -626,7 +664,12 @@ def estimate_memory_fit(
     hardware = hardware or {}
     model_size_mib = _model_size_mib(model) or 0.0
     params_b = _model_params_b(model) or 13.0
-    ctx = _float_or_none(params.get("ctx_size")) or 4096.0
+    n_ctx_train = model_context_length(model, probe=probe_model)
+    ctx = _float_or_none(params.get("ctx_size"))
+    if ctx == 0 and n_ctx_train:
+        # llama.cpp reads ``-c 0`` as "use the model's trained context".
+        ctx = float(n_ctx_train)
+    ctx = ctx or 4096.0
     batch = _float_or_none(params.get("batch_size")) or 512.0
     ubatch = _float_or_none(params.get("ubatch_size")) or min(batch, 512.0)
     layer_fraction = _layer_fraction(params, model)
@@ -708,6 +751,11 @@ def estimate_memory_fit(
         warnings.append("Accelerator memory capacity is unknown, so the fit badge is approximate.")
     if host_used_mib > 512 and ram_capacity_mib is None:
         warnings.append("Host RAM capacity is unknown, so CPU/offload pressure is not fully checked.")
+    if n_ctx_train and ctx > n_ctx_train:
+        warnings.append(
+            f"Context {int(ctx)} exceeds the model's trained context ({n_ctx_train}); "
+            "output quality usually degrades past it unless RoPE/YaRN scaling is configured."
+        )
 
     return {
         "status": status,
@@ -731,6 +779,7 @@ def estimate_memory_fit(
         },
         "inputs": {
             "ctx_size": int(ctx),
+            "n_ctx_train": n_ctx_train,
             "gpu_layer_fraction": round(layer_fraction, 2),
             "cache_type_k": params.get("cache_type_k"),
             "cache_type_v": params.get("cache_type_v"),
@@ -787,7 +836,10 @@ def estimate_tokens_per_second(
     cpu_decode = max(1.2, 9.0 * math.sqrt(max(float(logical_cores), 1.0)) / math.sqrt(max(model_params_b, 1.0)))
     blended = gpu_decode * (layer_fraction**1.35) + cpu_decode * (1.0 - layer_fraction)
 
-    ctx = _float_or_none(params.get("ctx_size")) or 4096
+    ctx = _float_or_none(params.get("ctx_size"))
+    if ctx == 0:
+        ctx = model_context_length(model)
+    ctx = ctx or 4096
     ctx_factor = max(0.72, 1.0 - min(ctx, 262144) / 262144 * 0.18)
     batch = _float_or_none(params.get("batch_size")) or 512
     ubatch = _float_or_none(params.get("ubatch_size")) or 512
