@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -21,7 +22,7 @@ def _sleeper() -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"], start_new_session=True)
 
 
-class LifecycleTests(unittest.TestCase):
+class _LifecycleBase(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -57,6 +58,7 @@ class LifecycleTests(unittest.TestCase):
 
         return calls, fake
 
+class LifecycleTests(_LifecycleBase):
     def test_release_stops_process_and_parks_restart_spec(self) -> None:
         sid = self._track(overrides={"ctx_size": 8192})
         pid = self.procs[-1].pid
@@ -129,6 +131,103 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(server_manager.pid_is_running(live_pid))
         self.assertEqual(server_manager._find_server(parked)["status"], server_manager.PARKED)
         self.assertIsNone(server_manager._find_server(live))
+
+
+class PidReuseTests(_LifecycleBase):
+    """A recorded PID now owned by another process is never treated as our server."""
+
+    def test_identity_is_stable_for_one_process(self) -> None:
+        proc = _sleeper()
+        self.procs.append(proc)
+        first = server_manager.process_identity(proc.pid)
+        self.assertIsNotNone(first)
+        self.assertEqual(first, server_manager.process_identity(proc.pid))
+
+    def _track_reused(self) -> tuple[str, subprocess.Popen]:
+        # A live process whose start time doesn't match the record: what a
+        # reused PID looks like after a reboot.
+        sid = self._track()
+        server_manager._update_server(sid, {"pid_identity": "another-process"})
+        return sid, self.procs[-1]
+
+    def test_reused_pid_is_not_running_and_is_pruned(self) -> None:
+        sid, _proc = self._track_reused()
+        self.assertIsNone(server_manager._find_server(sid))
+
+    def test_stop_never_kills_a_reused_pid(self) -> None:
+        sid, proc = self._track_reused()
+        server_manager.stop_server(server_id=sid)
+        self.assertIsNone(proc.poll())  # the unrelated process is still alive
+
+    def test_suspend_refuses_a_reused_pid(self) -> None:
+        _sid, proc = self._track_reused()
+        ok, _message = server_manager._set_process_suspended(proc.pid, True, "another-process")
+        self.assertFalse(ok)
+
+    def test_matching_identity_still_stops(self) -> None:
+        sid = self._track()
+        proc = self.procs[-1]
+        server_manager._update_server(sid, {"pid_identity": server_manager.process_identity(proc.pid)})
+        self.assertTrue(server_manager.stop_server(server_id=sid)["success"])
+        proc.wait(timeout=10)
+
+
+class StartLockTests(_LifecycleBase):
+    def _prepared(self, port: int = 18080) -> dict:
+        return {
+            "success": True,
+            "command": {"argv": [sys.executable, "-c", "import time;time.sleep(60)"], "cwd": None, "warnings": []},
+            "params": {"host": "127.0.0.1", "port": port},
+            "profile": {"model": None},
+            "warnings": [],
+        }
+
+    def _slow_popen(self):
+        real = subprocess.Popen
+
+        def popen(*args, **kwargs):
+            time.sleep(0.3)  # widen the window between the check and the record
+            proc = real(*args, **kwargs)
+            self.procs.append(proc)
+            return proc
+
+        return popen
+
+    def test_concurrent_starts_launch_one_server(self) -> None:
+        results: list[dict] = []
+        barrier = threading.Barrier(2)
+
+        def start() -> None:
+            barrier.wait()
+            results.append(server_manager.start_profile("qwen", wait_ready=False))
+
+        with mock.patch.object(server_manager, "prepare_launch_command", return_value=self._prepared()), \
+                mock.patch.object(server_manager.subprocess, "Popen", self._slow_popen()):
+            threads = [threading.Thread(target=start) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        self.assertEqual(sorted(r["success"] for r in results), [False, True], results)
+        self.assertEqual(len(self.procs), 1)
+
+    def test_start_refuses_port_used_by_another_tracked_server(self) -> None:
+        sid = self._track(mode="other")
+        server_manager._update_server(sid, {"host": "0.0.0.0", "port": 18080})
+        with mock.patch.object(server_manager, "prepare_launch_command", return_value=self._prepared(18080)), \
+                mock.patch.object(server_manager.subprocess, "Popen", self._slow_popen()):
+            result = server_manager.start_profile("qwen", wait_ready=False)
+        self.assertFalse(result["success"])
+        self.assertIn("18080", result["error"])
+        self.assertEqual(len(self.procs), 1)  # only the tracked "other" sleeper
+
+    def test_start_allows_a_different_port(self) -> None:
+        sid = self._track(mode="other")
+        server_manager._update_server(sid, {"host": "127.0.0.1", "port": 18080})
+        with mock.patch.object(server_manager, "prepare_launch_command", return_value=self._prepared(18081)), \
+                mock.patch.object(server_manager.subprocess, "Popen", self._slow_popen()):
+            result = server_manager.start_profile("qwen", wait_ready=False)
+        self.assertTrue(result["success"], result)
 
 
 class LifecycleApiTests(unittest.TestCase):
