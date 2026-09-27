@@ -27,10 +27,10 @@ SYNC_SECONDS = 5
 # trips the lockout that would also block the browser on this machine.
 AUTH_RETRY_SECONDS = 60
 AUTH_RETRY_MAX_SECONDS = 600
-# start waits for the model to load before replying: up to 180 s server-side
-# for vllm.cpp (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
+# start waits for the model to load before replying: up to 600 s server-side
+# for MLC LLM (server_manager.READY_TIMEOUT_SECONDS), plus a minute of headroom
 # for finding and launching the runtime.
-START_TIMEOUT_SECONDS = 240
+START_TIMEOUT_SECONDS = 660
 # stop allows 5 s for a clean exit plus 3 s after SIGKILL server-side.
 STOP_TIMEOUT_SECONDS = 20
 # restart stops and then starts, so it can take both.
@@ -284,7 +284,10 @@ class TrayApplication:
             endpoints = self.api.remotes().get("endpoints", [])
             for remote in endpoints:
                 suffix = " — active" if remote.get("enabled") else ("" if remote.get("selectable") else f" — set ${remote.get('api_key_env')}")
-                item = Gtk.CheckMenuItem(label=f"{remote.get('display_name') or remote.get('name')}{suffix}")
+                name = remote.get('display_name') or remote.get('name')
+                summary = remote.get('summary')
+                label = f"{name} ({summary})" if summary else f"{name}"
+                item = Gtk.CheckMenuItem(label=f"{label}{suffix}")
                 item.set_active(bool(remote.get("enabled")))
                 item.set_sensitive(bool(remote.get("enabled") or remote.get("selectable")))
                 item.connect("activate", self._toggle_remote, remote)

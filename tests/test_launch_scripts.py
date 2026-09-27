@@ -219,6 +219,55 @@ class VllmCppLaunchScriptTests(_IsolatedDirs):
         self.assertIn(f"& '{self.server_bin.as_posix()}' -m $model", scripts["tiny"])
         self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", scripts["qwen-vllm"])
 
+    def test_vllm_cpp_profile_appends_extra_vllm_cpp_args_only(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        config = AppConfig(
+            vllm_cpp_server_path=str(self.vllm_bin),
+            extra_llama_args=["--llama-only"],
+            extra_vllm_cpp_args=["--vllm-extra", "1"],
+        )
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={"runtime": "vllm.cpp", "ctx_size": 8192},
+            project_root=self.project_root,
+            config=config,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn("--vllm-extra 1", ps1)
+        self.assertNotIn("--llama-only", ps1)
+
+    def test_vllm_cpp_speculative_config_json_survives_rendering(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={
+                "runtime": "vllm.cpp",
+                "ctx_size": 8192,
+                "speculative_config": {"method": "mtp", "num_speculative_tokens": 2},
+            },
+            project_root=self.project_root,
+            config=self.config,
+        )
+        spec = '{"method": "mtp", "num_speculative_tokens": 2}'
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn(f"--speculative-config '{spec}'", ps1)
+        if not paths_module.is_windows():
+            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
+            self.assertIn(f"--speculative-config '{spec}'", sh)
+
+    def test_manifest_params_keep_vllm_cpp_keys(self) -> None:
+        params = {
+            "runtime": "vllm.cpp",
+            "ctx_size": 8192,
+            "max_num_seqs": 4,
+            "enable_prefix_caching": True,
+            "block_size": 32,
+            "kv_cache_dtype": "fp8",
+        }
+        self.assertEqual(launch_scripts_module._manifest_params(params), params)
+
 
 class ScanAllLaunchScriptsTests(_IsolatedDirs):
     def test_scan_creates_starter_script_for_newly_added_model(self) -> None:

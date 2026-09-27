@@ -36,13 +36,13 @@ POLL_SECONDS = 5
 AUTH_RETRY_SECONDS = 60
 AUTH_RETRY_MAX_SECONDS = 600
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
-# Server-side waits: start waits for the model to load (up to 180 s for
-# vllm.cpp, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
+# Server-side waits: start waits for the model to load (up to 600 s for
+# MLC LLM, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
 # and launching it; stop allows 5 s for a clean exit plus 3 s after a forced
 # kill; restart does both. Each client timeout is the server's longest wait
 # plus a minute of headroom, so the tray never gives up on a start that is
 # still going to succeed.
-START_TIMEOUT_SECONDS = 240
+START_TIMEOUT_SECONDS = 660
 STOP_TIMEOUT_SECONDS = 20
 TIMEOUTS = {
     "start": START_TIMEOUT_SECONDS,
@@ -347,6 +347,12 @@ def menu_text(text: str) -> str:
     return text.replace("&", "&&") if is_windows() else text
 
 
+def remote_label(remote: dict[str, Any]) -> str:
+    name = str(remote.get("display_name") or remote.get("name") or "")
+    summary = remote.get("summary")
+    return f"{name} ({summary})" if summary else name
+
+
 def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], None], quit_tray: Callable[[], None]):
     Item, Menu = pystray.MenuItem, pystray.Menu
     st = lambda: controller.state  # noqa: E731 - always read the latest state
@@ -381,7 +387,7 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         for r in st().remotes:
             suffix = " — active" if r.get("enabled") else "" if r.get("selectable") else f" — set ${r.get('api_key_env')}"
             yield Item(
-                menu_text(f"{r.get('display_name') or r.get('name')}{suffix}"),
+                menu_text(f"{remote_label(r)}{suffix}"),
                 remote_action(r),
                 checked=lambda _item, on=bool(r.get("enabled")): on,
                 enabled=bool(r.get("enabled") or r.get("selectable")),
