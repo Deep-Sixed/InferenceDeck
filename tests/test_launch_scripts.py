@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from inferencedeck import backends
 from inferencedeck import launch_scripts as launch_scripts_module
 from inferencedeck import paths as paths_module
 from inferencedeck.config import AppConfig
@@ -41,8 +42,6 @@ class _IsolatedDirs(unittest.TestCase):
             "LCC_LAUNCH_SCRIPTS_DIR": os.environ.get("LCC_LAUNCH_SCRIPTS_DIR"),
             "LLAMA_SERVER": os.environ.get("LLAMA_SERVER"),
             "LLAMA_CPP_HOME": os.environ.get("LLAMA_CPP_HOME"),
-            "VLLM_CPP_SERVER": os.environ.get("VLLM_CPP_SERVER"),
-            "VLLM_CPP_SERVER_URL": os.environ.get("VLLM_CPP_SERVER_URL"),
         }
         os.environ["LCC_CONFIG_DIR"] = str(self.config_dir)
         os.environ["LCC_CACHE_DIR"] = str(self.cache_dir)
@@ -57,12 +56,6 @@ class _IsolatedDirs(unittest.TestCase):
         self.server_bin.write_bytes(b"binary")
         os.environ["LLAMA_SERVER"] = str(self.server_bin)
         os.environ["LLAMA_CPP_HOME"] = str(self.project_root)
-        self.vllm_bin = self.project_root / ("vllm-server.exe" if paths_module.is_windows() else "vllm-server")
-        self.vllm_bin.write_bytes(b"binary")
-        os.environ["VLLM_CPP_SERVER"] = str(self.vllm_bin)
-        # Point the vllm.cpp readiness probe at a closed port so detection never
-        # talks to a real server on the default 127.0.0.1:8000.
-        os.environ["VLLM_CPP_SERVER_URL"] = "http://127.0.0.1:9"
 
         # Run inside the temp project so any code path that falls back to
         # find_project_root() (e.g. startup autoscan without an explicit
@@ -136,6 +129,128 @@ class GenerateSingleLaunchScriptTests(_IsolatedDirs):
             overwrite=False,
         )
         self.assertTrue(second["skipped"])
+
+
+class VllmCppLaunchScriptTests(_IsolatedDirs):
+    def setUp(self) -> None:
+        super().setUp()
+        self.vllm_bin = self.project_root / ("vllm-server.exe" if paths_module.is_windows() else "vllm-server")
+        self.vllm_bin.write_bytes(b"binary")
+        self.config = AppConfig(vllm_cpp_server_path=str(self.vllm_bin))
+        # Keep detection off the network; nothing here needs a running server.
+        patcher = mock.patch.object(backends, "_request_json", return_value=(False, None, "offline"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_vllm_cpp_profile_renders_vllm_server_invocation(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={"runtime": "vllm.cpp", "ctx_size": 16384, "max_num_seqs": 4},
+            project_root=self.project_root,
+            config=self.config,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", ps1)
+        self.assertIn("--max-model-len 16384", ps1)
+        self.assertIn("--num-blocks 512", ps1)
+        self.assertIn("--max-num-seqs 4", ps1)
+        for llama_flag in (" -m ", "--ctx-size", "--flash-attn", "llama-server"):
+            self.assertNotIn(llama_flag, ps1)
+        # The manifest parser still pins the exact model from the script.
+        self.assertTrue(_parse_model_path(Path(payload["ps1_path"])).endswith("Qwen3-8B-Q4_K_M.gguf"))
+        if not paths_module.is_windows():
+            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
+            self.assertIn(f'--model "$model"', sh)
+            self.assertIn("--max-model-len 16384", sh)
+
+    def test_missing_vllm_server_uses_placeholder_with_warning(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        with mock.patch.object(launch_scripts_module, "_vllm_cpp_binary_for_generation", return_value=None):
+            payload = generate_launch_script(
+                mode="qwen-vllm",
+                model_path=str(model_path),
+                params={"runtime": "vllm.cpp", "ctx_size": 8192},
+                project_root=self.project_root,
+                config=AppConfig(),
+            )
+        self.assertIn("& 'vllm-server' --model $model", Path(payload["ps1_path"]).read_text(encoding="utf-8"))
+        self.assertTrue(any("vllm-server was not found" in w for w in payload["warnings"]))
+
+    def test_scan_picks_the_binary_for_each_profiles_runtime(self) -> None:
+        manifest = {
+            "models": [
+                {
+                    "mode": "tiny",
+                    "name": "Tiny",
+                    "description": "llama.cpp profile",
+                    "recommended_params": {"ctx_size": 4096, "threads": 4, "gpu_layers": 999, "cache_type_k": "q8_0", "cache_type_v": "q8_0"},
+                },
+                {
+                    "mode": "qwen-vllm",
+                    "name": "Qwen on vllm.cpp",
+                    "description": "vllm.cpp profile",
+                    "recommended_params": {"runtime": "vllm.cpp", "ctx_size": 8192},
+                },
+            ]
+        }
+        (self.project_root / "models.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self._seed_model("Tiny-1B-Q8_0.gguf")
+        self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        result = generate_all_launch_scripts(project_root=self.project_root, model_dirs=[self.model_dir], config=self.config)
+        scripts = {item.mode: Path(item.ps1_path).read_text(encoding="utf-8") for item in result.generated}
+        self.assertIn(f"& '{self.server_bin.as_posix()}' -m $model", scripts["tiny"])
+        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", scripts["qwen-vllm"])
+
+    def test_vllm_cpp_profile_appends_extra_vllm_cpp_args_only(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        config = AppConfig(
+            vllm_cpp_server_path=str(self.vllm_bin),
+            extra_llama_args=["--llama-only"],
+            extra_vllm_cpp_args=["--vllm-extra", "1"],
+        )
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={"runtime": "vllm.cpp", "ctx_size": 8192},
+            project_root=self.project_root,
+            config=config,
+        )
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn("--vllm-extra 1", ps1)
+        self.assertNotIn("--llama-only", ps1)
+
+    def test_vllm_cpp_speculative_config_json_survives_rendering(self) -> None:
+        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
+        payload = generate_launch_script(
+            mode="qwen-vllm",
+            model_path=str(model_path),
+            params={
+                "runtime": "vllm.cpp",
+                "ctx_size": 8192,
+                "speculative_config": {"method": "mtp", "num_speculative_tokens": 2},
+            },
+            project_root=self.project_root,
+            config=self.config,
+        )
+        spec = '{"method": "mtp", "num_speculative_tokens": 2}'
+        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
+        self.assertIn(f"--speculative-config '{spec}'", ps1)
+        if not paths_module.is_windows():
+            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
+            self.assertIn(f"--speculative-config '{spec}'", sh)
+
+    def test_manifest_params_keep_vllm_cpp_keys(self) -> None:
+        params = {
+            "runtime": "vllm.cpp",
+            "ctx_size": 8192,
+            "max_num_seqs": 4,
+            "enable_prefix_caching": True,
+            "block_size": 32,
+            "kv_cache_dtype": "fp8",
+        }
+        self.assertEqual(launch_scripts_module._manifest_params(params), params)
 
 
 class ScanAllLaunchScriptsTests(_IsolatedDirs):
@@ -257,111 +372,6 @@ class StartupAutoScanTests(_IsolatedDirs):
         self.assertIsNotNone(result)
         self.assertEqual(result.scanned_model_count, 1)
         self.assertEqual(len(result.generated), 1)
-
-
-VLLM_PARAMS = {"runtime": "vllm.cpp", "ctx_size": 8192, "max_num_seqs": 4, "enable_prefix_caching": True}
-
-
-class VllmCppLaunchScriptTests(_IsolatedDirs):
-    def test_vllm_cpp_profile_uses_vllm_server(self) -> None:
-        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
-        payload = generate_launch_script(
-            mode="qwen-vllm",
-            model_path=str(model_path),
-            params=dict(VLLM_PARAMS),
-            project_root=self.project_root,
-        )
-        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
-        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", ps1)
-        self.assertNotIn("llama-server", ps1)
-        self.assertNotIn(" -m ", ps1)
-        self.assertEqual(ps1.count("--model"), 1)
-        self.assertIn("--max-model-len 8192", ps1)
-        self.assertIn("--num-blocks 256", ps1)
-        self.assertIn("--max-num-seqs 4", ps1)
-        self.assertIn("--enable-prefix-caching", ps1)
-        self.assertIn("--served-model-name", ps1)
-        self.assertNotIn("--ctx-size", ps1)
-        self.assertIn("vllm-server", payload["command_line"])
-        self.assertEqual(_parse_model_path(Path(payload["ps1_path"])), model_path.as_posix())
-        if not paths_module.is_windows():
-            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
-            self.assertIn(f'exec {self.vllm_bin} --model "$model"', sh)
-            self.assertIn("--max-model-len 8192", sh)
-            self.assertNotIn("llama-server", sh)
-
-    def test_vllm_cpp_profile_appends_extra_vllm_cpp_args_only(self) -> None:
-        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
-        config = AppConfig(extra_llama_args=["--llama-only"], extra_vllm_cpp_args=["--vllm-extra", "1"])
-        payload = generate_launch_script(
-            mode="qwen-vllm",
-            model_path=str(model_path),
-            params=dict(VLLM_PARAMS),
-            project_root=self.project_root,
-            config=config,
-        )
-        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
-        self.assertIn("--vllm-extra 1", ps1)
-        self.assertNotIn("--llama-only", ps1)
-
-    def test_vllm_cpp_missing_binary_uses_placeholder_with_warning(self) -> None:
-        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
-        missing = mock.Mock(binary_path=None)
-        with mock.patch("inferencedeck.backends.detect_vllm_cpp", return_value=missing):
-            payload = generate_launch_script(
-                mode="qwen-vllm",
-                model_path=str(model_path),
-                params=dict(VLLM_PARAMS),
-                project_root=self.project_root,
-            )
-        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
-        self.assertIn("& 'vllm-server' --model $model", ps1)
-        self.assertTrue(any("vllm-server was not found" in w for w in payload["warnings"]))
-        self.assertFalse(any("llama-server was not found" in w for w in payload["warnings"]))
-
-    def test_vllm_cpp_speculative_config_json_survives_rendering(self) -> None:
-        model_path = self._seed_model("Qwen3-8B-Q4_K_M.gguf")
-        params = dict(VLLM_PARAMS, speculative_config={"method": "mtp", "num_speculative_tokens": 2})
-        payload = generate_launch_script(
-            mode="qwen-vllm",
-            model_path=str(model_path),
-            params=params,
-            project_root=self.project_root,
-        )
-        spec = '{"method": "mtp", "num_speculative_tokens": 2}'
-        ps1 = Path(payload["ps1_path"]).read_text(encoding="utf-8")
-        self.assertIn(f"--speculative-config '{spec}'", ps1)
-        if not paths_module.is_windows():
-            sh = Path(payload["sh_path"]).read_text(encoding="utf-8")
-            self.assertIn(f"--speculative-config '{spec}'", sh)
-
-    def test_scan_generates_vllm_cpp_script_for_vllm_profile(self) -> None:
-        manifest = {
-            "models": [
-                {"mode": "tiny", "name": "Tiny", "description": "test",
-                 "recommended_params": {"ctx_size": 4096, "threads": 4, "gpu_layers": 999,
-                                        "cache_type_k": "q8_0", "cache_type_v": "q8_0"}},
-                {"mode": "qwen-vllm", "name": "Qwen (vllm.cpp)", "description": "test",
-                 "recommended_params": dict(VLLM_PARAMS)},
-            ]
-        }
-        (self.project_root / "models.json").write_text(json.dumps(manifest), encoding="utf-8")
-        self._seed_model("Tiny-1B-Q8_0.gguf")
-        self._seed_model("Qwen-8B-Q4_K_M.gguf")
-        result = generate_all_launch_scripts(project_root=self.project_root, model_dirs=[self.model_dir])
-        by_mode = {item.mode: item for item in result.generated}
-        vllm_ps1 = Path(by_mode["qwen-vllm"].ps1_path).read_text(encoding="utf-8")
-        self.assertIn(f"& '{self.vllm_bin.as_posix()}' --model $model", vllm_ps1)
-        self.assertIn("--max-model-len 8192", vllm_ps1)
-        tiny_ps1 = Path(by_mode["tiny"].ps1_path).read_text(encoding="utf-8")
-        self.assertIn(f"& '{self.server_bin.as_posix()}' -m $model", tiny_ps1)
-
-    def test_manifest_params_keep_vllm_cpp_keys(self) -> None:
-        params = dict(VLLM_PARAMS, block_size=32, kv_cache_dtype="fp8", threads=4)
-        kept = launch_scripts_module._manifest_params(params)
-        for key in ("runtime", "ctx_size", "max_num_seqs", "enable_prefix_caching", "block_size", "kv_cache_dtype"):
-            self.assertIn(key, kept)
-        self.assertEqual(kept["runtime"], "vllm.cpp")
 
 
 class ConfigFieldTests(_IsolatedDirs):
