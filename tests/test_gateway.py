@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import tempfile
@@ -14,7 +15,7 @@ from unittest import mock
 
 from inferencedeck.auth import AuthState
 from inferencedeck.gateway import anthropic_api, ollama_api, openai_api, router
-from inferencedeck.gateway.engines import OllamaEngine, OpenAICompatibleEngine
+from inferencedeck.gateway.engines import AnthropicEngine, OllamaEngine, OpenAICompatibleEngine
 from inferencedeck.gateway.ir import GatewayError, StreamEvent, Usage
 from inferencedeck.gateway.router import Target
 from inferencedeck.remotes import list_endpoints
@@ -235,6 +236,89 @@ class GatewayServerTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
+    def _broken_stream_target(self, released: list[bool]) -> Target:
+        class BrokenEngine:
+            api_base = "http://upstream.invalid/v1"
+
+            def stream(self, request):
+                def events():
+                    yield StreamEvent("text", text="Hel")
+                    # Not a GatewayError: e.g. an upstream chunk of an unexpected shape.
+                    raise AttributeError("'str' object has no attribute 'get'")
+                return events()
+
+        class Lease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                released.append(True)
+
+        return Target(BrokenEngine(), "broken", "m", lease=Lease)
+
+    def test_unexpected_stream_failure_is_reported_in_band(self) -> None:
+        chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        anthropic = {"model": "m", "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
+            with self.subTest(path=path):
+                released: list[bool] = []
+                self.target = self._broken_stream_target(released)
+                status, raw = self.post(path, body)
+                self.assertEqual(status, 200)
+                # One response only: no second status line written into the stream.
+                self.assertNotIn(b"HTTP/1.", raw)
+                self.assertIn(b"Hel", raw)
+                self.assertIn(b"upstream stream failed", raw)
+                self.assertEqual(released, [True])  # a model switch isn't left waiting on it
+
+    def test_trusted_proxy_throttles_each_gateway_client_separately(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+
+        def guess(client: str) -> int:
+            return self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": client})[0]
+
+        for _ in range(5):
+            self.assertEqual(guess("198.51.100.7"), 401)
+        self.assertEqual(guess("198.51.100.7"), 429)
+        self.assertEqual(guess("198.51.100.8"), 401)  # another user behind the proxy is not locked out
+
+    def test_untrusted_forwarded_for_cannot_dodge_the_gateway_throttle(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset()))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        for i in range(5):
+            self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": f"198.51.100.{i}"})
+        status, _raw = self.post("/v1/chat/completions", body,
+                                 {"Authorization": "Bearer wrong", "X-Forwarded-For": "198.51.100.99"})
+        self.assertEqual(status, 429)
+
+    def test_cross_site_style_posts_never_reach_upstream(self) -> None:
+        # What a web page can send without a CORS preflight: text/plain, or a form.
+        chat = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        anthropic = {"model": "qwen", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
+            for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"):
+                with self.subTest(path=path, content_type=content_type):
+                    status, raw = self.post(path, body, {"Content-Type": content_type})
+                    self.assertEqual(status, 415)
+                    self.assertIn("application/json", raw.decode())
+        # urllib's default for a body with no Content-Type is the form type.
+        request = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(chat).encode(), method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(ctx.exception.code, 415)
+        self.assertEqual(_FakeUpstream.received, [])
+
+    def test_json_with_a_charset_is_accepted(self) -> None:
+        status, _raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+                                 {"Content-Type": "application/json; charset=utf-8"})
+        self.assertEqual(status, 200)
+
+    def test_missing_token_is_401_before_the_content_type_check(self) -> None:
+        self.start_gateway(AuthState(token="secret"))
+        status, _raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": []}, {"Content-Type": "text/plain"})
+        self.assertEqual(status, 401)
+
     def test_openai_request_is_forwarded_with_server_side_key(self) -> None:
         status, raw = self.post("/v1/chat/completions", {"model": "qwen", "messages": [{"role": "user", "content": "hi"}],
                                                          "min_p": 0.1}, {"Authorization": "Bearer client-key"})
@@ -319,6 +403,64 @@ class GatewayServerTests(unittest.TestCase):
         self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
         status, _ = self.post("/v1/messages", {"max_tokens": 5, **body}, {"x-api-key": "s3cret"})
         self.assertEqual(status, 200)
+
+    def test_trusted_proxy_throttles_by_forwarded_client(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        attacker = {"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.5"}
+        for _ in range(5):
+            self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 429)
+        # Another client behind the same proxy has its own bucket.
+        other = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        self.assertEqual(self.post("/v1/chat/completions", body, other)[0], 200)
+
+    def test_forwarded_for_ignored_from_untrusted_peer(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset()))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for n in range(5):
+            headers = {"Authorization": "Bearer wrong", "X-Forwarded-For": f"203.0.113.{n}"}
+            self.assertEqual(self.post("/v1/chat/completions", body, headers)[0], 401)
+        # Rotating the header doesn't dodge the throttle: the peer address is the key.
+        fresh = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        status, raw = self.post("/v1/chat/completions", body, fresh)
+        self.assertEqual(status, 429)
+        self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
+    def test_valid_token_clears_earlier_failures(self) -> None:
+        self.start_gateway(AuthState(token="s3cret"))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for _ in range(4):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+        # One more typo later doesn't trip the lockout.
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+
+    def test_client_forwarded_for_line_cannot_dodge_the_throttle(self) -> None:
+        # A proxy that adds its own X-Forwarded-For line (HAProxy) leaves the
+        # client's forged line first; the throttle must key on the proxy's.
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        port = int(self.base.rsplit(":", 1)[1])
+        payload = json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode()
+
+        def guess(forged: str) -> int:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                conn.putrequest("POST", "/v1/chat/completions")
+                conn.putheader("Content-Type", "application/json")
+                conn.putheader("Content-Length", str(len(payload)))
+                conn.putheader("Authorization", "Bearer wrong")
+                conn.putheader("X-Forwarded-For", forged)
+                conn.putheader("X-Forwarded-For", "203.0.113.5")
+                conn.endheaders(payload)
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        for n in range(5):
+            self.assertEqual(guess(f"10.9.9.{n}"), 401)
+        self.assertEqual(guess("10.9.9.99"), 429)
 
     def test_non_loopback_bind_needs_token(self) -> None:
         with self.assertRaises(Exception):
@@ -638,6 +780,221 @@ class OllamaRoutingTests(unittest.TestCase):
             cfg = list_endpoints(Path(tmp))[0]
         self.assertEqual(cfg.lane, "remote_host")
         self.assertTrue(cfg.valid, cfg.error)
+
+
+
+class AnthropicEngineMappingTests(unittest.TestCase):
+    def _request(self, **extra: Any):
+        return openai_api.parse_request({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [{"type": "text", "text": "look"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}},
+                                             {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}}]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call.1", "type": "function", "function": {"name": "a", "arguments": '{"x":1}'}},
+                    {"id": "call.2", "type": "function", "function": {"name": "b", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call.1", "content": "one"},
+                {"role": "tool", "tool_call_id": "call.2", "content": "two"},
+                {"role": "user", "content": "and?"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "a", "parameters": {"type": "object"}}},
+                      {"type": "function", "function": {"name": "b"}}],
+            **extra,
+        })
+
+    def test_to_wire_shapes_a_valid_messages_request(self) -> None:
+        wire = anthropic_api.to_wire(self._request(
+            temperature=0.3, min_p=0.1, seed=7, repeat_penalty=1.1, stop="END", tool_choice="required",
+            response_format={"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}), "claude-opus-5")
+        self.assertEqual(wire["system"], "be brief")
+        self.assertEqual(wire["max_tokens"], anthropic_api.DEFAULT_MAX_TOKENS)
+        self.assertEqual([m["role"] for m in wire["messages"]], ["user", "assistant", "user"])
+        images = [b["source"] for b in wire["messages"][0]["content"] if b["type"] == "image"]
+        self.assertEqual(images, [{"type": "base64", "media_type": "image/jpeg", "data": "QUJD"},
+                                  {"type": "url", "url": "https://example.invalid/a.png"}])
+        # Empty assistant text is dropped; ids are made API-safe and stay paired.
+        self.assertEqual(wire["messages"][1]["content"], [
+            {"type": "tool_use", "id": "call_1", "name": "a", "input": {"x": 1}},
+            {"type": "tool_use", "id": "call_2", "name": "b", "input": {}}])
+        # Parallel tool results and the text after them share one user turn.
+        self.assertEqual(wire["messages"][2]["content"], [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "one"},
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "two"},
+            {"type": "text", "text": "and?"}])
+        self.assertEqual(wire["tool_choice"], {"type": "any"})
+        self.assertEqual(wire["stop_sequences"], ["END"])
+        self.assertEqual(wire["output_config"], {"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        self.assertEqual(wire["temperature"], 0.3)
+        # Fields the Messages API would reject are not sent.
+        for field in ("min_p", "seed", "repeat_penalty", "stop", "response_format"):
+            self.assertNotIn(field, wire)
+
+    def test_streaming_defaults_to_a_larger_max_tokens(self) -> None:
+        request = openai_api.parse_request({"messages": [{"role": "user", "content": "x"}], "stream": True})
+        self.assertEqual(anthropic_api.to_wire(request, "m")["max_tokens"], anthropic_api.DEFAULT_STREAM_MAX_TOKENS)
+        request = openai_api.parse_request({"messages": [{"role": "user", "content": "x"}], "max_tokens": 50})
+        self.assertEqual(anthropic_api.to_wire(request, "m")["max_tokens"], 50)
+
+    def test_from_wire_skips_thinking_and_totals_cached_input(self) -> None:
+        result = anthropic_api.from_wire({
+            "id": "msg_1", "model": "claude-opus-5", "stop_reason": "tool_use",
+            "content": [{"type": "thinking", "thinking": "", "signature": "s"},
+                        {"type": "text", "text": "Checking."},
+                        {"type": "tool_use", "id": "toolu_1", "name": "a", "input": {"x": 1}}],
+            "usage": {"input_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 10,
+                      "output_tokens": 7}}, "m")
+        self.assertEqual(result.text, "Checking.")
+        self.assertEqual((result.tool_calls[0].id, json.loads(result.tool_calls[0].arguments)), ("toolu_1", {"x": 1}))
+        self.assertEqual(result.finish_reason, "tool_calls")
+        self.assertEqual(result.usage, Usage(115, 7))
+        for reason, finish in (("max_tokens", "length"), ("refusal", "content_filter"),
+                               ("model_context_window_exceeded", "length"), ("stop_sequence", "stop")):
+            self.assertEqual(anthropic_api.from_wire({"stop_reason": reason, "content": []}, "m").finish_reason, finish)
+
+    def test_stream_events(self) -> None:
+        def sse(event: dict[str, Any]) -> list[bytes]:
+            return [f"event: {event['type']}\n".encode(), f"data: {json.dumps(event)}\n".encode(), b"\n"]
+        lines = [line for event in (
+            {"type": "message_start", "message": {"usage": {"input_tokens": 4, "output_tokens": 1}}},
+            {"type": "ping"},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}},
+            {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Hi"}},
+            {"type": "content_block_start", "index": 2,
+             "content_block": {"type": "tool_use", "id": "toolu_9", "name": "a", "input": {}}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": '{"x"'}},
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": ":1}"}},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 12}},
+            {"type": "message_stop"},
+        ) for line in sse(event)]
+        events = list(anthropic_api.stream_events(lines))
+        self.assertEqual([e.kind for e in events], ["text", "tool_call", "tool_call", "tool_call", "usage", "finish"])
+        self.assertEqual((events[1].tool_id, events[1].tool_name, events[1].index), ("toolu_9", "a", 0))
+        self.assertEqual(events[2].arguments + events[3].arguments, '{"x":1}')
+        self.assertEqual(events[4].usage, Usage(4, 12))
+        self.assertEqual(events[5].finish_reason, "tool_calls")
+        with self.assertRaises(GatewayError) as ctx:
+            list(anthropic_api.stream_events(sse({"type": "error",
+                                                  "error": {"type": "overloaded_error", "message": "Overloaded"}})))
+        self.assertEqual(ctx.exception.kind, "overloaded")
+
+
+class _FakeAnthropic(BaseHTTPRequestHandler):
+    received: list[dict[str, Any]] = []
+
+    def log_message(self, *args: Any) -> None:
+        return
+
+    def _json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        # Header names are case-insensitive (urllib sends "X-api-key"); compare lowercased.
+        headers = {name.lower(): value for name, value in self.headers.items()}
+        type(self).received.append({"path": self.path, "headers": headers, "body": body})
+        if body["model"] == "busy":
+            self._json(529, {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+            return
+        if body.get("stream"):
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            for event in (
+                {"type": "message_start", "message": {"id": "msg_s", "usage": {"input_tokens": 3, "output_tokens": 1}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}},
+                {"type": "message_stop"},
+            ):
+                self.wfile.write(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
+            return
+        self._json(200, {"id": "msg_1", "type": "message", "role": "assistant", "model": body["model"],
+                         "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                                      "input": {"city": "Oslo"}}],
+                         "stop_reason": "tool_use", "usage": {"input_tokens": 9, "output_tokens": 4}})
+
+
+class AnthropicGatewayTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _FakeAnthropic.received = []
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAnthropic)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        self.engine = AnthropicEngine(f"http://127.0.0.1:{upstream.server_address[1]}", model="claude-opus-5",
+                                      api_key="sk-ant-test")
+        self.target = Target(self.engine, "Claude (Anthropic · Cloud)", "claude-opus-5")
+        gateway = make_server("127.0.0.1", 0, AuthState(token=""), _StubRouter(lambda: self.target))
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.addCleanup(gateway.server_close)
+        self.addCleanup(gateway.shutdown)
+        self.base = f"http://127.0.0.1:{gateway.server_address[1]}"
+
+    post = GatewayServerTests.post
+
+    def test_openai_client_tool_call_through_anthropic(self) -> None:
+        status, raw = self.post("/v1/chat/completions", {
+            "model": "claude", "messages": [{"role": "user", "content": "weather in Oslo?"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+        }, {"Authorization": "Bearer client-key"})
+        self.assertEqual(status, 200)
+        choice = json.loads(raw)["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(choice["message"]["tool_calls"][0]["id"], "toolu_1")
+        self.assertEqual(json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]), {"city": "Oslo"})
+        sent = _FakeAnthropic.received[0]
+        self.assertEqual(sent["path"], "/v1/messages")
+        self.assertEqual(sent["headers"]["x-api-key"], "sk-ant-test")
+        self.assertEqual(sent["headers"]["anthropic-version"], "2023-06-01")
+        self.assertNotIn("authorization", sent["headers"])  # neither ours nor the client's
+        self.assertEqual(sent["body"]["model"], "claude-opus-5")
+        self.assertEqual(sent["body"]["tools"][0]["input_schema"], {"type": "object"})
+
+    def test_openai_streaming_through_anthropic(self) -> None:
+        status, raw = self.post("/v1/chat/completions", {"model": "claude", "stream": True,
+                                                         "stream_options": {"include_usage": True},
+                                                         "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200)
+        chunks = [d for _, d in _sse_events(raw) if isinstance(d, dict)]
+        text = "".join((c["choices"][0]["delta"].get("content") or "") for c in chunks if c.get("choices"))
+        self.assertEqual(text, "Hello")
+        self.assertEqual(chunks[-1]["usage"], {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+
+    def test_anthropic_client_through_anthropic_engine(self) -> None:
+        status, raw = self.post("/v1/messages", {"model": "claude", "max_tokens": 64, "system": "sys",
+                                                 "messages": [{"role": "user", "content": "weather?"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["content"][0]["input"], {"city": "Oslo"})
+        self.assertEqual(_FakeAnthropic.received[0]["body"]["system"], "sys")
+        self.assertEqual(_FakeAnthropic.received[0]["body"]["max_tokens"], 64)
+
+    def test_overloaded_529_becomes_503(self) -> None:
+        self.target = Target(AnthropicEngine(self.engine.api_base, model="busy"), "busy", "busy")
+        status, raw = self.post("/v1/messages", {"model": "busy", "max_tokens": 5,
+                                                 "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(raw)["error"]["type"], "overloaded_error")
+
+
+class AnthropicRoutingTests(unittest.TestCase):
+    def test_anthropic_endpoint_uses_messages_engine_at_api_root(self) -> None:
+        for url in ("https://api.anthropic.com", "https://api.anthropic.com/v1", "https://api.anthropic.com/v1/messages"):
+            with tempfile.TemporaryDirectory() as tmp:
+                _write_endpoints(Path(tmp), claude={"provider": "anthropic", "lane": "true_cloud", "enabled": True,
+                                                    "baseUrl": url, "model": "claude-opus-5",
+                                                    "apiKeyEnv": "ANTHROPIC_TEST_KEY"})
+                with mock.patch.dict(os.environ, {"ANTHROPIC_TEST_KEY": "k"}):
+                    target = router.Router(endpoints=lambda: list_endpoints(Path(tmp)), servers=lambda: []).resolve()
+            self.assertIsInstance(target.engine, AnthropicEngine)
+            self.assertEqual(target.engine.api_base, "https://api.anthropic.com", url)
+            self.assertEqual(target.engine.api_key, "k")
 
 
 if __name__ == "__main__":

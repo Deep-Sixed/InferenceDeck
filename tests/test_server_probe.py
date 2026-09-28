@@ -8,7 +8,7 @@ import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from inferencedeck import server_manager
-from inferencedeck.benchmark import response_metrics
+from inferencedeck.benchmark import _speed_metrics as response_metrics
 
 
 class _FakeServer:
@@ -136,21 +136,21 @@ class ResponseMetricsTests(unittest.TestCase):
         }
         metrics = response_metrics(payload, "x" * 400, elapsed=4.0)
         self.assertEqual(metrics["tokens_per_second"], 50.0)
-        self.assertEqual(metrics["tokens_per_second_source"], "timings")
-        self.assertEqual(metrics["wall_tokens_per_second"], 25.0)
+        self.assertEqual(metrics["timing_source"], "server")
+        self.assertEqual(metrics["end_to_end_tokens_per_second"], 25.0)
         self.assertEqual(metrics["prompt_tokens_per_second"], 1200.0)
-        self.assertEqual(metrics["prompt_tokens"], 480)
+        self.assertEqual(metrics["prompt_tokens"], 500)  # usage wins over timings for counts
         self.assertEqual(metrics["completion_tokens"], 100)
         self.assertEqual(metrics["cached_prompt_tokens"], 20)
-        self.assertEqual(metrics["prompt_ms"], 400.0)
-        self.assertEqual(metrics["generation_ms"], 2000.0)
+        self.assertEqual(metrics["prompt_seconds"], 0.4)
+        self.assertEqual(metrics["generation_seconds"], 2.0)
 
     def test_falls_back_to_wall_clock_without_timings(self) -> None:
         metrics = response_metrics({"usage": {"completion_tokens": 60, "prompt_tokens": 12}}, "hi", elapsed=3.0)
         self.assertEqual(metrics["tokens_per_second"], 20.0)
-        self.assertEqual(metrics["tokens_per_second_source"], "wall_clock")
+        self.assertEqual(metrics["timing_source"], "wall_clock")
         self.assertEqual(metrics["prompt_tokens"], 12)
-        self.assertNotIn("prompt_tokens_per_second", metrics)
+        self.assertIsNone(metrics["prompt_tokens_per_second"])
 
     def test_estimates_tokens_from_text_when_usage_missing(self) -> None:
         metrics = response_metrics({}, "a" * 40, elapsed=1.0)

@@ -307,7 +307,7 @@ def _nvidia_smi_gpus() -> list[dict[str, Any]]:
     result = _run(
         [
             binary,
-            "--query-gpu=index,name,memory.total,memory.free,driver_version,clocks.current.memory,clocks.max.memory",
+            "--query-gpu=index,name,memory.total,memory.free,driver_version,clocks.current.memory,clocks.max.memory,pci.bus_id",
             "--format=csv,noheader,nounits",
         ],
         timeout=2.5,
@@ -345,6 +345,7 @@ def _nvidia_smi_gpus() -> list[dict[str, Any]]:
                 "vram_data_rate_mts": data_rate,
                 "vram_bandwidth_gbps": vram_bandwidth_gbps,
                 "driver_version": driver_version,
+                "pci_bus_id": normalize_pci_bus_id(parts[7]) if len(parts) > 7 else None,
                 "backend": "nvidia-smi",
                 "vendor": "NVIDIA",
                 "integrated": False,
@@ -790,7 +791,8 @@ def _linux_lspci_gpus() -> list[dict[str, Any]]:
             continue
         vendor = _gpu_vendor(name)
         pci_addr = re.match(r"^([0-9a-fA-F:.]+)", line)
-        pci_bus = pci_addr.group(1).split(":")[0] if pci_addr else ""
+        # "01:00.0", or "0000:01:00.0" with a domain: the bus is the second-to-last field.
+        pci_bus = pci_addr.group(1).split(":")[-2] if pci_addr and ":" in pci_addr.group(1) else ""
         vram_total = None
         vram_info = _guess_vram_specs(name, vendor, "", "", "")
         vram_info["bus_width_bits"] = _linux_lspci_bus_width(pci_bus, name, vendor)
@@ -807,6 +809,7 @@ def _linux_lspci_gpus() -> list[dict[str, Any]]:
                 "vram_bus_width_bits": vram_info.get("bus_width_bits"),
                 "vram_bandwidth_gbps": vram_info.get("bandwidth_gbps"),
                 "driver_version": None,
+                "pci_bus_id": normalize_pci_bus_id(pci_addr.group(1)) if pci_addr else None,
                 "backend": "lspci",
                 "vendor": vendor,
                 "integrated": _gpu_integrated(name),
@@ -817,19 +820,72 @@ def _linux_lspci_gpus() -> list[dict[str, Any]]:
     return gpus
 
 
+_PCI_RE = re.compile(r"^(?:(?P<domain>[0-9a-fA-F]+):)?(?P<bus>[0-9a-fA-F]{1,2}):(?P<dev>[0-9a-fA-F]{1,2})\.(?P<fn>[0-7])$")
+# Words that differ between how drivers and OS listings spell the same card.
+_GPU_NAME_NOISE = {
+    "nvidia", "corporation", "corp", "amd", "ati", "advanced", "micro", "devices", "inc",
+    "intel", "apple", "graphics", "controller",
+}
+
+
+def normalize_pci_bus_id(value: Any) -> str | None:
+    """``00000000:01:00.0`` (nvidia-smi) and ``01:00.0`` (lspci) -> ``0000:01:00.0``."""
+    match = _PCI_RE.match(str(value or "").strip())
+    if not match:
+        return None
+    domain = int(match.group("domain") or "0", 16)
+    return f"{domain:04x}:{int(match.group('bus'), 16):02x}:{int(match.group('dev'), 16):02x}.{match.group('fn')}"
+
+
+def _gpu_name_key(gpu: dict[str, Any]) -> str:
+    """Comparable card name: lspci's bracketed marketing name when present, minus vendor words."""
+    name = str(gpu.get("name") or "")
+    bracketed = re.findall(r"\[([^\]]+)\]", name)
+    if bracketed:
+        name = bracketed[-1]
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t and t not in _GPU_NAME_NOISE]
+    return " ".join(tokens)
+
+
+def _same_card(primary: dict[str, Any], other: dict[str, Any]) -> bool:
+    if str(primary.get("vendor") or "").lower() != str(other.get("vendor") or "").lower():
+        return False
+    bus_a, bus_b = primary.get("pci_bus_id"), other.get("pci_bus_id")
+    if bus_a and bus_b:
+        return bus_a == bus_b
+    key = _gpu_name_key(primary)
+    return bool(key) and key == _gpu_name_key(other)
+
+
 def _dedupe_gpus(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
+    """Merge the driver's and the OS's listing of the same physical card.
+
+    ``gpus`` is ordered best source first (nvidia-smi, then the OS listing). Every
+    row within one source is its own device, so identical cards (two RTX 3090s)
+    are kept apart; a later source's row is dropped only when it matches a card an
+    earlier source already reported, by PCI address when both know it, else by
+    name. Each earlier card absorbs at most one duplicate.
+    """
+    kept: list[dict[str, Any]] = []
+    claimed: set[int] = set()
     for gpu in gpus:
-        name = str(gpu.get("name") or "").lower()
-        vendor = str(gpu.get("vendor") or "").lower()
-        key = re.sub(r"[^a-z0-9]+", "", f"{vendor}:{name}")
-        if not key or key in seen:
+        if not str(gpu.get("name") or "").strip():
             continue
-        seen.add(key)
-        gpu["index"] = len(deduped)
-        deduped.append(gpu)
-    return deduped
+        source = gpu.get("backend")
+        duplicate_of = next(
+            (
+                i for i, earlier in enumerate(kept)
+                if i not in claimed and earlier.get("backend") != source and _same_card(earlier, gpu)
+            ),
+            None,
+        )
+        if duplicate_of is not None:
+            claimed.add(duplicate_of)
+            continue
+        kept.append(gpu)
+    for index, gpu in enumerate(kept):
+        gpu["index"] = index
+    return kept
 
 
 def detect_gpus() -> list[dict[str, Any]]:

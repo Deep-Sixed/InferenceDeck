@@ -42,6 +42,7 @@
                   "llama.cpp",
                   "vllm.cpp",
                   "mlc-llm",
+                  "koboldcpp",
                   "wsl-llama.cpp",
                   "ollama",
                   "lm-studio",
@@ -145,6 +146,45 @@
               },
               "mmap": {
                 "type": "boolean"
+              },
+              "mlock": {
+                "type": "boolean"
+              },
+              "load_mode": {
+                "enum": [
+                  "auto",
+                  "dio",
+                  "mlock",
+                  "mmap",
+                  "mmap+mlock",
+                  "none"
+                ]
+              },
+              "numa": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "enum": [
+                      "distribute",
+                      "isolate",
+                      "numactl"
+                    ]
+                  }
+                ]
+              },
+              "split_mode": {
+                "enum": [
+                  "layer",
+                  "none",
+                  "row",
+                  "tensor"
+                ]
+              },
+              "main_gpu": {
+                "type": "integer",
+                "minimum": 0
               },
               "kv_offload": {
                 "type": "boolean"

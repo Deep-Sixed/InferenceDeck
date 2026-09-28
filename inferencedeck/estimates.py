@@ -239,7 +239,8 @@ def _extract_kv_dims(reader, arch: str | None, n_layer: int | None) -> tuple[int
 # (keyed by size+mtime) survives restarts, so a profiles refresh never re-parses.
 _GGUF_META_CACHE_FILENAME = "gguf_meta_cache.json"
 _KV_META_CACHE_VERSION = 2  # bump when kv_dims computation changes to invalidate stale entries
-_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None, dict[str, Any] | None]] = {}
+# path -> (signature, n_layer, kv_dims, supports_tools, n_ctx_train, info)
+_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]] = {}
 
 # Substrings that, in a GGUF chat template, indicate the model was trained to emit
 # tool calls (Qwen/Hermes use ``tool_call`` + a ``tools`` list; Mistral/Devstral use
@@ -291,6 +292,7 @@ def _store_meta_cache(
     n_layer: int | None,
     kv_dims: tuple | None,
     supports_tools: bool | None,
+    n_ctx_train: int | None = None,
     info: dict[str, Any] | None = None,
 ) -> None:
     path = _meta_cache_file()
@@ -306,6 +308,7 @@ def _store_meta_cache(
             "n_layer": n_layer,
             "kv_dims": list(kv_dims) if kv_dims else None,
             "supports_tools": supports_tools,
+            "n_ctx_train": n_ctx_train,
             "info": info,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -341,12 +344,14 @@ def _model_info(reader: Any, arch: str | None) -> dict[str, Any]:
     return info
 
 
-def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | None, dict[str, Any] | None]:
-    """One GGUF reader pass: (n_layer, kv_dims, supports_tools, info). Empty on failure.
+def _parse_gguf_meta(
+    model_path: str,
+) -> tuple[int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]:
+    """One GGUF reader pass: (n_layer, kv_dims, supports_tools, n_ctx_train, info). Empty on failure.
 
-    ``supports_tools`` reads ``tokenizer.chat_template`` and ``info`` the other
-    capability fields from the same (slow) header pass we already do for dims,
-    so neither adds extra GGUF reads.
+    ``supports_tools`` reads ``tokenizer.chat_template``, ``n_ctx_train`` reads
+    ``{arch}.context_length`` and ``info`` the other capability fields, all from
+    the same (slow) header pass we already do for dims, so none adds a GGUF read.
     """
     try:
         import gguf as _gguf
@@ -358,13 +363,17 @@ def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | 
         kv_dims = _extract_kv_dims(reader, arch, n_layer)
         template = _gguf_field_value(reader.get_field("tokenizer.chat_template"))
         supports_tools = _template_supports_tools(template)
-        return (n_layer, kv_dims, supports_tools, _model_info(reader, arch))
+        n_ctx_train = _gguf_field_value(reader.get_field(f"{arch}.context_length")) if arch else None
+        if not isinstance(n_ctx_train, int) or n_ctx_train <= 0:
+            n_ctx_train = None
+        return (n_layer, kv_dims, supports_tools, n_ctx_train, _model_info(reader, arch))
     except Exception:
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
 
-def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple | None, bool | None]:
-    return _gguf_meta_full(model_path, parse)[:3]  # type: ignore[return-value]
+def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple | None, bool | None, int | None]:
+    """(n_layer, kv_dims, supports_tools, n_ctx_train); see ``_gguf_meta_full``."""
+    return _gguf_meta_full(model_path, parse)[:4]  # type: ignore[return-value]
 
 
 def gguf_model_info(model_path: str | None, probe: bool = False) -> dict[str, Any] | None:
@@ -373,53 +382,53 @@ def gguf_model_info(model_path: str | None, probe: bool = False) -> dict[str, An
 
     With ``probe`` False, only cached values are returned and the GGUF is never opened.
     """
-    return _gguf_meta_full(model_path, probe)[3]
+    return _gguf_meta_full(model_path, probe)[4]
 
 
 def _gguf_meta_full(
     model_path: str | None, parse: bool
-) -> tuple[int | None, tuple | None, bool | None, dict[str, Any] | None]:
-    """Resolve (n_layer, kv_dims, supports_tools) for a GGUF via memory/disk cache.
+) -> tuple[int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]:
+    """Resolve (n_layer, kv_dims, supports_tools, n_ctx_train, info) for a GGUF via memory/disk cache.
 
     When ``parse`` is False, never opens the GGUF — returns cached values or
-    ``(None, None, None)`` so callers (e.g. the profiles-list fit badge) stay fast
+    all ``None`` so callers (e.g. the profiles-list fit badge) stay fast
     and fall back to heuristics. When True, parses once on a miss and persists the
     result for every later process.
     """
     if not model_path:
-        return (None, None, None, None)
+        return (None, None, None, None, None)
     key = str(model_path)
     sig = _file_signature(key)
 
     mem = _gguf_meta_mem.get(key)
     if mem and sig and mem[0] == sig:
-        return (mem[1], mem[2], mem[3], mem[4])
+        return mem[1:]
 
     if sig:
         disk = _load_meta_cache().get(key)
         if disk and disk.get("size") == sig[0] and disk.get("mtime") == sig[1]:
-            # Older cache entries lack the tool flag or capability info; re-parse
-            # to backfill them when a parsing caller asks, otherwise serve the
-            # cached values as-is.
-            if parse and ("supports_tools" not in disk or "info" not in disk):
-                pass
-            else:
+            # Older cache entries lack the tool flag, trained context or capability
+            # info; re-parse to backfill them when a parsing caller asks, otherwise
+            # serve them as-is. Only complete entries are memoized, so a later probe
+            # can still backfill.
+            complete = all(k in disk for k in ("supports_tools", "n_ctx_train", "info"))
+            if complete or not parse:
                 kv = tuple(disk["kv_dims"]) if disk.get("kv_dims") else None
-                tools = disk.get("supports_tools")
-                info = disk.get("info")
-                _gguf_meta_mem[key] = (sig, disk.get("n_layer"), kv, tools, info)
-                return (disk.get("n_layer"), kv, tools, info)
+                meta = (disk.get("n_layer"), kv, disk.get("supports_tools"), disk.get("n_ctx_train"), disk.get("info"))
+                if complete:
+                    _gguf_meta_mem[key] = (sig, *meta)
+                return meta
 
     if not parse:
         # Don't cache the negative: a later parse=True call must still read it.
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
-    # Padded so a parser returning only the first three fields still works.
-    n_layer, kv_dims, supports_tools, info = (tuple(_parse_gguf_meta(key)) + (None,) * 4)[:4]
+    # Padded so a parser returning fewer fields (older fakes in tests) still works.
+    meta = (tuple(_parse_gguf_meta(key)) + (None,) * 5)[:5]
     if sig:
-        _gguf_meta_mem[key] = (sig, n_layer, kv_dims, supports_tools, info)
-        _store_meta_cache(key, sig, n_layer, kv_dims, supports_tools, info)
-    return (n_layer, kv_dims, supports_tools, info)
+        _gguf_meta_mem[key] = (sig, *meta)
+        _store_meta_cache(key, sig, *meta)
+    return meta
 
 
 def _read_gguf_n_layer(model_path: str | None) -> int | None:
@@ -439,6 +448,31 @@ def model_supports_tools(model_path: str | None, probe: bool = True) -> bool | N
     ``probe`` False, never opens the GGUF (cache-only) so callers can stay fast.
     """
     return _gguf_meta(model_path, parse=probe)[2]
+
+
+def model_context_length(model: dict[str, Any] | str | None, probe: bool = False) -> int | None:
+    """The context length a model was trained for (GGUF ``{arch}.context_length``).
+
+    ``None`` when unknown. With ``probe`` False, never opens the GGUF (cache-only).
+    """
+    if isinstance(model, str):
+        path: str | None = model
+    elif model:
+        cached = _int_positive(model.get("n_ctx_train"))
+        if cached:
+            return cached
+        path = model.get("path") or model.get("model_path")
+    else:
+        path = None
+    return _gguf_meta(path, parse=probe)[3] if path else None
+
+
+def _int_positive(value: Any) -> int | None:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
 
 
 def recommend_jinja(model: dict[str, Any] | str | None, probe: bool = True) -> dict[str, Any]:
@@ -662,6 +696,83 @@ def _status_label(status: str) -> str:
     }.get(status, "Unknown")
 
 
+def _gpu_capacity_mib(gpu: dict[str, Any]) -> float | None:
+    return _mib(gpu.get("vram_free_bytes") or gpu.get("vram_total_bytes"))
+
+
+def _split_shares(raw: Any, count: int) -> list[float] | None:
+    """Normalized ``tensor_split`` proportions for ``count`` GPUs, or None (llama.cpp's default)."""
+    if raw in (None, "", []):
+        return None
+    parts = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    try:
+        values = [float(part) for part in parts if str(part).strip()]
+    except (TypeError, ValueError):
+        return None
+    values = (values + [0.0] * count)[:count]
+    total = sum(v for v in values if v > 0)
+    if total <= 0:
+        return None
+    return [max(v, 0.0) / total for v in values]
+
+
+def _accelerator_pool(params: dict[str, Any], hardware: dict[str, Any]) -> dict[str, Any]:
+    """The GPUs a launch will spread the model over, and how much that split can hold.
+
+    llama.cpp splits layers across every visible GPU by default, in proportion to
+    free memory, so capacity is the sum. ``split_mode: none`` keeps to ``main_gpu``;
+    ``device`` (e.g. ``CUDA0,CUDA1``) picks GPUs by index; ``tensor_split`` fixes the
+    shares, and then the GPU that fills first bounds the total: min(capacity / share).
+    Only discrete GPUs on the primary GPU's backend count.
+    """
+    primary = hardware.get("primary_gpu") or {}
+    backend = primary.get("acceleration_backend")
+    pool = [
+        gpu for gpu in (hardware.get("gpus") or [primary])
+        if gpu and not gpu.get("integrated") and gpu.get("acceleration_backend") == backend and _gpu_capacity_mib(gpu)
+    ]
+    single = {"gpus": [primary] if primary else [], "capacity_mib": _gpu_capacity_mib(primary) if primary else None}
+    if len(pool) < 2:
+        return single
+
+    device = str(params.get("device", params.get("cuda_device")) or "").strip().lower()
+    if device and device != "auto":
+        indices = [int(m.group(1)) for m in (re.search(r"(\d+)$", part.strip()) for part in device.split(",")) if m]
+        selected = [pool[i] for i in dict.fromkeys(indices) if 0 <= i < len(pool)]
+        if not selected:
+            return single
+        pool = selected
+    if str(params.get("split_mode") or "").strip().lower() == "none":
+        try:
+            main = int(params.get("main_gpu") or 0)
+        except (TypeError, ValueError):
+            main = 0
+        pool = [pool[main] if 0 <= main < len(pool) else pool[0]]
+    if len(pool) < 2:
+        return {"gpus": pool, "capacity_mib": _gpu_capacity_mib(pool[0])}
+
+    capacities = [_gpu_capacity_mib(gpu) or 0.0 for gpu in pool]
+    shares = _split_shares(params.get("tensor_split"), len(pool))
+    if shares:
+        used = [(cap, share) for cap, share in zip(capacities, shares) if share > 0]
+        pool = [gpu for gpu, share in zip(pool, shares) if share > 0]
+        capacity = min(cap / share for cap, share in used)
+    else:
+        capacity = sum(capacities)
+    return {"gpus": pool, "capacity_mib": capacity}
+
+
+def _accelerator_label(gpus: list[dict[str, Any]]) -> str | None:
+    names = [str(gpu.get("name") or "GPU") for gpu in gpus]
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    if len(set(names)) == 1:
+        return f"{len(names)}x {names[0]}"
+    return " + ".join(names)
+
+
 def estimate_memory_fit(
     params: dict[str, Any],
     model: dict[str, Any] | None = None,
@@ -679,7 +790,12 @@ def estimate_memory_fit(
     hardware = hardware or {}
     model_size_mib = _model_size_mib(model) or 0.0
     params_b = _model_params_b(model) or 13.0
-    ctx = _float_or_none(params.get("ctx_size")) or 4096.0
+    n_ctx_train = model_context_length(model, probe=probe_model)
+    ctx = _float_or_none(params.get("ctx_size"))
+    if ctx == 0 and n_ctx_train:
+        # llama.cpp reads ``-c 0`` as "use the model's trained context".
+        ctx = float(n_ctx_train)
+    ctx = ctx or 4096.0
     batch = _float_or_none(params.get("batch_size")) or 512.0
     ubatch = _float_or_none(params.get("ubatch_size")) or min(batch, 512.0)
     layer_fraction = _layer_fraction(params, model)
@@ -709,17 +825,21 @@ def estimate_memory_fit(
     if not mmap and model_size_mib:
         host_model_mib += model_size_mib * 0.35
 
+    pool = _accelerator_pool(params, hardware)
+    # Each GPU in a split carries its own runtime context and compute buffers.
+    gpu_count = max(1, len(pool["gpus"]))
+
     accelerator_used_mib = 0.0
     if layer_fraction > 0:
         accelerator_used_mib += accelerator_model_mib
-        accelerator_used_mib += _CUDA_CONTEXT_OVERHEAD_MIB
+        accelerator_used_mib += _CUDA_CONTEXT_OVERHEAD_MIB * gpu_count
     if kv_offload and layer_fraction > 0:
         # KV lives with its layer: only the offloaded layers' share sits in VRAM.
         accelerator_used_mib += kv_cache_mib * layer_fraction
     if op_offload and layer_fraction > 0:
-        accelerator_used_mib += compute_mib
+        accelerator_used_mib += compute_mib * gpu_count
     elif layer_fraction > 0:
-        accelerator_used_mib += compute_mib * 0.35
+        accelerator_used_mib += compute_mib * 0.35 * gpu_count
 
     host_used_mib = host_model_mib
     if not kv_offload or layer_fraction <= 0:
@@ -736,7 +856,7 @@ def estimate_memory_fit(
     primary_gpu = hardware.get("primary_gpu") or {}
     memory = hardware.get("memory") or {}
     unified_memory = bool(memory.get("unified") or primary_gpu.get("unified_memory"))
-    accelerator_capacity_mib = _mib(primary_gpu.get("vram_free_bytes") or primary_gpu.get("vram_total_bytes"))
+    accelerator_capacity_mib = pool["capacity_mib"]
     if unified_memory and not accelerator_capacity_mib:
         accelerator_capacity_mib = _mib(memory.get("available_bytes") or memory.get("total_bytes"))
     ram_capacity_mib = _mib(memory.get("available_bytes") or memory.get("total_bytes"))
@@ -746,14 +866,15 @@ def estimate_memory_fit(
     )
     ram_headroom_mib = ram_capacity_mib - host_used_mib if ram_capacity_mib is not None else None
 
-    accelerator_status = _status_from_headroom(accelerator_headroom_mib, accelerator_capacity_mib, target_mib)
+    # The headroom target is per GPU: every card in a split must keep its own.
+    accelerator_status = _status_from_headroom(accelerator_headroom_mib, accelerator_capacity_mib, target_mib * gpu_count)
     ram_status = _status_from_headroom(ram_headroom_mib, ram_capacity_mib, max(2048.0, target_mib))
     relevant = [accelerator_status]
     if host_used_mib > 512 or not kv_offload or layer_fraction < 1.0:
         relevant.append(ram_status)
     status = _worst_status(relevant)
 
-    accelerator_name = primary_gpu.get("name") or ("Unified memory" if unified_memory else "Accelerator")
+    accelerator_name = _accelerator_label(pool["gpus"]) or ("Unified memory" if unified_memory else "Accelerator")
     warnings: list[str] = []
     if not model:
         warnings.append("No matched model was available; fit estimate uses generic model assumptions.")
@@ -761,6 +882,11 @@ def estimate_memory_fit(
         warnings.append("Accelerator memory capacity is unknown, so the fit badge is approximate.")
     if host_used_mib > 512 and ram_capacity_mib is None:
         warnings.append("Host RAM capacity is unknown, so CPU/offload pressure is not fully checked.")
+    if n_ctx_train and ctx > n_ctx_train:
+        warnings.append(
+            f"Context {int(ctx)} exceeds the model's trained context ({n_ctx_train}); "
+            "output quality usually degrades past it unless RoPE/YaRN scaling is configured."
+        )
 
     return {
         "status": status,
@@ -768,6 +894,7 @@ def estimate_memory_fit(
         "accelerator_status": accelerator_status,
         "ram_status": ram_status,
         "accelerator_name": accelerator_name,
+        "accelerator_count": gpu_count if layer_fraction > 0 else 0,
         "backend": primary_gpu.get("acceleration_backend") or primary_gpu.get("backend"),
         "uses_ram_offload": host_used_mib > 512 or not kv_offload or layer_fraction < 1.0,
         "model_size_mib": _round_mib(model_size_mib) or None,
@@ -784,6 +911,7 @@ def estimate_memory_fit(
         },
         "inputs": {
             "ctx_size": int(ctx),
+            "n_ctx_train": n_ctx_train,
             "gpu_layer_fraction": round(layer_fraction, 2),
             "cache_type_k": params.get("cache_type_k"),
             "cache_type_v": params.get("cache_type_v"),
@@ -840,7 +968,10 @@ def estimate_tokens_per_second(
     cpu_decode = max(1.2, 9.0 * math.sqrt(max(float(logical_cores), 1.0)) / math.sqrt(max(model_params_b, 1.0)))
     blended = gpu_decode * (layer_fraction**1.35) + cpu_decode * (1.0 - layer_fraction)
 
-    ctx = _float_or_none(params.get("ctx_size")) or 4096
+    ctx = _float_or_none(params.get("ctx_size"))
+    if ctx == 0:
+        ctx = model_context_length(model)
+    ctx = ctx or 4096
     ctx_factor = max(0.72, 1.0 - min(ctx, 262144) / 262144 * 0.18)
     batch = _float_or_none(params.get("batch_size")) or 512
     ubatch = _float_or_none(params.get("ubatch_size")) or 512

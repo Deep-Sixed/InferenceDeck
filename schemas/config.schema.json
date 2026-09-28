@@ -67,6 +67,15 @@
         "type": "string"
       }
     },
+    "koboldcpp_path": {
+      "type": "string"
+    },
+    "extra_koboldcpp_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "update_channel": {
       "enum": [
         "stable",
@@ -100,6 +109,10 @@
         "warn",
         "off"
       ]
+    },
+    "gateway_model_switching": {
+      "type": "boolean",
+      "description": "Load the profile a gateway request names."
     }
   }
 }

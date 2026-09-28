@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .api_params import validate_overrides
-from .auth import LOOPBACK_HOSTS, SESSION_TTL_SECONDS, AuthState, client_address
+from .auth import SESSION_TTL_SECONDS, AuthState, host_header_ok, request_client
 from .control import ControlPlane
 from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
 
@@ -64,22 +64,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     def _host_ok(self) -> bool:
         # Without auth the API only binds to loopback. Reject any other Host
         # header so a DNS-rebinding page can't read or drive the local API.
-        if self.auth_state.enabled:
-            return True
-        host = self.headers.get("Host", "")
-        if host.startswith("["):
-            name = host[1:].partition("]")[0]
-        else:
-            name = host.rpartition(":")[0] if host.count(":") == 1 else host
-        return name.lower() in LOOPBACK_HOSTS
+        return host_header_ok(self.headers, self.auth_state)
 
     def _cookie_attrs(self) -> str:
         return "HttpOnly; SameSite=Strict; Path=/" + ("; Secure" if self.secure_cookies else "")
 
     def _client(self) -> str:
-        return client_address(
-            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
-        )
+        return request_client(self)
 
     def _throttled(self, retry_after: int) -> None:
         self._json(
@@ -99,6 +90,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             return False
         if self.headers.get("X-Auth-Token"):
             if self.auth_state.supplied_token_ok(self.headers):
+                self.auth_state.record_success(client)
                 return True
             # A wrong token is a failed guess, same as a wrong login password.
             self.auth_state.record_failure(client)
@@ -250,9 +242,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.config_check())
             elif parsed.path == "/api/sampling":
                 self._json(HTTPStatus.OK, self.control_plane.sampling_presets())
+            elif parsed.path == "/api/hf/files":
+                self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
             elif parsed.path == "/api/updates":
-                refresh = (query.get("refresh") or ["0"])[0] in ("1", "true")
-                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=refresh))
+                # Cached answers only. Asking GitHub again is POST /api/updates: a
+                # GET can be fired by any web page (an <img> tag), and each forced
+                # check spends this machine's GitHub API rate limit.
+                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=False))
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -359,6 +355,17 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     validate_overrides(body.get("overrides")),
                     completion_tokens=_bounded_int(body, "completion_tokens", 128, 16, 2048),
                 )
+            elif parsed.path == "/api/hf/download":
+                # Always into the HF cache: the API never picks a destination path.
+                payload = self.control_plane.hf_download(
+                    str(body.get("repo_id") or ""),
+                    quant=str(body.get("quant") or "") or None,
+                    pattern=str(body.get("pattern") or "") or None,
+                    include_mmproj=bool(body.get("include_mmproj", True)),
+                    dry_run=bool(body.get("dry_run", False)),
+                )
+            elif parsed.path == "/api/updates":
+                payload = self.control_plane.updates(refresh=True)
             elif parsed.path == "/api/runtime":
                 payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))
             elif parsed.path == "/api/remote":

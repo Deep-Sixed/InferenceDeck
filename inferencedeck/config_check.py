@@ -32,6 +32,7 @@ from .api_params import CACHE_TYPES
 from .backends import LAUNCHABLE_RUNTIMES
 from .capabilities import MODALITIES
 from .config import CONFIG_FILENAME, AppConfig
+from .llama_args import LOAD_MODES, NUMA_STRATEGIES, SPLIT_MODES
 from .paths import config_dir, find_project_root
 from .remotes import VALID_LANES, VALID_TRANSPORTS, _parse as parse_endpoint, endpoints_dir
 from .runtime_updates import SUPPORTED_CHANNELS
@@ -69,6 +70,8 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "extra_vllm_cpp_args": _STRING_LIST,
         "mlc_llm_path": {"type": "string"},
         "extra_mlc_llm_args": _STRING_LIST,
+        "koboldcpp_path": {"type": "string"},
+        "extra_koboldcpp_args": _STRING_LIST,
         "update_channel": {"enum": list(SUPPORTED_CHANNELS)},
         "profile_names": {"type": "object", "additionalProperties": {"type": "string"}},
         "server_history_limit": _NON_NEGATIVE,
@@ -76,6 +79,7 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "auto_scan_on_startup": {"type": "boolean"},
         "idle_release_seconds": {**_NON_NEGATIVE, "description": "Release a server's GPU after this long idle; 0 = off."},
         "concurrent_vram_check": {"enum": ["block", "warn", "off"]},
+        "gateway_model_switching": {"type": "boolean", "description": "Load the profile a gateway request names."},
     },
 }
 
@@ -101,6 +105,11 @@ PARAM_PROPERTIES: dict[str, Any] = {
     "reasoning": {"type": "boolean"},
     "reasoning_budget": {"type": "integer", "minimum": -1},
     "mmap": {"type": "boolean"},
+    "mlock": {"type": "boolean"},
+    "load_mode": {"enum": sorted(LOAD_MODES)},
+    "numa": {"anyOf": [{"type": "boolean"}, {"enum": sorted(NUMA_STRATEGIES)}]},
+    "split_mode": {"enum": sorted(SPLIT_MODES)},
+    "main_gpu": _NON_NEGATIVE,
     "kv_offload": {"type": "boolean"},
     "op_offload": {"type": "boolean"},
     "embedding": {"type": "boolean"},
@@ -155,6 +164,7 @@ EXTRA_PARAMS = {
     "reasoning_parser", "scheduling_policy", "tokenizer_config", "tool_call_parser",
     "mlc_mode", "mlc_model", "model_lib", "context_window_size", "prefill_chunk_size",
     "max_num_sequence", "max_total_seq_length", "sliding_window_size", "tensor_parallel_shards",
+    "tensor_split", "rpc", "rpc_servers", "override_kv", "kv_overrides", "lora", "lora_path",
 }
 KNOWN_PARAMS = set(PARAM_PROPERTIES) | EXTRA_PARAMS
 

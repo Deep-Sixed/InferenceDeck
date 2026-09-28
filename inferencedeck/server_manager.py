@@ -13,7 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .backends import LAUNCHABLE_RUNTIMES, detect_llama_cpp, detect_mlc_llm, detect_runtime, detect_vllm_cpp
+from .backends import (
+    LAUNCHABLE_RUNTIMES,
+    detect_koboldcpp,
+    detect_llama_cpp,
+    detect_mlc_llm,
+    detect_runtime,
+    detect_vllm_cpp,
+)
 from .capabilities import profile_capabilities, resolve_projector, with_served
 from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
@@ -21,6 +28,8 @@ from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
 from .hardware import detect_system_hardware
 from .inflight import busy_servers
 from .llama_args import LaunchCommand, build_llama_server_args
+from .koboldcpp_args import build_koboldcpp_args
+from .llama_flags import supported_flags
 from .mlc_llm_args import build_mlc_llm_serve_args
 from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
@@ -576,7 +585,11 @@ def _remove_server(server_id: str) -> None:
 # vllm.cpp loads and warms the model before it binds, which takes noticeably
 # longer than llama-server (about 53 s cold for a 27B on its reference box).
 # MLC LLM may first download HF:// weights and JIT-compile a model library.
-READY_TIMEOUT_SECONDS = {"llama.cpp": DEFAULT_READY_TIMEOUT_SECONDS, "vllm.cpp": 180, "mlc-llm": 600}
+# KoboldCpp's one-file builds unpack themselves before loading, and its default
+# autofit probes memory first, so it gets more time than llama-server.
+READY_TIMEOUT_SECONDS = {
+    "llama.cpp": DEFAULT_READY_TIMEOUT_SECONDS, "vllm.cpp": 180, "mlc-llm": 600, "koboldcpp": 180,
+}
 
 
 def http_base(host: str | None, port: int) -> str:
@@ -720,6 +733,8 @@ def prepare_launch_command(
         return _prepare_vllm_cpp(resolved, params, app_config, preset_warnings)
     if runtime == "mlc-llm":
         return _prepare_mlc_llm(resolved, params, app_config, preset_warnings)
+    if runtime == "koboldcpp":
+        return _prepare_koboldcpp(resolved, params, app_config, preset_warnings)
     if runtime != "llama.cpp":
         env = detect_runtime(runtime, root, config=app_config)
         if env is None:
@@ -746,6 +761,7 @@ def prepare_launch_command(
         resolved.model["path"],
         params,
         extra_args=app_config.extra_llama_args,
+        flags=supported_flags(llama.binary_path),
     )
     warnings = resolved.warnings + preset_warnings + command.warnings
     return {
@@ -781,6 +797,30 @@ def _prepare_vllm_cpp(
         "command": command.to_dict(),
         "params": params,
         "capabilities": profile_capabilities(resolved.model, params, probe=True),
+        "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
+    }
+
+
+def _prepare_koboldcpp(
+    resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig, preset_warnings: list[str] | None = None
+) -> dict[str, Any]:
+    env = detect_koboldcpp(config=app_config)
+    invocation = env.details.get("invocation")
+    if not invocation:
+        return {"success": False, "error": "KoboldCpp was not found.", "environment": env.to_dict()}
+    command = build_koboldcpp_args(
+        invocation,
+        resolved.model["path"],
+        params,
+        extra_args=app_config.extra_koboldcpp_args,
+    )
+    return {
+        "success": True,
+        "runtime": "koboldcpp",
+        "profile": resolved.to_dict(),
+        "environment": env.to_dict(),
+        "command": command.to_dict(),
+        "params": params,
         "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
     }
 

@@ -44,6 +44,8 @@ from typing import Any
 from .capabilities import resolve_projector
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
+from .koboldcpp_args import build_koboldcpp_args
+from .llama_flags import supported_flags
 from .mlc_llm_args import build_mlc_llm_serve_args
 from .models import discover_models
 from .paths import (
@@ -461,7 +463,16 @@ def _mlc_llm_binary_for_generation(config: AppConfig) -> str | None:
     return invocation[0] if invocation else None
 
 
-SCRIPT_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm")
+def _koboldcpp_binary_for_generation(config: AppConfig) -> str | None:
+    """Resolve KoboldCpp's executable (or koboldcpp.py) used inside generated scripts."""
+
+    from .backends import koboldcpp_invocation
+
+    invocation = koboldcpp_invocation(config)
+    return invocation[-1] if invocation else None
+
+
+SCRIPT_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm", "koboldcpp")
 
 
 def _script_runtime(params: dict[str, Any]) -> str:
@@ -477,6 +488,12 @@ def _binary_path_for_script(
     """Return the binary path to embed for ``runtime`` and any warnings about it."""
 
     warnings: list[str] = []
+    if runtime == "koboldcpp":
+        binary = config.koboldcpp_path or _koboldcpp_binary_for_generation(config)
+        if not binary:
+            warnings.append("KoboldCpp was not found; generated scripts use a 'koboldcpp' placeholder.")
+            binary = "koboldcpp"
+        return binary, warnings
     if runtime == "mlc-llm":
         binary = config.mlc_llm_path or _mlc_llm_binary_for_generation(config)
         if not binary:
@@ -509,12 +526,18 @@ def _build_script_command(
 ) -> LaunchCommand:
     """Build the server argv for ``runtime``."""
 
+    if runtime == "koboldcpp":
+        # A source checkout's koboldcpp.py runs under Python; release builds run directly.
+        invocation = [sys.executable, binary] if binary.lower().endswith(".py") else [binary]
+        return build_koboldcpp_args(invocation, model_path, params, extra_args=config.extra_koboldcpp_args)
     if runtime == "mlc-llm":
         invocation = [binary, "-m", "mlc_llm"] if binary == sys.executable else [binary]
         return build_mlc_llm_serve_args(invocation, model_path, params, extra_args=config.extra_mlc_llm_args)
     if runtime == "vllm.cpp":
         return build_vllm_cpp_server_args(binary, model_path, params, extra_args=config.extra_vllm_cpp_args)
-    return build_llama_server_args(binary, model_path, params, extra_args=config.extra_llama_args)
+    return build_llama_server_args(
+        binary, model_path, params, extra_args=config.extra_llama_args, flags=supported_flags(binary)
+    )
 
 
 def _write_text_atomic(path: Path, content: str) -> None:
