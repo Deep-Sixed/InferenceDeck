@@ -92,6 +92,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         ) or self.headers.get("x-api-key", "") or self.headers.get("X-Auth-Token", "")
         return bool(supplied) and secrets.compare_digest(supplied, self.auth_state.token)
 
+    def _client(self) -> str:
+        # Same throttle key as the control API: X-Forwarded-For only from a trusted proxy.
+        return client_address(
+            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
+        )
+
     def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -133,11 +139,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(HTTPStatus.FORBIDDEN, render_error(GatewayError(403, "host not allowed", "authentication")))
             return False
-        # Same client identity as the control API: behind a trusted reverse proxy
-        # (INFERENCEDECK_TRUSTED_PROXIES), throttle the real client, not the proxy.
-        client = client_address(
-            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
-        )
+        client = self._client()
         wait = self.auth_state.retry_after(client)
         if wait:
             self._send(HTTPStatus.TOO_MANY_REQUESTS,
