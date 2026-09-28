@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .estimates import estimate_memory_fit, estimate_tokens_per_second, _get_total_layers, prime_model_meta, recommend_jinja
+from .estimates import (
+    _get_total_layers,
+    estimate_memory_fit,
+    estimate_tokens_per_second,
+    model_context_length,
+    prime_model_meta,
+    recommend_jinja,
+)
 
 # ponytail: greedy grid scan over the existing estimator (layers x ctx x kv-cache).
 # No subprocess, no optimizer lib — ~100 cheap pure-Python fit evals. The ceiling
@@ -14,7 +21,6 @@ _BF16_CACHE_LADDER = ["bf16", *CACHE_LADDER]
 _CACHE_RANK = {name: i for i, name in enumerate(reversed(CACHE_LADDER))}
 _CACHE_RANK["bf16"] = _CACHE_RANK["f16"]
 _MAX_CACHE_RANK = max(_CACHE_RANK.values())
-_MAX_CTX_INDEX = len(CTX_LADDER) - 1
 
 # K and V are tuned independently. The K cache is more sensitive to quantization
 # than V (keys drive attention scores; values are just averaged), so we (a) never
@@ -83,7 +89,7 @@ _TUNE_KEYS = (
 )
 _REASONS = {
     "gpu_layers": "offload as many layers to the accelerator as memory allows (biggest speed lever)",
-    "ctx_size": "grow the context window into the remaining memory headroom",
+    "ctx_size": "grow the context window into the remaining memory headroom, up to the model's trained context",
     "cache_type_k": "pick the KV-cache quant that best balances fidelity and memory",
     "cache_type_v": "pick the KV-cache quant that best balances fidelity and memory (V sheds bits before K)",
     "batch_size": "grow the logical batch into leftover memory headroom for faster prompt processing",
@@ -112,6 +118,18 @@ _INTENTS = (
     ("max_context", "Max context",
      "Largest context window that fits, then the best KV quant for it."),
 )
+
+
+def _ctx_ladder(model: dict[str, Any] | None) -> list[int]:
+    """CTX_LADDER capped at the model's trained context, which is itself a rung.
+
+    Growing past the trained context costs memory for a window the model degrades
+    in, so it is never suggested. Unknown trained context keeps the full ladder.
+    """
+    n_ctx_train = model_context_length(model)
+    if not n_ctx_train or n_ctx_train > CTX_LADDER[-1]:
+        return list(CTX_LADDER)
+    return [ctx for ctx in CTX_LADDER if ctx < n_ctx_train] + [n_ctx_train]
 
 
 def _layer_options(model: dict[str, Any] | None) -> list[Any]:
@@ -207,8 +225,10 @@ def _collect_candidates(
     """Evaluate the grid once and keep every config the estimator says fits."""
     candidates: list[dict[str, Any]] = []
     cache_ladder = _cache_ladder(hardware)
+    ctx_ladder = _ctx_ladder(model)
+    max_ctx_index = max(1, len(ctx_ladder) - 1)
     for layers in _layer_options(model):
-        for ctx in CTX_LADDER:
+        for ctx in ctx_ladder:
             for cache_k in cache_ladder:
                 for cache_v in cache_ladder:
                     # Never spend more bits on V than K — K carries more signal.
@@ -227,7 +247,7 @@ def _collect_candidates(
                         "cache_k": cache_k,
                         "cache_v": cache_v,
                         "lf": fit["inputs"]["gpu_layer_fraction"],
-                        "ctx_norm": CTX_LADDER.index(ctx) / _MAX_CTX_INDEX,
+                        "ctx_norm": ctx_ladder.index(ctx) / max_ctx_index,
                         "cache_norm": _cache_fidelity_norm(cache_k, cache_v),
                         "roomy": 1 if fit["status"] == "good" else 0,
                     })
@@ -336,6 +356,7 @@ def auto_tune_fit(
         "notes": [
             "Suggestions come from the memory estimator, not a live run — verify with a fit test or benchmark.",
             "Priority: max GPU layers, then a balance of KV-cache fidelity and context (quality-leaning).",
+            "Context never exceeds the model's trained context when the GGUF reports it.",
             "K and V caches are tuned independently; V sheds bits before K and is never more precise than K.",
             "Batch/ubatch grow into leftover headroom after context and KV quality are settled.",
             "Threads follow the CPU: physical cores for decode, logical cores for prompt batches.",
