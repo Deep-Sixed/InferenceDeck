@@ -227,6 +227,16 @@ class StartProfileVramTests(unittest.TestCase):
         self.assertEqual(server_manager._find_server(other)["status"], server_manager.PARKED)
         self.assertEqual(result["server"]["estimated_vram_mib"], 14000)
 
+    def test_refused_start_releases_nothing(self) -> None:
+        other = self._track_other()
+        # A small server already on the new server's port (127.0.0.1:1): the start must fail.
+        squatter = self._track_other(mib=500)
+        server_manager._update_server(squatter, {"mode": "squatter", "host": "127.0.0.1", "port": 1})
+        result = self._start(release_conflicts=True)
+        self.assertFalse(result["success"])
+        self.assertIn("already used", result["error"])
+        self.assertEqual(server_manager._find_server(other)["status"], "running")
+
     def test_server_answering_requests_is_not_released(self) -> None:
         other = self._track_other()
         self.busy = [{other: 2}]
