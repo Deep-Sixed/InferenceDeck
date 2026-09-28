@@ -190,8 +190,17 @@ class Router:
 
     def explain(self, model: str = "") -> dict[str, Any]:
         """Which target a request for ``model`` would use, and the ranking behind it. Never loads anything."""
-        ordered = self._ordered_matches(self.catalog(), model) if model else []
-        chosen = self._resolve(model, allow_switch=False)  # explaining must not start a profile
+        remotes = self.endpoints()
+        ordered = self._ordered_matches(self.catalog(remotes), model) if model else []
+        # Pick from the same ranking the candidates show: resolving again would
+        # rebuild the catalog and could see a fleet view that changed meanwhile.
+        if ordered:
+            enabled = next((r for r in remotes if r.enabled), None)
+            if enabled is not None:
+                _remote_key(enabled)  # as _resolve: an unusable enabled endpoint is an error
+            chosen = ordered[0][0]
+        else:
+            chosen = self._resolve(model, allow_switch=False)  # explaining must not start a profile
         return {
             "model": model or None,
             "target": chosen.to_dict(),

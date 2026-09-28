@@ -123,6 +123,17 @@ class RouterPlacementTests(unittest.TestCase):
         ]}
         self.assertEqual(self._router(_ranker(overview)).resolve("qwen").server_id, "qwen-1")
 
+    def test_explain_target_is_its_first_candidate(self) -> None:
+        # The fleet view arrives between two lookups: the first sees none, the second sees friday loaded.
+        views = iter([None, {"hosts": [
+            _host("thanatos", local=True, servers=[]),
+            _host("friday", url="http://friday.tail.ts.net:8716", servers=[_qwen(31.8)]),
+        ]}])
+        config = SimpleNamespace(fleet_peers=[{"url": "http://friday:8716"}], fleet_name="", gateway_placement=True)
+        ranker = placement.FleetRanker(config=lambda: config, get_fleet=lambda *_: _Fleet(next(views, None)))
+        report = self._router(ranker).explain("qwen")
+        self.assertEqual(report["target"], {k: v for k, v in report["candidates"][0].items() if k in report["target"]})
+
     def test_single_match_never_consults_the_fleet(self) -> None:
         ranker = mock.Mock()
         self.servers = []
