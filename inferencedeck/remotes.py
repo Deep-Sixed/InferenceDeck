@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .fileio import atomic_write_text, locked
+from .live_config import Rejected, live_file
 from .paths import config_dir
 
 LANE_REMOTE_HOST = "remote_host"
@@ -134,11 +135,44 @@ def infer_transport(base_url: str, lane: str) -> str:
     return ""
 
 
+def _bad(path: Path, error: str) -> RemoteEndpoint:
+    return RemoteEndpoint(path, "", "", "", "", "", LANE_TRUE_CLOUD, False, False, error)
+
+
 def _parse(path: Path) -> RemoteEndpoint:
+    """The endpoint exactly as the file on disk says (see _parse_live for the one in effect)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return RemoteEndpoint(path, "", "", "", "", "", LANE_TRUE_CLOUD, False, False, f"bad JSON: {exc}")
+        return _bad(path, f"bad JSON: {exc}")
+    return _from_data(path, data)
+
+
+def _parse_endpoint_bytes(raw: bytes) -> dict[str, Any]:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Rejected([f"not valid JSON: {exc}"]) from None
+    if not isinstance(data, dict):
+        raise Rejected(["must be a JSON object"])
+    return data
+
+
+def _parse_live(path: Path) -> RemoteEndpoint:
+    """The endpoint in effect: a file caught mid-edit (not valid JSON) keeps its
+    previous version, so an active endpoint doesn't silently switch off."""
+
+    live = live_file(path, _parse_endpoint_bytes, "remote endpoint")
+    data = live.get()
+    if data is None:
+        rejected = live.state()["rejected"]
+        return _bad(path, f"bad JSON: {rejected['errors'][0]}" if rejected else "file is missing")
+    return _from_data(path, data)
+
+
+def _from_data(path: Path, data: Any) -> RemoteEndpoint:
+    if not isinstance(data, dict):
+        return _bad(path, "bad JSON: must be a JSON object")
     provider = str(data.get("provider") or "").strip()
     model = str(data.get("model") or "").strip()
     base_url = str(data.get("baseUrl") or "").strip()
@@ -210,7 +244,7 @@ def list_endpoints(directory: Path | None = None) -> list[RemoteEndpoint]:
     root = directory or endpoints_dir()
     if not root.is_dir():
         return []
-    return [_parse(path) for path in sorted(root.glob("*.json")) if not path.name.endswith(".example.json")]
+    return [_parse_live(path) for path in sorted(root.glob("*.json")) if not path.name.endswith(".example.json")]
 
 
 def active_endpoint(directory: Path | None = None) -> RemoteEndpoint | None:

@@ -13,6 +13,8 @@
     <h2>Status</h2>
     <div id="status" class="muted">Loading…</div>
     <div id="server-actions"></div>
+    <div id="config-rejected" class="list"></div>
+    <div id="config-problems" class="list"></div>
   </section>
   <section class="card" id="fleet-card" hidden>
     <h2>Machines</h2>
@@ -63,6 +65,11 @@
   <section class="card">
     <h2>Tracked servers</h2>
     <div id="servers" class="list"></div>
+  </section>
+  <section class="card hidden" id="logs-card">
+    <h2>Live logs <span id="logs-title" class="muted"></span></h2>
+    <div class="actions ctx"><button id="logs-close">Close</button><label class="meta"><input type="checkbox" id="logs-follow" checked> Follow</label><span class="meta">Last 2000 lines; the full log stays on disk.</span></div>
+    <pre id="logs" class="logs"></pre>
   </section>
   <section class="card">
     <h2>Active command</h2>

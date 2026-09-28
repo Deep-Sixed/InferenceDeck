@@ -10,6 +10,9 @@ Endpoints:
 A request's ``model`` picks the target it names (see router.py); ``--switch-models``
 (or ``gateway_model_switching`` in config) also loads a named profile on demand.
 
+Requests to local servers are counted while they run (see inflight.py), so
+idle release and making room for another model leave a busy server alone.
+
 Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
 SDK sends API keys (``Authorization: Bearer``, ``x-api-key``) or as
@@ -29,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 
 from ..auth import AuthState, host_header_ok, request_client, validate_bind_security
 from ..config import AppConfig
+from ..inflight import Tracker, tracker
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
 from .router import Router
@@ -74,6 +78,8 @@ def _header_value(target: Any) -> str:
 class GatewayRequestHandler(BaseHTTPRequestHandler):
     auth_state = AuthState()
     router: Router = Router()
+    # None: this process's shared tracker (see inflight.py).
+    inflight: Tracker | None = None
     server_version = "InferenceDeckGateway/1"
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -235,23 +241,26 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             model = request.model or target.model_id
             # Says which machine answered, for when placement picked between several.
             routed = {"X-InferenceDeck-Target": _header_value(target)}
+            # Counted until the last byte is sent, so a streaming reply keeps
+            # its server from being released by idle release or to make room.
             # The lease tells a model switch this server is still busy; for a
             # stream it is held until the last chunk is written.
-            lease = target.lease()
-            lease.__enter__()
-            try:
-                if request.stream:
-                    events = target.engine.stream(request)
-                    stream_lease, lease = lease, None
-                    self._send_stream(api.render_stream(events, model, body), stream_lease, routed)
-                else:
-                    result = target.engine.complete(request)
-                    # Report the model the client asked for, so aliases stay stable.
-                    result.model = model
-                    self._send(HTTPStatus.OK, api.render_result(result), headers=routed)
-            finally:
-                if lease is not None:
-                    lease.__exit__(None, None, None)
+            with (self.inflight or tracker()).track(target.server_id):
+                lease = target.lease()
+                lease.__enter__()
+                try:
+                    if request.stream:
+                        events = target.engine.stream(request)
+                        stream_lease, lease = lease, None
+                        self._send_stream(api.render_stream(events, model, body), stream_lease, routed)
+                    else:
+                        result = target.engine.complete(request)
+                        # Report the model the client asked for, so aliases stay stable.
+                        result.model = model
+                        self._send(HTTPStatus.OK, api.render_result(result), headers=routed)
+                finally:
+                    if lease is not None:
+                        lease.__exit__(None, None, None)
         except GatewayError as exc:
             self._send(exc.status, api.render_error(exc))
         except Exception as exc:  # pragma: no cover - last-resort guard
@@ -259,7 +268,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
 
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
-                router: Router | None = None) -> ThreadingHTTPServer:
+                router: Router | None = None, inflight: Tracker | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
     # The gateway has no TLS option of its own; off loopback it still needs a
     # token, and the README points LAN use at a tailnet or a TLS reverse proxy.
@@ -267,6 +276,8 @@ def make_server(host: str, port: int, auth_state: AuthState | None = None,
     attrs: dict[str, Any] = {"auth_state": auth}
     if router is not None:
         attrs["router"] = router
+    if inflight is not None:
+        attrs["inflight"] = inflight
     handler = type("BoundGatewayRequestHandler", (GatewayRequestHandler,), attrs)
     return ThreadingHTTPServer((host, port), handler)
 

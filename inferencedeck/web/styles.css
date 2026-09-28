@@ -25,3 +25,4 @@
 .fleet-down td:first-child strong{color:var(--muted)}
 #fleet-form input{background:#0b1118;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;min-width:0;flex:1 1 160px}
 #fleet-form{align-items:center}#fleet-placement{margin-top:10px}
+.card.hidden{display:none}pre.logs{max-height:420px;overflow:auto;font-size:12px;white-space:pre-wrap}
