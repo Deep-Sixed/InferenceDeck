@@ -239,7 +239,9 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
                 router: Router | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
-    validate_bind_security(host, auth)
+    # The gateway has no TLS option of its own; off loopback it still needs a
+    # token, and the README points LAN use at a tailnet or a TLS reverse proxy.
+    validate_bind_security(host, auth, allow_insecure_http=True)
     attrs: dict[str, Any] = {"auth_state": auth}
     if router is not None:
         attrs["router"] = router

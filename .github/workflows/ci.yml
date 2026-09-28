@@ -20,3 +20,6 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e .[tray]
       - run: python -m unittest discover -s tests -v
+      # Editable installs hide missing package data; check a real wheel.
+      - run: python -m pip wheel . --no-deps -w dist
+      - run: python -c "import glob, zipfile; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); missing = [f for f in ('index.html', 'app.js', 'styles.css') if 'inferencedeck/web/' + f not in names]; assert not missing, missing"

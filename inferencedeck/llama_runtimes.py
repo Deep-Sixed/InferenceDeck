@@ -16,6 +16,7 @@ the CPU lacks, whatever is pinned.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .cpu_features import CpuFeatures, detect_cpu_features
-from .paths import executable_names
+from .paths import executable_names, is_windows
 
 SIDECAR_NAME = "inferencedeck-runtime.json"
 AUTO = "auto"
@@ -204,6 +205,22 @@ def _binaries_under(root: Path) -> list[Path]:
     return found
 
 
+def runtime_id(variant: str, path: str) -> str:
+    """A pin that keeps naming the same binary however discovery order changes.
+
+    The suffix hashes the resolved path, so adding or removing other builds (or
+    search roots) never shifts which binary a saved id refers to.
+    """
+
+    try:
+        canonical = str(Path(path).resolve())
+    except OSError:
+        canonical = str(path)
+    if is_windows():
+        canonical = canonical.casefold()  # Windows paths are case-insensitive
+    return f"{variant}-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:8]}"
+
+
 def discover_runtimes(roots: list[Path], pinned_paths: list[str] | None = None) -> list[RuntimeCandidate]:
     seen: set[str] = set()
     candidates: list[RuntimeCandidate] = []
@@ -236,10 +253,8 @@ def discover_runtimes(roots: list[Path], pinned_paths: list[str] | None = None) 
         if found:
             add(Path(found))
 
-    counts: dict[str, int] = {}
     for c in candidates:
-        counts[c.variant] = counts.get(c.variant, 0) + 1
-        c.id = c.variant if counts[c.variant] == 1 else f"{c.variant}-{counts[c.variant]}"
+        c.id = runtime_id(c.variant, c.path)
     return candidates
 
 
@@ -268,6 +283,9 @@ def _tier(candidate: RuntimeCandidate) -> int:
 
 
 def _matches(candidate: RuntimeCandidate, wanted: str) -> bool:
+    # A stable id or path names one binary; a bare variant ("cuda-avx1") means
+    # any build of that kind. Old order-based ids ("standard-2") match nothing,
+    # so they fall back to automatic selection instead of silently moving.
     return wanted in {candidate.id, candidate.variant, candidate.path}
 
 

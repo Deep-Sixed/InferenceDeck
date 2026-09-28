@@ -295,9 +295,41 @@ class AuthState:
         return self._expire(self._failures.get(client, deque()))
 
 
-def validate_bind_security(host: str, auth: AuthState) -> None:
-    if host.strip().lower() not in LOOPBACK_HOSTS and not auth.enabled:
+# Tailscale addresses: traffic to them is already WireGuard-encrypted.
+TAILNET_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def is_tailnet_address(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host.strip().strip("[]"))
+    except ValueError:
+        return False
+    return any(address in network for network in TAILNET_NETWORKS)
+
+
+def validate_bind_security(
+    host: str, auth: AuthState, *, tls: bool = False, allow_insecure_http: bool = False
+) -> None:
+    """Refuse binds that would expose the control API unsafely.
+
+    Off loopback the API needs authentication, and the password, token and
+    session cookie must not cross the network in the clear: that needs TLS, a
+    Tailscale address (encrypted by WireGuard), or an explicit opt-out.
+    0.0.0.0 is every interface, including the ordinary LAN, not "the tailnet".
+    """
+
+    host = host.strip().lower()
+    if host in LOOPBACK_HOSTS:
+        return
+    if not auth.enabled:
         raise RuntimeError(
             "Refusing non-loopback bind without authentication. Set INFERENCEDECK_TOKEN "
             "or INFERENCEDECK_TOKEN_FILE before binding to a LAN/tailnet address."
         )
+    if tls or allow_insecure_http or is_tailnet_address(host):
+        return
+    raise RuntimeError(
+        f"Refusing plain-HTTP bind on {host}: the login password, token and session cookie would "
+        "cross the network unencrypted. Use --certfile/--keyfile, bind to this machine's Tailscale "
+        "address (100.x.y.z) instead of 0.0.0.0, or pass --allow-insecure-http to accept the risk."
+    )
