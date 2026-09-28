@@ -20,6 +20,7 @@ from .control import ControlPlane
 from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
 
 MAX_BODY_BYTES = 1024 * 1024
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 # Each live log stream holds a handler thread open; cap how many run at once.
 MAX_LOG_STREAMS = 8
 MAX_LOG_HISTORY_BYTES = 256 * 1024
@@ -88,7 +89,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         if wait:
             self._throttled(wait)
             return False
-        if self.headers.get("X-Auth-Token"):
+        if self.headers.get("X-Auth-Token") or self.headers.get("Authorization"):
             if self.auth_state.supplied_token_ok(self.headers):
                 self.auth_state.record_success(client)
                 return True
@@ -116,6 +117,14 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _text(self, status: int, body: str, content_type: str) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
     def _sse(self, event: str, data: dict[str, Any] | None = None) -> None:
         payload = f"event: {event}\ndata: {json.dumps(data or {})}\n\n" if event else ": keepalive\n\n"
         self.wfile.write(payload.encode("utf-8"))
@@ -238,6 +247,29 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/runtime":
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
+            elif parsed.path == "/api/telemetry":
+                self._json(HTTPStatus.OK, self.control_plane.telemetry())
+            elif parsed.path == "/api/fleet":
+                self._json(HTTPStatus.OK, self.control_plane.fleet())
+            elif parsed.path == "/api/fleet/placement":
+                try:
+                    payload = self.control_plane.fleet_placement(
+                        profile=(query.get("profile") or [""])[0], model=(query.get("model") or [""])[0]
+                    )
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, payload)
+            elif parsed.path == "/api/telemetry/history":
+                range_name = (query.get("range") or ["1h"])[0]
+                try:
+                    payload = self.control_plane.telemetry_history(range_name)
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, payload)
+            elif parsed.path == "/metrics":
+                self._text(HTTPStatus.OK, self.control_plane.metrics(), PROMETHEUS_CONTENT_TYPE)
             elif parsed.path == "/api/config/check":
                 self._json(HTTPStatus.OK, self.control_plane.config_check())
             elif parsed.path == "/api/sampling":

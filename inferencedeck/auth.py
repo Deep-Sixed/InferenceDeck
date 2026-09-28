@@ -249,7 +249,11 @@ class AuthState:
 
     def supplied_token_ok(self, headers) -> bool:
         # Header only: a ?token= query parameter would leak into logs and history.
+        # "Authorization: Bearer" is what Prometheus and most scrapers send natively.
         supplied = headers.get("X-Auth-Token", "")
+        if not supplied:
+            scheme, _, credentials = headers.get("Authorization", "").partition(" ")
+            supplied = credentials.strip() if scheme.lower() == "bearer" else ""
         return bool(supplied) and self.enabled and secrets.compare_digest(supplied, self.token)
 
     def retry_after(self, client: str) -> int:

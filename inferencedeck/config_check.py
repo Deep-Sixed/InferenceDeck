@@ -80,6 +80,27 @@ CONFIG_SCHEMA: dict[str, Any] = {
         "idle_release_seconds": {**_NON_NEGATIVE, "description": "Release a server's GPU after this long idle; 0 = off."},
         "concurrent_vram_check": {"enum": ["block", "warn", "off"]},
         "gateway_model_switching": {"type": "boolean", "description": "Load the profile a gateway request names."},
+        "gateway_placement": {"type": "boolean", "description": "Order gateway targets sharing a name by fleet placement."},
+        "telemetry_sample_seconds": {**_NON_NEGATIVE, "description": "Seconds between telemetry samples; 0 = history off."},
+        "telemetry_retention_days": _POSITIVE,
+        "otlp_endpoint": {"type": "string", "description": "OTLP/HTTP endpoint for OpenTelemetry export; empty = off."},
+        "otlp_export_seconds": _POSITIVE,
+        "fleet_peers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "url": {"type": "string", "minLength": 1},
+                    "tokenEnv": {"type": "string"},
+                    "token_env": {"type": "string"},
+                    "caFile": {"type": "string"},
+                    "ca_file": {"type": "string"},
+                },
+            },
+        },
+        "fleet_name": {"type": "string"},
     },
 }
 
@@ -113,6 +134,7 @@ PARAM_PROPERTIES: dict[str, Any] = {
     "kv_offload": {"type": "boolean"},
     "op_offload": {"type": "boolean"},
     "embedding": {"type": "boolean"},
+    "metrics": {"type": "boolean"},
     "reranking": {"type": "boolean"},
     "vision": {"type": "boolean"},
     "mmproj": {"type": "string", "minLength": 1},

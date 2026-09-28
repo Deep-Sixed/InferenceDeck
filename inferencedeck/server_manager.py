@@ -36,6 +36,7 @@ from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
 from .proc import run as run_hidden
 from .sampling import layer_sampling_preset, request_defaults
+from .telemetry import emit as emit_event
 
 
 STATE_FILENAME = "servers.json"
@@ -433,6 +434,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
                 "stop_stderr": str(exc),
             },
         )
+        emit_event("server.stop_failed", server, reason=str(exc))
         return {
             "success": False,
             "message": str(exc),
@@ -451,6 +453,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
                 "stop_stderr": result.stderr.strip(),
             },
         )
+        emit_event("server.stop_failed", server, reason=f"exit status {result.returncode}")
         return {
             "success": False,
             "message": result.stdout.strip() or result.stderr.strip() or f"taskkill returned {result.returncode} for PID {pid}.",
@@ -469,6 +472,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
                 "stop_stderr": result.stderr.strip(),
             },
         )
+        emit_event("server.stopped", server)
         return {"success": True, "message": message, "server": _find_server(server["id"])}
 
     if _wait_gone(pid, 5):
@@ -491,6 +495,7 @@ def stop_server(server_id: str | None = None, mode: str | None = None, timeout: 
             "stop_stderr": result.stderr.strip(),
         },
     )
+    emit_event("server.stop_failed", server, reason="did not exit")
     return {
         "success": False,
         "message": f"PID {pid} did not exit after SIGTERM and SIGKILL.",
@@ -533,6 +538,7 @@ def suspend_server(server_id: str | None = None, mode: str | None = None) -> dic
     success, message = _set_process_suspended(pid, True, server.get("pid_identity"))
     if success:
         _update_server(server["id"], {"status": "suspended", "running": True, "suspended": True})
+        emit_event("server.suspended", server)
     return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
 
 
@@ -544,6 +550,7 @@ def resume_server(server_id: str | None = None, mode: str | None = None) -> dict
     success, message = _set_process_suspended(pid, False, server.get("pid_identity"))
     if success:
         _update_server(server["id"], {"status": "running", "running": True, "suspended": False})
+        emit_event("server.resumed", server)
     return {"success": success, "message" if success else "error": message, "server": _find_server(server["id"])}
 
 def _update_server(server_id: str, patch: dict[str, Any]) -> None:
@@ -1008,6 +1015,7 @@ def start_profile(
         except Exception as exc:
             stdout_handle.close()
             stderr_handle.close()
+            emit_event("server.start_failed", profile=mode, runtime=prepared.get("runtime") or "llama.cpp", reason=str(exc))
             return {"success": False, "error": str(exc), "prepared": prepared}
         finally:
             stdout_handle.close()
@@ -1047,11 +1055,17 @@ def start_profile(
             "capabilities": prepared.get("capabilities"),
         }
         _upsert_server(server)
+        emit_event("server.started", server, model_path=server["model_path"], context_size=server["ctx_size"])
     app_config = AppConfig.load()
     trim_server_history(app_config.server_history_limit)
 
     if wait_ready:
+        launched = time.monotonic()
         ready = wait_until_ready(server["host"], server["port"], proc.pid, ready_timeout_seconds)
+        if ready:
+            emit_event("server.ready", server, startup_seconds=round(time.monotonic() - launched, 3))
+        else:
+            emit_event("server.start_failed", server, reason="startup_timeout", waited_seconds=round(time.monotonic() - launched, 3))
         patch: dict[str, Any] = {
             "status": "running" if ready else "startup_timeout",
             "running": pid_is_running(proc.pid),
@@ -1098,6 +1112,7 @@ def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[s
     }
     # Written whole: stop_server may already have pruned the stopped record.
     _upsert_server(parked)
+    emit_event("server.released", server)
     return {
         "success": True,
         "message": f"Released GPU: stopped {server.get('mode')}. Restore starts it again.",
@@ -1182,6 +1197,7 @@ def restore_server(
     if result.get("success") or started.get("running"):
         # A server is up (even if it missed the readiness deadline); the parked record is spent.
         _remove_server(server_id)
+        emit_event("server.restored", claimed, new_server_id=started.get("id"))
     else:
         _update_server(server_id, {"status": PARKED})
     return result
