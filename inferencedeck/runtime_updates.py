@@ -59,6 +59,7 @@ GITHUB_REPOS: dict[str, str] = {
     "vllm": "vllm-project/vllm",
     "vllm.cpp": "mudler/vllm.cpp",
     "mlc-llm": "mlc-ai/mlc-llm",
+    "koboldcpp": "LostRuins/koboldcpp",
     "mlx": "ml-explore/mlx",
 }
 
@@ -71,6 +72,7 @@ def runtime_label(runtime_id: str) -> str:
         "vllm": "vLLM",
         "vllm.cpp": "vllm.cpp",
         "mlc-llm": "MLC LLM",
+        "koboldcpp": "KoboldCpp",
         "mlx": "MLX",
         "lm-studio": "LM Studio",
     }.get(runtime_id, runtime_id)

@@ -9,6 +9,7 @@ from .benchmark import load_benchmark_results, run_profile_benchmark
 from .config import AppConfig
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
+from .hf_download import download_model, repo_gguf_listing
 from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
@@ -67,6 +68,7 @@ class ControlPlane:
                 "restart": True,
                 "prepare": True,
                 "logs": True,
+                "hf_download": True,
             },
             "context_presets": list(CONTEXT_PRESETS),
         }
@@ -111,6 +113,23 @@ class ControlPlane:
             overrides=overrides,
             completion_tokens=completion_tokens,
         )
+
+    def hf_files(self, repo_id: str) -> dict[str, Any]:
+        """The GGUF quants and vision projectors a Hugging Face repo offers."""
+        return repo_gguf_listing(repo_id)
+
+    def hf_download(
+        self,
+        repo_id: str,
+        *,
+        quant: str | None = None,
+        pattern: str | None = None,
+        include_mmproj: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Download one quant (all shards, plus its mmproj) into the HF cache,
+        which model discovery already scans."""
+        return download_model(repo_id, pattern=pattern, quant=quant, include_mmproj=include_mmproj, dry_run=dry_run)
 
     def benchmark_history(self) -> list[dict[str, Any]]:
         return load_benchmark_results()

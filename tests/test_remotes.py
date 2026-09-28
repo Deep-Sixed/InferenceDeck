@@ -136,6 +136,21 @@ class OptionalKeyTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     enable_endpoint("ep", root)
 
+    def test_cloud_without_model_is_invalid(self) -> None:
+        # Unpinned, a paid endpoint would get whatever model name a client sent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="openrouter", lane="true_cloud", apiKeyEnv="OR_KEY")
+            cfg = list_endpoints(root)[0]
+            self.assertFalse(cfg.valid)
+            self.assertIn("model", cfg.error)
+            with mock.patch.dict(os.environ, {"OR_KEY": "k"}), self.assertRaises(ValueError):
+                enable_endpoint("ep", root)
+
+    def test_self_hosted_without_model_is_still_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host")
+            self.assertTrue(list_endpoints(root)[0].valid)
+
     def test_cloud_without_key_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, provider="openrouter", lane="true_cloud")

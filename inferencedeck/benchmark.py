@@ -72,6 +72,53 @@ def _fallback_token_count(text: str) -> int:
     return max(1, round(len(text) / 4))
 
 
+def _positive(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[str, Any]:
+    """Token counts and throughput for one non-streaming completion.
+
+    llama-server reports a ``timings`` object that splits prompt processing from
+    generation. Dividing completion tokens by the request's wall-clock time mixes
+    the two (and HTTP overhead), under-reporting generation speed, so the server's
+    own numbers win when present and wall-clock is only the fallback.
+    """
+    usage = payload.get("usage") or {}
+    timings = payload.get("timings") or {}
+    completion_count = int(
+        usage.get("completion_tokens") or timings.get("predicted_n") or usage.get("predicted_n")
+        or _fallback_token_count(text)
+    )
+    prompt_count = int(usage.get("prompt_tokens") or timings.get("prompt_n") or usage.get("prompt_n") or 0)
+    end_to_end = completion_count / elapsed if completion_count else 0.0
+
+    predicted_ms = _positive(timings.get("predicted_ms"))
+    generation = _positive(timings.get("predicted_per_second"))
+    if generation is None and predicted_ms and _positive(timings.get("predicted_n")):
+        generation = float(timings["predicted_n"]) / (predicted_ms / 1000.0)
+    prompt_ms = _positive(timings.get("prompt_ms"))
+    prompt_speed = _positive(timings.get("prompt_per_second"))
+    if prompt_speed is None and prompt_ms and _positive(timings.get("prompt_n")):
+        prompt_speed = float(timings["prompt_n"]) / (prompt_ms / 1000.0)
+
+    return {
+        "completion_tokens": completion_count,
+        "prompt_tokens": prompt_count,
+        # Generation speed: the server's decode rate when reported, else wall-clock.
+        "tokens_per_second": round(generation if generation is not None else end_to_end, 2),
+        "prompt_tokens_per_second": round(prompt_speed, 2) if prompt_speed is not None else None,
+        "end_to_end_tokens_per_second": round(end_to_end, 2),
+        "prompt_seconds": round(prompt_ms / 1000.0, 3) if prompt_ms else None,
+        "generation_seconds": round(predicted_ms / 1000.0, 3) if predicted_ms else None,
+        "timing_source": "server" if generation is not None else "wall_clock",
+    }
+
+
 def send_chat_prompt(
     mode: str,
     prompt: str,
@@ -115,19 +162,14 @@ def send_chat_prompt(
         return {"success": False, "error": str(exc), "endpoint": f"{base_url}/v1/chat/completions"}
     elapsed = max(time.perf_counter() - started, 0.001)
 
-    usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
 
     return {
         "success": True,
         "reply": text,
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0),
-        "tokens_per_second": round(tokens_per_second, 2),
+        **_speed_metrics(response_payload, text, elapsed),
     }
 
 
@@ -202,10 +244,8 @@ def run_profile_benchmark(
 
     usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    prompt_count = int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0)
-    total_count = int(usage.get("total_tokens") or (prompt_count + completion_count))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
+    speed = _speed_metrics(response_payload, text, elapsed)
+    total_count = int(usage.get("total_tokens") or (speed["prompt_tokens"] + speed["completion_tokens"]))
     chars_per_second = len(text) / elapsed if text else 0.0
 
     benchmark = {
@@ -214,14 +254,13 @@ def run_profile_benchmark(
         "server_id": server.get("id"),
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": prompt_count,
+        **speed,
         "total_tokens": total_count,
-        "tokens_per_second": round(tokens_per_second, 2),
         "chars_per_second": round(chars_per_second, 1),
         "response_chars": len(text),
         "requested_max_tokens": int(completion_tokens),
         "usage": usage,
+        "timings": response_payload.get("timings"),
     }
     save_benchmark_result(benchmark)
 
