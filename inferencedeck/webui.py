@@ -6,7 +6,6 @@ from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
 
 from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
@@ -46,25 +45,23 @@ def make_server(
     port: int = 8716,
     control_plane: ControlPlane | None = None,
     auth_state: AuthState | None = None,
+    certfile: str | None = None,
+    keyfile: str | None = None,
     *,
-    tls_cert: str | None = None,
-    tls_key: str | None = None,
     allow_insecure_http: bool = False,
 ) -> ThreadingHTTPServer:
-    if bool(tls_cert) != bool(tls_key):
-        raise RuntimeError("--tls-cert and --tls-key must be given together.")
+    """Build the server; with ``certfile`` it speaks HTTPS and marks the session cookie Secure."""
     auth = auth_state or AuthState()
-    tls = bool(tls_cert)
-    validate_bind_security(host, auth, tls=tls, allow_insecure_http=allow_insecure_http)
+    validate_bind_security(host, auth, tls=bool(certfile), allow_insecure_http=allow_insecure_http)
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
-    handler.secure_cookies = tls
+    handler.secure_cookies = bool(certfile)
     server = ThreadingHTTPServer((host, port), handler)
-    if tls:
+    if certfile:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(tls_cert, tls_key)
+        context.load_cert_chain(certfile, keyfile or None)
         server.socket = context.wrap_socket(server.socket, server_side=True)
     return server
 
@@ -74,30 +71,31 @@ def serve(
     port: int = 8716,
     control_plane: ControlPlane | None = None,
     auth_state: AuthState | None = None,
-    **transport: Any,
+    certfile: str | None = None,
+    keyfile: str | None = None,
+    *,
+    allow_insecure_http: bool = False,
 ) -> None:
-    make_server(host, port, control_plane, auth_state, **transport).serve_forever()
+    make_server(
+        host, port, control_plane, auth_state, certfile, keyfile, allow_insecure_http=allow_insecure_http
+    ).serve_forever()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="InferenceDeck web UI and control API")
+    parser = argparse.ArgumentParser(description="InferenceDeck local web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8716)
-    parser.add_argument("--tls-cert", help="PEM certificate: serve HTTPS (needed off loopback unless on Tailscale)")
-    parser.add_argument("--tls-key", help="PEM private key for --tls-cert")
+    parser.add_argument("--certfile", help="PEM certificate (with chain) to serve HTTPS; needed off loopback unless on Tailscale")
+    parser.add_argument("--keyfile", help="PEM private key, if not included in --certfile")
     parser.add_argument(
         "--allow-insecure-http",
         action="store_true",
         help="allow a plain-HTTP non-loopback bind (credentials travel unencrypted)",
     )
     args = parser.parse_args()
-    serve(
-        args.host,
-        args.port,
-        tls_cert=args.tls_cert,
-        tls_key=args.tls_key,
-        allow_insecure_http=args.allow_insecure_http,
-    )
+    if args.keyfile and not args.certfile:
+        parser.error("--keyfile needs --certfile")
+    serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile, allow_insecure_http=args.allow_insecure_http)
     return 0
 
 

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
+import sysconfig
 import urllib.error
 import urllib.request
 import importlib.util
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -231,6 +235,323 @@ def detect_vllm() -> Environment:
     )
 
 
+def _vllm_cpp_roots(config: AppConfig) -> list[Path]:
+    roots: list[Path] = []
+    home = os.environ.get("VLLM_CPP_HOME")
+    if home:
+        roots.append(Path(home).expanduser())
+    roots.extend(Path(raw).expanduser() for raw in config.runtime_dirs if raw)
+    # A source build puts vllm-server in build/examples; a release archive in bin.
+    expanded: list[Path] = []
+    for root in roots:
+        expanded.extend([root, root / "build" / "examples"])
+    return [path for path in expanded if path.is_dir()]
+
+
+VLLM_CPP_VERSION_RE = re.compile(r"vllm\.cpp\s+v?(\d[\w.+-]*)")
+
+
+def _vllm_cpp_installed_version(binary: str | None) -> tuple[str | None, str | None]:
+    """(version, source) of an installed vllm-server, without needing it to be running.
+
+    A release archive carries ``VERSION`` beside ``release-manifest.json`` at its
+    root (the binary is ``bin/vllm-server``). Otherwise ``vllm-server --version``
+    prints ``vllm.cpp 0.0.3+cuda c-abi=29``.
+    """
+
+    if not binary:
+        return None, None
+    root = Path(binary).parent.parent
+    if (root / "release-manifest.json").is_file():
+        try:
+            text = (root / "VERSION").read_text(encoding="utf-8").strip()
+        except OSError:
+            text = ""
+        if text:
+            return text.splitlines()[0].strip(), "archive"
+    try:
+        result = run_hidden([binary, "--version"], capture_output=True, text=True, timeout=2.0, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    match = VLLM_CPP_VERSION_RE.search(result.stdout or "")
+    return (match.group(1), "binary") if match else (None, None)
+
+
+def detect_vllm_cpp(config: AppConfig | None = None) -> Environment:
+    """vllm.cpp's ``vllm-server``: a standalone C++ engine with vLLM's serving core."""
+
+    app_config = config or AppConfig.load()
+    binary = (
+        _configured_file(app_config.vllm_cpp_server_path)
+        or _find_executable("vllm-server", ["VLLM_CPP_SERVER", "VLLM_CPP_SERVER_BIN"], _vllm_cpp_roots(app_config))
+    )
+
+    configured_url = os.environ.get("VLLM_CPP_SERVER_URL")
+    api_url = _normalize_base_url(configured_url, "http://127.0.0.1:8000")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    # The installed binary is what an update would replace, so its version wins;
+    # a running server's /version stands in when the binary's can't be read.
+    version, version_source = _vllm_cpp_installed_version(binary)
+    if not version and ok:
+        got_version, version_payload, _ = _request_json(f"{api_url}/version")
+        if got_version and isinstance(version_payload, dict) and version_payload.get("version"):
+            version, version_source = str(version_payload["version"]), "server"
+
+    warnings: list[str] = []
+    if not binary:
+        warnings.append(
+            "vllm-server was not found. Set vllm_cpp_server_path in config, VLLM_CPP_SERVER, "
+            "or VLLM_CPP_HOME to a vllm.cpp build or release archive."
+        )
+    return Environment(
+        id="vllm.cpp",
+        kind="local_binary",
+        name="vllm.cpp",
+        available=bool(binary or ok),
+        binary_path=binary,
+        api_url=api_url if ok else None,
+        version=str(version) if version else None,
+        model_count=model_count,
+        details={
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "status": "alpha: CLI flags may change between vllm.cpp releases",
+            "version_source": version_source,
+        },
+        warnings=warnings,
+    )
+
+
+# A source checkout's version.py says this until its release tooling syncs the
+# real version in, so it names no release and can't be compared.
+MLC_LLM_UNSYNCED_VERSION = "0.1.dev0"
+
+# Prints the version of the mlc-llm wheel (nightly and CUDA builds use suffixed
+# names, e.g. mlc-llm-nightly-cu122) installed in the interpreter that runs it.
+_MLC_VERSION_SNIPPET = (
+    "from importlib import metadata\n"
+    "for d in metadata.distributions():\n"
+    "    n = (d.metadata.get('Name') or '').lower().replace('_', '-')\n"
+    "    if n == 'mlc-llm' or n.startswith('mlc-llm-'):\n"
+    "        print(d.version); break\n"
+)
+
+
+def _mlc_llm_package_version() -> str | None:
+    """Version of the mlc-llm wheel installed in this interpreter."""
+
+    for dist in metadata.distributions():
+        name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
+        if name == "mlc-llm" or name.startswith("mlc-llm-"):
+            return dist.version
+    return None
+
+
+def _same_path(a: str | Path, b: str | Path | None) -> bool:
+    if not b:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
+def _script_interpreter(script: str) -> str | None:
+    """The Python a console script runs under, from its ``#!`` line (POSIX only)."""
+
+    try:
+        with open(script, "rb") as fh:
+            first = fh.readline(512).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    interpreter = first[2:].strip().split()[0] if first[2:].strip() else ""
+    return interpreter if interpreter and Path(interpreter).is_file() else None
+
+
+def _mlc_llm_version(invocation: list[str] | None) -> str | None:
+    """Version of the mlc-llm wheel behind ``invocation``.
+
+    ``python -m mlc_llm`` is this interpreter. A console script may belong to
+    another environment (a venv or conda env of its own), so its version is
+    read from the interpreter named on its ``#!`` line.
+    """
+
+    if not invocation:
+        return None
+    version: str | None = None
+    # This interpreter: python -m mlc_llm, or a console script in its own scripts
+    # directory (on Windows those are .exe launchers with no readable #! line).
+    if invocation[0] == sys.executable or _same_path(Path(invocation[0]).parent, sysconfig.get_path("scripts")):
+        version = _mlc_llm_package_version()
+    else:
+        interpreter = _script_interpreter(invocation[0])
+        if interpreter and _same_path(interpreter, sys.executable):
+            version = _mlc_llm_package_version()
+        elif interpreter:
+            try:
+                result = run_hidden(
+                    [interpreter, "-c", _MLC_VERSION_SNIPPET], capture_output=True, text=True, timeout=5.0, check=False
+                )
+                version = (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else None
+            except (OSError, subprocess.SubprocessError):
+                version = None
+    if version == MLC_LLM_UNSYNCED_VERSION:
+        return None
+    return version
+
+
+def mlc_llm_invocation(config: AppConfig | None = None) -> list[str] | None:
+    """How to run the MLC LLM CLI: its console script, else ``python -m mlc_llm``."""
+
+    app_config = config or AppConfig.load()
+    script = _configured_file(app_config.mlc_llm_path) or _find_executable("mlc_llm", ["MLC_LLM_BIN"])
+    if script:
+        return [script]
+    if importlib.util.find_spec("mlc_llm") is not None:
+        return [sys.executable, "-m", "mlc_llm"]
+    return None
+
+
+def detect_mlc_llm(config: AppConfig | None = None) -> Environment:
+    """MLC LLM's ``mlc_llm serve``: TVM-compiled models on CUDA, Metal, Vulkan, ROCm or OpenCL."""
+
+    invocation = mlc_llm_invocation(config)
+    api_url = _normalize_base_url(os.environ.get("MLC_LLM_SERVER_URL"), "http://127.0.0.1:8000")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    warnings: list[str] = []
+    if not invocation:
+        warnings.append(
+            "MLC LLM was not found. Install the mlc-llm package, or set mlc_llm_path in config "
+            "or MLC_LLM_BIN to its mlc_llm command."
+        )
+    return Environment(
+        id="mlc-llm",
+        kind="local_binary",
+        name="MLC LLM",
+        available=bool(invocation or ok),
+        binary_path=invocation[0] if invocation else None,
+        api_url=api_url if ok else None,
+        version=_mlc_llm_version(invocation),
+        model_count=model_count,
+        details={
+            "invocation": invocation,
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "model_format": "MLC weight folders (mlc-chat-config.json) or HF:// ids, not GGUF",
+        },
+        warnings=warnings,
+    )
+
+
+# Release binaries (Linux/macOS names; Windows adds .exe), then a source checkout.
+KOBOLDCPP_NAMES = (
+    "koboldcpp",
+    "koboldcpp-linux-x64",
+    "koboldcpp-linux-x64-nocuda",
+    "koboldcpp-linux-x64-oldpc",
+    "koboldcpp-mac-arm64",
+    "koboldcpp_nocuda",
+    "koboldcpp_oldpc",
+    "koboldcpp_cu12",
+)
+
+# Version per (path, mtime): a one-file KoboldCpp build unpacks itself on every
+# run, so --version can take seconds; ask once per binary, not per inventory.
+_KOBOLDCPP_VERSIONS: dict[tuple[str, float], str | None] = {}
+
+
+def koboldcpp_invocation(config: AppConfig | None = None) -> list[str] | None:
+    """How to run KoboldCpp: its executable, or ``python koboldcpp.py`` for a source checkout."""
+
+    app_config = config or AppConfig.load()
+    configured = _configured_file(app_config.koboldcpp_path) or _env_file("KOBOLDCPP_BIN", "KOBOLDCPP")
+    found = configured
+    if not found:
+        roots = [Path(raw).expanduser() for raw in [os.environ.get("KOBOLDCPP_HOME", "")] + list(app_config.runtime_dirs) if raw]
+        roots = [root for root in roots if root.is_dir()]
+        for name in KOBOLDCPP_NAMES:
+            found = _find_executable(name, roots=roots)
+            if found:
+                break
+        if not found:
+            for root in roots:
+                if (root / "koboldcpp.py").is_file():
+                    found = str(root / "koboldcpp.py")
+                    break
+    if not found:
+        return None
+    return [sys.executable, found] if found.lower().endswith(".py") else [found]
+
+
+def _koboldcpp_version(invocation: list[str] | None) -> str | None:
+    if not invocation:
+        return None
+    target = invocation[-1]
+    try:
+        key = (target, Path(target).stat().st_mtime)
+    except OSError:
+        return None
+    if key not in _KOBOLDCPP_VERSIONS:
+        version = None
+        try:
+            result = run_hidden([*invocation, "--version"], capture_output=True, text=True, timeout=30.0, check=False)
+            # Prints the bare version, e.g. "1.122.1".
+            match = re.search(r"\b(\d+(?:\.\d+)+)\b", result.stdout or "")
+            version = match.group(1) if match else None
+        except (OSError, subprocess.SubprocessError):
+            version = None
+        _KOBOLDCPP_VERSIONS[key] = version
+    return _KOBOLDCPP_VERSIONS[key]
+
+
+def detect_koboldcpp(config: AppConfig | None = None) -> Environment:
+    """KoboldCpp: a single-executable llama.cpp fork serving GGUF over an OpenAI-compatible API."""
+
+    invocation = koboldcpp_invocation(config)
+    api_url = _normalize_base_url(os.environ.get("KOBOLDCPP_SERVER_URL"), "http://127.0.0.1:5001")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    version = _koboldcpp_version(invocation)
+    version_source = "binary" if version else None
+    if not version and ok:
+        got, caps, _ = _request_json(f"{api_url}/api/extra/version")
+        if got and isinstance(caps, dict) and caps.get("version"):
+            version, version_source = str(caps["version"]), "server"
+    warnings: list[str] = []
+    if not invocation:
+        warnings.append(
+            "KoboldCpp was not found. Set koboldcpp_path in config or KOBOLDCPP_BIN to its executable "
+            "(or koboldcpp.py), or put it in KOBOLDCPP_HOME or runtime_dirs."
+        )
+    return Environment(
+        id="koboldcpp",
+        kind="local_binary",
+        name="KoboldCpp",
+        available=bool(invocation or ok),
+        binary_path=invocation[-1] if invocation else None,
+        api_url=api_url if ok else None,
+        version=version,
+        model_count=model_count,
+        details={
+            "invocation": invocation,
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "version_source": version_source,
+        },
+        warnings=warnings,
+    )
+
+
 def detect_mlx() -> Environment:
     module_available = importlib.util.find_spec("mlx_lm") is not None
     is_macos = os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
@@ -313,13 +634,16 @@ def detect_all(project_root: Path | None = None, config: AppConfig | None = None
         detect_ollama(),
         detect_lm_studio(),
         detect_vllm(),
+        detect_vllm_cpp(config),
+        detect_mlc_llm(config),
+        detect_koboldcpp(config),
         detect_mlx(),
     ]
 
 
 # Runtimes whose launch path is actually wired into prepare_launch_command.
 # Others are detectable (and selectable in the UI) but cannot be started yet.
-LAUNCHABLE_RUNTIMES = ("llama.cpp",)
+LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm", "koboldcpp")
 
 
 def detect_runtime(
@@ -333,6 +657,12 @@ def detect_runtime(
         return detect_llama_cpp(project_root, config=config)
     if runtime_id == "wsl-llama.cpp":
         return detect_wsl_llama_cpp()
+    if runtime_id == "vllm.cpp":
+        return detect_vllm_cpp(config)
+    if runtime_id == "mlc-llm":
+        return detect_mlc_llm(config)
+    if runtime_id == "koboldcpp":
+        return detect_koboldcpp(config)
     detectors = {
         "ollama": detect_ollama,
         "lm-studio": detect_lm_studio,

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
+import tempfile
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest import mock
 
-from inferencedeck import tray
+from inferencedeck import server_manager, tray
 from inferencedeck.auth import AuthState
 from inferencedeck.control import ControlPlane
 from inferencedeck.control_api import ControlRequestHandler
@@ -55,6 +58,44 @@ class ApiClientTests(unittest.TestCase):
         state = tray.fetch_state(tray.ApiClient("http://127.0.0.1:1"))
         self.assertIn("not reachable", state.error)
         self.assertEqual(state.kind, "error")
+        self.assertFalse(state.unauthorized)  # unreachable is not an auth problem
+
+    def test_token_file_is_used_like_the_server_uses_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = os.path.join(tmp, "token")
+            with open(token_file, "w", encoding="utf-8") as fh:
+                fh.write("s3cret\n")
+            env = {"INFERENCEDECK_TOKEN": "", "INFERENCEDECK_TOKEN_FILE": token_file}
+            with mock.patch.dict(os.environ, env):
+                self.assertIsNone(tray.fetch_state(tray.ApiClient(self.url)).error)
+
+    def test_rejected_token_is_reported_as_not_signed_in(self) -> None:
+        state = tray.fetch_state(tray.ApiClient(self.url, token="stale"))
+        self.assertTrue(state.unauthorized)
+        self.assertIn("INFERENCEDECK_TOKEN", state.status_text())
+
+
+class AuthBackoffTests(unittest.TestCase):
+    def test_polling_backs_off_after_401_and_recovers(self) -> None:
+        bad = tray.TrayState(error="unauthorized", unauthorized=True)
+        delays, carry = [], 0.0
+        for _ in range(6):
+            delay, carry = tray.next_poll_delay(bad, carry)
+            delays.append(delay)
+        self.assertEqual(delays, [60, 120, 240, 480, 600, 600])
+        self.assertEqual(tray.next_poll_delay(tray.TrayState(), carry), (tray.POLL_SECONDS, 0))
+
+    def test_stale_token_never_locks_out_this_machine(self) -> None:
+        # Drive the tray's schedule against the real throttle for an hour.
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        bad = tray.TrayState(error="unauthorized", unauthorized=True)
+        carry = 0.0
+        while now[0] < 3600:
+            self.assertEqual(auth.retry_after("127.0.0.1"), 0, f"locked out at t={now[0]}")
+            auth.record_failure("127.0.0.1")
+            delay, carry = tray.next_poll_delay(bad, carry)
+            now[0] += delay
 
 
 class TrayStateTests(unittest.TestCase):
@@ -115,6 +156,24 @@ class ControllerTests(unittest.TestCase):
         c.toggle_remote({"name": "oai", "enabled": False})
         c.toggle_remote({"name": "oai", "enabled": True})
         self.assertEqual(api.remote.call_args_list, [mock.call("enable", "oai"), mock.call("disable")])
+
+
+class TimeoutTests(unittest.TestCase):
+    """A tray must wait at least as long as the server may take to start a model."""
+
+    SLOWEST_READY = max(server_manager.READY_TIMEOUT_SECONDS.values())
+
+    def test_tray_outwaits_the_slowest_runtime(self) -> None:
+        for action in ("start", "restore"):
+            self.assertGreater(tray.TIMEOUTS[action], self.SLOWEST_READY, action)
+        self.assertGreater(tray.TIMEOUTS["restart"], tray.TIMEOUTS["stop"] + self.SLOWEST_READY)
+
+    def test_linux_tray_outwaits_the_slowest_runtime(self) -> None:
+        # The Linux tray needs GTK to import, so read its constant from the source.
+        source = (Path(__file__).resolve().parents[1] / "frontends" / "linux" / "inferencedeck_tray.py").read_text(encoding="utf-8")
+        start = int(re.search(r"^START_TIMEOUT_SECONDS = (\d+)$", source, re.M).group(1))
+        self.assertGreater(start, self.SLOWEST_READY)
+        self.assertIn("RESTART_TIMEOUT_SECONDS = STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS", source)
 
 
 class StartWebTests(unittest.TestCase):
@@ -206,6 +265,8 @@ class PystrayMenuTests(unittest.TestCase):
         remote = [i for i in items[tray.menu_text("Remote & cloud models")].submenu.items if "OpenAI" in str(i.text)][0]
         self.assertEqual(str(remote.text), "OpenAI — set $OPENAI_API_KEY")
         self.assertFalse(remote.enabled)
+        self.assertEqual(tray.remote_label({"display_name": "Qwen", "summary": "Thanatos · Tailscale · Self-hosted"}),
+                         "Qwen (Thanatos · Tailscale · Self-hosted)")
         items["Open Web UI"](icon)
         self.assertEqual(opened, [True])
         self.assertTrue(items["Open Web UI"].default)

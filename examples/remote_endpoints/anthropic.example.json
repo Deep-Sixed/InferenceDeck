@@ -1,0 +1,12 @@
+{
+  "provider": "anthropic",
+  "enabled": false,
+  "lane": "true_cloud",
+  "routable": true,
+  "model": "claude-opus-5",
+  "aliases": ["claude"],
+  "baseUrl": "https://api.anthropic.com",
+  "apiKeyEnv": "ANTHROPIC_API_KEY",
+  "displayName": "Claude Opus 5",
+  "tags": ["cloud"]
+}

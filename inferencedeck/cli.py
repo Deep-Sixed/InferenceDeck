@@ -4,8 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
+from .backends import detect_all
+from .config import AppConfig
+from .hf_download import download_model, repo_gguf_listing
 from .inventory import build_inventory
 from .profile_resolver import resolved_inventory, resolve_profiles
+from .runtime_updates import SUPPORTED_CHANNELS, check_runtime_updates
 from .server_manager import list_servers, prepare_launch_command, server_logs, stop_server
 
 
@@ -83,6 +87,39 @@ def logs_command(args: argparse.Namespace) -> int:
     return 0 if result.get("success") else 2
 
 
+def hf_files_command(args: argparse.Namespace) -> int:
+    result = repo_gguf_listing(args.repo_id, revision=args.revision)
+    print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=args.pretty))
+    return 0 if result.get("success") else 2
+
+
+def pull_command(args: argparse.Namespace) -> int:
+    result = download_model(
+        args.repo_id,
+        pattern=args.pattern,
+        quant=args.quant,
+        include_mmproj=not args.no_mmproj,
+        dest_dir=args.dest,
+        revision=args.revision,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=args.pretty))
+    return 0 if result.get("success") else 2
+
+
+def updates_command(args: argparse.Namespace) -> int:
+    config = AppConfig.load()
+    root = Path(args.project_root).expanduser() if args.project_root else None
+    environments = [env.to_dict() for env in detect_all(root, config=config)]
+    payload = check_runtime_updates(
+        environments,
+        channel=args.channel or config.update_channel,
+        force_refresh=args.refresh,
+    )
+    print(json.dumps(payload, indent=2 if args.pretty else None, sort_keys=args.pretty))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m inferencedeck",
@@ -122,6 +159,34 @@ def main(argv: list[str] | None = None) -> int:
     logs_parser.add_argument("--lines", type=int, default=200)
     logs_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     logs_parser.set_defaults(func=logs_command)
+
+    hf_files_parser = subparsers.add_parser("hf-files", help="List the GGUF quants and mmproj files in a Hugging Face repo.")
+    hf_files_parser.add_argument("repo_id", help="Hugging Face repo, e.g. unsloth/gemma-3-4b-it-GGUF.")
+    hf_files_parser.add_argument("--revision", default="main")
+    hf_files_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    hf_files_parser.set_defaults(func=hf_files_command)
+
+    pull_parser = subparsers.add_parser("pull", help="Download one GGUF quant (all shards, plus its mmproj) from Hugging Face.")
+    pull_parser.add_argument("repo_id", help="Hugging Face repo, e.g. unsloth/gemma-3-4b-it-GGUF.")
+    pull_parser.add_argument("--quant", help="Quant to fetch, e.g. Q4_K_M.")
+    pull_parser.add_argument("--pattern", help="Filename glob, e.g. '*UD-Q4_K_XL*'.")
+    pull_parser.add_argument("--no-mmproj", action="store_true", help="Skip the vision projector.")
+    pull_parser.add_argument("--dest", help="Download into this folder instead of the Hugging Face cache.")
+    pull_parser.add_argument("--revision", default="main")
+    pull_parser.add_argument("--dry-run", action="store_true", help="Show what would be downloaded.")
+    pull_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    pull_parser.set_defaults(func=pull_command)
+
+    updates_parser = subparsers.add_parser(
+        "updates", help="Compare installed runtime versions with their latest upstream releases."
+    )
+    updates_parser.add_argument("--project-root", help="Optional existing llama.cpp/control-center root.")
+    updates_parser.add_argument(
+        "--channel", choices=SUPPORTED_CHANNELS, help="Release channel (default: update_channel from config)."
+    )
+    updates_parser.add_argument("--refresh", action="store_true", help="Ignore the one-hour cache and ask GitHub again.")
+    updates_parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    updates_parser.set_defaults(func=updates_command)
 
     _add_common_args(parser)
     parser.set_defaults(func=inventory_command)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -10,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import cache_dir
-from .server_manager import file_lock, list_servers, start_profile, stop_server, write_json_atomic
+from .fileio import atomic_write_text, locked
+from .server_manager import http_base, list_servers, start_profile, stop_server
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -37,17 +37,13 @@ def load_benchmark_results() -> list[dict[str, Any]]:
     return payload if isinstance(payload, list) else []
 
 
-_RESULTS_LOCK = threading.Lock()
-
-
 def save_benchmark_result(result: dict[str, Any]) -> None:
-    # Read-append-write under a lock (threads and other processes), so two
-    # benchmarks finishing together can't drop one result or collide on a temp file.
     path = benchmark_results_path()
-    with file_lock(path.with_suffix(".lock"), _RESULTS_LOCK):
+    # Locked read-modify-write: two benchmarks finishing together keep both results.
+    with locked(path.with_name(path.name + ".lock")):
         results = load_benchmark_results()
         results.append(result)
-        write_json_atomic(path, results[-100:])
+        atomic_write_text(path, json.dumps(results[-100:], indent=2) + "\n")
 
 
 def _server_for_mode(mode: str) -> dict[str, Any] | None:
@@ -58,10 +54,7 @@ def _server_for_mode(mode: str) -> dict[str, Any] | None:
 
 
 def _api_base(server: dict[str, Any]) -> str:
-    host = str(server.get("host") or "127.0.0.1")
-    if host in {"0.0.0.0", "::"}:
-        host = "127.0.0.1"
-    return f"http://{host}:{int(server.get('port') or 8080)}"
+    return http_base(server.get("host"), int(server.get("port") or 8080))
 
 
 def _completion_text(payload: dict[str, Any]) -> str:
@@ -77,6 +70,53 @@ def _fallback_token_count(text: str) -> int:
     if not text:
         return 0
     return max(1, round(len(text) / 4))
+
+
+def _positive(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[str, Any]:
+    """Token counts and throughput for one non-streaming completion.
+
+    llama-server reports a ``timings`` object that splits prompt processing from
+    generation. Dividing completion tokens by the request's wall-clock time mixes
+    the two (and HTTP overhead), under-reporting generation speed, so the server's
+    own numbers win when present and wall-clock is only the fallback.
+    """
+    usage = payload.get("usage") or {}
+    timings = payload.get("timings") or {}
+    completion_count = int(
+        usage.get("completion_tokens") or timings.get("predicted_n") or usage.get("predicted_n")
+        or _fallback_token_count(text)
+    )
+    prompt_count = int(usage.get("prompt_tokens") or timings.get("prompt_n") or usage.get("prompt_n") or 0)
+    end_to_end = completion_count / elapsed if completion_count else 0.0
+
+    predicted_ms = _positive(timings.get("predicted_ms"))
+    generation = _positive(timings.get("predicted_per_second"))
+    if generation is None and predicted_ms and _positive(timings.get("predicted_n")):
+        generation = float(timings["predicted_n"]) / (predicted_ms / 1000.0)
+    prompt_ms = _positive(timings.get("prompt_ms"))
+    prompt_speed = _positive(timings.get("prompt_per_second"))
+    if prompt_speed is None and prompt_ms and _positive(timings.get("prompt_n")):
+        prompt_speed = float(timings["prompt_n"]) / (prompt_ms / 1000.0)
+
+    return {
+        "completion_tokens": completion_count,
+        "prompt_tokens": prompt_count,
+        # Generation speed: the server's decode rate when reported, else wall-clock.
+        "tokens_per_second": round(generation if generation is not None else end_to_end, 2),
+        "prompt_tokens_per_second": round(prompt_speed, 2) if prompt_speed is not None else None,
+        "end_to_end_tokens_per_second": round(end_to_end, 2),
+        "prompt_seconds": round(prompt_ms / 1000.0, 3) if prompt_ms else None,
+        "generation_seconds": round(predicted_ms / 1000.0, 3) if predicted_ms else None,
+        "timing_source": "server" if generation is not None else "wall_clock",
+    }
 
 
 def send_chat_prompt(
@@ -122,19 +162,14 @@ def send_chat_prompt(
         return {"success": False, "error": str(exc), "endpoint": f"{base_url}/v1/chat/completions"}
     elapsed = max(time.perf_counter() - started, 0.001)
 
-    usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
 
     return {
         "success": True,
         "reply": text,
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0),
-        "tokens_per_second": round(tokens_per_second, 2),
+        **_speed_metrics(response_payload, text, elapsed),
     }
 
 
@@ -145,24 +180,39 @@ def run_profile_benchmark(
     overrides: dict[str, Any] | None = None,
     prompt: str | None = None,
     completion_tokens: int = 128,
-    restart: bool = True,
+    restart: bool = False,
     stop_after: bool = False,
-    ready_timeout_seconds: int = 90,
+    # None: wait as long as this profile's runtime needs to load (see
+    # server_manager.READY_TIMEOUT_SECONDS; vllm.cpp and MLC LLM take far longer than llama.cpp).
+    ready_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    """Time one chat completion against the profile's server.
+
+    A server already running for ``mode`` is benchmarked as it is; one is only
+    started (with ``overrides``) when none is running or ``restart`` is set.
+    The completion length is capped per request via ``max_tokens``, never as a
+    server flag, so the server is left as the user configured it.
+    """
+
     params = dict(overrides or {})
-    params["n_predict"] = int(completion_tokens)
-    start = start_profile(
-        mode=mode,
-        project_root=project_root,
-        model_dirs=model_dirs,
-        overrides=params,
-        stop_existing=restart,
-        wait_ready=True,
-        ready_timeout_seconds=ready_timeout_seconds,
-    )
-    server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
-    if not server:
-        return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    server = None if restart else _server_for_mode(mode)
+    start = None
+    if server is None:
+        start = start_profile(
+            mode=mode,
+            project_root=project_root,
+            model_dirs=model_dirs,
+            overrides=params or None,
+            stop_existing=restart,
+            wait_ready=True,
+            ready_timeout_seconds=ready_timeout_seconds,
+        )
+        server = (start.get("server") if start.get("success") else None) or _server_for_mode(mode)
+        if not server:
+            return {"success": False, "error": start.get("error") or "No running tracked server was available.", "start": start}
+    if server.get("suspended"):
+        # A paused process can't answer; the request would just hang until timeout.
+        return {"success": False, "error": f"Server for '{mode}' is paused; resume it before benchmarking.", "server": server}
 
     base_url = _api_base(server)
     request_payload = {
@@ -171,7 +221,8 @@ def run_profile_benchmark(
             {"role": "system", "content": "You are benchmarking local inference. Answer directly."},
             {"role": "user", "content": prompt or DEFAULT_PROMPT},
         ],
-        "temperature": float(params.get("temperature", 0.2) or 0.2),
+        # 0 is a real setting (greedy decoding); only a missing value gets the default.
+        "temperature": float(0.2 if params.get("temperature") is None else params["temperature"]),
         "max_tokens": int(completion_tokens),
         "stream": False,
     }
@@ -193,10 +244,8 @@ def run_profile_benchmark(
 
     usage = response_payload.get("usage") or {}
     text = _completion_text(response_payload)
-    completion_count = int(usage.get("completion_tokens") or usage.get("predicted_n") or _fallback_token_count(text))
-    prompt_count = int(usage.get("prompt_tokens") or usage.get("prompt_n") or 0)
-    total_count = int(usage.get("total_tokens") or (prompt_count + completion_count))
-    tokens_per_second = completion_count / elapsed if completion_count else 0.0
+    speed = _speed_metrics(response_payload, text, elapsed)
+    total_count = int(usage.get("total_tokens") or (speed["prompt_tokens"] + speed["completion_tokens"]))
     chars_per_second = len(text) / elapsed if text else 0.0
 
     benchmark = {
@@ -205,14 +254,13 @@ def run_profile_benchmark(
         "server_id": server.get("id"),
         "endpoint": f"{base_url}/v1/chat/completions",
         "elapsed_seconds": round(elapsed, 3),
-        "completion_tokens": completion_count,
-        "prompt_tokens": prompt_count,
+        **speed,
         "total_tokens": total_count,
-        "tokens_per_second": round(tokens_per_second, 2),
         "chars_per_second": round(chars_per_second, 1),
         "response_chars": len(text),
         "requested_max_tokens": int(completion_tokens),
         "usage": usage,
+        "timings": response_payload.get("timings"),
     }
     save_benchmark_result(benchmark)
 

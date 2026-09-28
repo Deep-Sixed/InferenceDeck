@@ -8,7 +8,7 @@ from typing import Any
 
 from .estimates import estimate_tokens_per_second
 from .hardware import detect_system_hardware
-from .llama_args import normalize_gpu_layers
+from .llama_args import multi_gpu_args, normalize_gpu_layers
 from .server_manager import prepare_launch_command
 from .proc import run as run_hidden
 
@@ -37,6 +37,8 @@ INT_FLAGS = {
     "-n": "n_predict",
     "--predict": "n_predict",
     "--n-predict": "n_predict",
+    "-mg": "main_gpu",
+    "--main-gpu": "main_gpu",
 }
 FLOAT_FLAGS = {
     "--temp": "temperature",
@@ -52,6 +54,10 @@ STRING_FLAGS = {
     "--cache-type-k": "cache_type_k",
     "-ctv": "cache_type_v",
     "--cache-type-v": "cache_type_v",
+    "-sm": "split_mode",
+    "--split-mode": "split_mode",
+    "-ts": "tensor_split",
+    "--tensor-split": "tensor_split",
 }
 GPU_LAYER_FLAGS = {"-ngl", "--gpu-layers", "--n-gpu-layers"}
 BOOL_FLAGS = {"-fa": "flash_attn", "--flash-attn": "flash_attn", "--reasoning": "reasoning"}
@@ -85,6 +91,9 @@ FIT_APPLY_KEYS = {
     "reasoning",
     "kv_offload",
     "op_offload",
+    "split_mode",
+    "tensor_split",
+    "main_gpu",
 }
 
 
@@ -146,6 +155,8 @@ def build_fit_args(fit_binary: str, model_path: str, params: dict[str, Any], tar
         args.extend(["--predict", str(params["n_predict"])])
     if "reasoning" in params and params["reasoning"]:
         args.append("--reasoning")
+    # The split decides how much lands on each GPU, so the fit must see it.
+    args.extend(multi_gpu_args(params))
     return args
 
 
@@ -285,6 +296,12 @@ def run_fit_test(
     prepared = prepare_launch_command(mode, project_root=project_root, model_dirs=model_dirs, overrides=overrides)
     if not prepared.get("success"):
         return prepared
+    if prepared.get("runtime", "llama.cpp") != "llama.cpp":
+        return {
+            "success": False,
+            "error": f"Fit uses llama-fit-params, which only sizes llama.cpp profiles; this profile runs on {prepared['runtime']}.",
+            "prepared": prepared,
+        }
 
     fit_binary = prepared.get("environment", {}).get("details", {}).get("llama_fit_params")
     if not fit_binary or not Path(fit_binary).is_file():

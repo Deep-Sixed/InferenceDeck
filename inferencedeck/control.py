@@ -4,15 +4,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .backends import detect_llama_cpp
+from .backends import detect_all, detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
 from .config import AppConfig
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
+from .hf_download import download_model, repo_gguf_listing
 from .inventory import build_inventory
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
+from .runtime_updates import check_runtime_updates
 from .server_manager import (
     CONTEXT_PRESETS,
     list_servers,
@@ -65,6 +67,7 @@ class ControlPlane:
                 "restart": True,
                 "prepare": True,
                 "logs": True,
+                "hf_download": True,
             },
             "context_presets": list(CONTEXT_PRESETS),
         }
@@ -90,8 +93,7 @@ class ControlPlane:
     def benchmark(
         self, mode: str, overrides: dict[str, Any] | None = None, *, completion_tokens: int = 128
     ) -> dict[str, Any]:
-        # Benchmarking starts (or restarts) a local server, so it obeys the same
-        # local/remote exclusivity as Start.
+        # A benchmark may start a local server, so it obeys the same rule as Start.
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
@@ -103,6 +105,23 @@ class ControlPlane:
             completion_tokens=completion_tokens,
         )
 
+    def hf_files(self, repo_id: str) -> dict[str, Any]:
+        """The GGUF quants and vision projectors a Hugging Face repo offers."""
+        return repo_gguf_listing(repo_id)
+
+    def hf_download(
+        self,
+        repo_id: str,
+        *,
+        quant: str | None = None,
+        pattern: str | None = None,
+        include_mmproj: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Download one quant (all shards, plus its mmproj) into the HF cache,
+        which model discovery already scans."""
+        return download_model(repo_id, pattern=pattern, quant=quant, include_mmproj=include_mmproj, dry_run=dry_run)
+
     def benchmark_history(self) -> list[dict[str, Any]]:
         return load_benchmark_results()
 
@@ -113,6 +132,17 @@ class ControlPlane:
         env = detect_llama_cpp(root, config=self._config())
         return env.details["runtime_selection"]
 
+    def updates(self, *, refresh: bool = False) -> dict[str, Any]:
+        """Installed runtime versions against their latest upstream releases.
+
+        GitHub answers are cached for an hour; ``refresh`` asks again. Nothing is
+        ever downloaded or replaced.
+        """
+        root = Path(self.project_root).expanduser().resolve() if self.project_root else find_project_root()
+        config = self._config()
+        environments = [env.to_dict() for env in detect_all(root, config=config)]
+        return check_runtime_updates(environments, channel=config.update_channel, force_refresh=refresh)
+
     def set_runtime(self, runtime: str) -> dict[str, Any]:
         """Pin a discovered, compatible build (by id), or go back to "auto"."""
         runtime = (runtime or "").strip()
@@ -122,9 +152,7 @@ class ControlPlane:
                 raise ValueError(f"Unknown runtime: {runtime}")
             if not match["compatible"]:
                 raise ValueError(f"{match['label']} can't run on this machine: {match['incompatible_reason']}")
-        config = self._config()
-        config.llama_runtime = runtime
-        config.save()
+        AppConfig.update(lambda config: setattr(config, "llama_runtime", runtime))
         return {"success": True, "runtime": self.runtime()}
 
     def remote_endpoints(self) -> dict[str, Any]:

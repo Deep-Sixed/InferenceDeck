@@ -8,7 +8,7 @@ from pathlib import Path
 
 from inferencedeck.config import AppConfig
 from inferencedeck.estimates import estimate_memory_fit, estimate_tokens_per_second
-from inferencedeck.fit import apply_fit_suggestions, build_fit_args, parse_fit_output
+from inferencedeck.fit import apply_fit_suggestions, build_fit_args, parse_fit_output, parse_fitted_args
 from inferencedeck.hardware import _parse_cpuinfo
 from inferencedeck.hf_metadata import infer_query
 from inferencedeck.inventory import build_inventory
@@ -359,6 +359,75 @@ class LaunchArgsTests(unittest.TestCase):
         self.assertIn("--no-kv-offload", cmd.argv)
         self.assertIn("--no-op-offload", cmd.argv)
 
+    def test_multi_gpu_lora_rope_and_metadata_flags(self) -> None:
+        cmd = build_llama_server_args(
+            "llama-server",
+            "m.gguf",
+            {
+                "split_mode": "Row",
+                "tensor_split": [3, 1.5],
+                "main_gpu": 1,
+                "rpc_servers": ["10.0.0.2:50052", "10.0.0.3:50052"],
+                "override_kv": ["tokenizer.ggml.add_bos_token=bool:false", "general.name=str:a,b"],
+                "lora": ["style.gguf", {"path": "domain.gguf", "scale": 0.5}],
+                "rope_scaling": "yarn",
+                "rope_scale": 4,
+                "yarn_orig_ctx": 32768,
+                "numa": True,
+            },
+        )
+        argv = cmd.argv
+
+        def value(flag: str) -> str:
+            return argv[argv.index(flag) + 1]
+
+        self.assertEqual(value("--split-mode"), "row")
+        self.assertEqual(value("--tensor-split"), "3,1.5")
+        self.assertEqual(value("--main-gpu"), "1")
+        self.assertEqual(value("--rpc"), "10.0.0.2:50052,10.0.0.3:50052")
+        # One flag per override, so a comma inside a str value survives.
+        overrides = [argv[i + 1] for i, token in enumerate(argv) if token == "--override-kv"]
+        self.assertEqual(overrides, ["tokenizer.ggml.add_bos_token=bool:false", "general.name=str:a,b"])
+        self.assertEqual(value("--lora"), "style.gguf")
+        self.assertEqual(value("--lora-scaled"), "domain.gguf:0.5")
+        self.assertEqual(value("--rope-scaling"), "yarn")
+        self.assertEqual(value("--rope-scale"), "4")
+        self.assertEqual(value("--yarn-orig-ctx"), "32768")
+        self.assertEqual(value("--numa"), "distribute")
+        self.assertEqual(cmd.warnings, [])
+
+    def test_comma_string_tensor_split_and_bad_values_warn(self) -> None:
+        cmd = build_llama_server_args("llama-server", "m.gguf", {"tensor_split": "3, 1"})
+        self.assertEqual(cmd.argv[cmd.argv.index("--tensor-split") + 1], "3,1")
+
+        bad = build_llama_server_args(
+            "llama-server",
+            "m.gguf",
+            {
+                "split_mode": "diagonal",
+                "tensor_split": "3,x",
+                "main_gpu": "first",
+                "override_kv": "no-type-here",
+                "lora": [{"path": "a.gguf", "scale": "big"}],
+                "rope_scaling": "cubic",
+                "numa": "everywhere",
+            },
+        )
+        for flag in ("--split-mode", "--tensor-split", "--main-gpu", "--override-kv", "--lora-scaled", "--rope-scaling", "--numa"):
+            self.assertNotIn(flag, bad.argv)
+        self.assertEqual(len(bad.warnings), 7)
+
+    def test_fit_carries_and_parses_multi_gpu_split(self) -> None:
+        args = build_fit_args("llama-fit-params", "m.gguf", {"split_mode": "layer", "tensor_split": [1, 1], "main_gpu": 0})
+        self.assertEqual(args[args.index("--split-mode") + 1], "layer")
+        self.assertEqual(args[args.index("--tensor-split") + 1], "1,1")
+        parsed = parse_fitted_args("-c 8192 -ngl 99 -ts 20,12 -sm layer -mg 1")
+        self.assertEqual(parsed["tensor_split"], "20,12")
+        self.assertEqual(parsed["split_mode"], "layer")
+        self.assertEqual(parsed["main_gpu"], 1)
+        applied = apply_fit_suggestions({"ctx_size": 4096}, parsed)
+        self.assertEqual(applied["tensor_split"], "20,12")
+
     def test_string_gpu_layers_do_not_crash(self) -> None:
         # 'all'/'auto' and float-ish strings are valid manifest values elsewhere
         # in the app; the arg builders must not raise on them.
@@ -593,7 +662,7 @@ class KvMetaProbeTests(unittest.TestCase):
 
         def fake_parse(path: str):
             self.parse_calls.append(path)
-            return (32, (256, 128, 128), True)
+            return (32, (256, 128, 128), True, 32768)
 
         est._parse_gguf_meta = fake_parse
         self.model_file = Path(self._tmp) / "model.gguf"
@@ -636,6 +705,57 @@ class KvMetaProbeTests(unittest.TestCase):
         self.assertEqual(len(self.parse_calls), 1)
         rec = self.est.recommend_jinja({"path": str(self.model_file)})
         self.assertTrue(rec["recommended"])
+
+    def test_trained_context_cached_and_backfilled(self) -> None:
+        self.assertEqual(self.est.model_context_length(self.model, probe=True), 32768)
+        self.assertEqual(len(self.parse_calls), 1)
+        self.est._gguf_meta_mem.clear()
+        self.assertEqual(self.est.model_context_length(self.model), 32768)  # cache-only
+        self.assertEqual(len(self.parse_calls), 1)
+
+        # An entry written before trained context was tracked is re-parsed once
+        # by a probing caller, and still served as-is to cache-only callers.
+        data = json.loads(self._cache.read_text(encoding="utf-8"))
+        del data[str(self.model_file)]["n_ctx_train"]
+        self._cache.write_text(json.dumps(data), encoding="utf-8")
+        self.est._gguf_meta_mem.clear()
+        self.assertIsNone(self.est.model_context_length(self.model))
+        self.assertEqual(len(self.parse_calls), 1)
+        self.assertEqual(self.est.model_context_length(self.model, probe=True), 32768)
+        self.assertEqual(len(self.parse_calls), 2)
+
+    def test_fit_warns_past_trained_context_and_resolves_zero(self) -> None:
+        within = self.est.estimate_memory_fit({"ctx_size": 32768}, self.model, None, probe_model=True)
+        self.assertEqual(within["inputs"]["n_ctx_train"], 32768)
+        self.assertFalse(any("trained context" in w for w in within["warnings"]))
+
+        beyond = self.est.estimate_memory_fit({"ctx_size": 65536}, self.model, None, probe_model=True)
+        self.assertTrue(any("trained context (32768)" in w for w in beyond["warnings"]))
+
+        # llama.cpp treats -c 0 as "use the trained context".
+        zero = self.est.estimate_memory_fit({"ctx_size": 0}, self.model, None, probe_model=True)
+        self.assertEqual(zero["inputs"]["ctx_size"], 32768)
+
+    def test_smart_tune_never_exceeds_trained_context(self) -> None:
+        from inferencedeck.smart_tune import _ctx_ladder, auto_tune_fit
+
+        self.assertEqual(_ctx_ladder({"n_ctx_train": 40960})[-2:], [32768, 40960])
+        self.assertEqual(_ctx_ladder({"n_ctx_train": 1024}), [1024])
+        self.assertEqual(_ctx_ladder({"n_ctx_train": 1_000_000})[-1], 131072)
+        self.assertEqual(_ctx_ladder({"name": "unknown"})[-1], 131072)
+
+        hw = {
+            "primary_gpu": {"name": "RTX 4090", "vram_total_bytes": 80 * 1024**3,
+                            "vram_free_bytes": 80 * 1024**3, "vram_bandwidth_gbps": 1000},
+            "memory": {"total_bytes": 64 * 1024**3, "available_bytes": 48 * 1024**3},
+            "cpu": {"logical_cores": 16},
+        }
+        out = auto_tune_fit({"gpu_layers": 0, "ctx_size": 2048}, self.model, hw)
+        self.assertTrue(out["success"])
+        for suggestion in out["suggestions"]:
+            self.assertLessEqual(suggestion["params"]["ctx_size"], 32768)
+        context = next(s for s in out["suggestions"] if "max_context" in s["intents"])
+        self.assertEqual(context["params"]["ctx_size"], 32768)
 
     def test_template_tool_markers(self) -> None:
         self.assertTrue(self.est._template_supports_tools("...{{ tool_call }}..."))
@@ -1000,7 +1120,7 @@ class ServerStopTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 with mock.patch.object(server_manager, "cache_dir", return_value=Path(tmp)):
-                    server_manager.write_state({"servers": [{"id": "s", "mode": "m", "pid": proc.pid, "running": True, "process": server_manager.process_identity(proc.pid)}]})
+                    server_manager.write_state({"servers": [{"id": "s", "mode": "m", "pid": proc.pid, "running": True}]})
                     self.assertTrue(server_manager.suspend_server(server_id="s")["success"])
                     started = time.monotonic()
                     result = server_manager.stop_server(server_id="s")
@@ -1035,7 +1155,7 @@ class ServerStopTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 with mock.patch.object(server_manager, "cache_dir", return_value=Path(tmp)):
                     server_manager.write_state(
-                        {"servers": [{"id": "test-server", "mode": "test", "pid": proc.pid, "process": server_manager.process_identity(proc.pid)}]}
+                        {"servers": [{"id": "test-server", "mode": "test", "pid": proc.pid}]}
                     )
                     result = server_manager.stop_server(server_id="test-server")
             self.assertTrue(result["success"], result)
@@ -1087,10 +1207,51 @@ class RuntimeDispatchTests(unittest.TestCase):
         self.assertEqual(detect_runtime("llama.cpp").id, "llama.cpp")
         self.assertEqual(detect_runtime(None).id, "llama.cpp")
         self.assertEqual(detect_runtime("ollama").id, "ollama")
+        self.assertEqual(detect_runtime("vllm.cpp").id, "vllm.cpp")
+        self.assertEqual(detect_runtime("mlc-llm").id, "mlc-llm")
+        self.assertEqual(detect_runtime("koboldcpp").id, "koboldcpp")
         # Unknown id is rejected (no silent fallback to llama.cpp).
         self.assertIsNone(detect_runtime("nonsense-runtime"))
-        # llama.cpp is the only runtime wired into the launch path so far.
-        self.assertEqual(LAUNCHABLE_RUNTIMES, ("llama.cpp",))
+        # The runtimes wired into the launch path.
+        self.assertEqual(LAUNCHABLE_RUNTIMES, ("llama.cpp", "vllm.cpp", "mlc-llm", "koboldcpp"))
+
+
+
+class BenchmarkSpeedTests(unittest.TestCase):
+    def test_prefers_llama_server_timings_over_wall_clock(self) -> None:
+        from inferencedeck.benchmark import _speed_metrics
+
+        payload = {
+            "usage": {"completion_tokens": 100, "prompt_tokens": 400},
+            "timings": {"prompt_n": 400, "prompt_ms": 500.0, "prompt_per_second": 800.0,
+                        "predicted_n": 100, "predicted_ms": 2000.0, "predicted_per_second": 50.0},
+        }
+        # 4 s wall clock includes 0.5 s of prompt processing plus overhead.
+        speed = _speed_metrics(payload, "x" * 400, 4.0)
+        self.assertEqual(speed["tokens_per_second"], 50.0)
+        self.assertEqual(speed["prompt_tokens_per_second"], 800.0)
+        self.assertEqual(speed["end_to_end_tokens_per_second"], 25.0)
+        self.assertEqual(speed["generation_seconds"], 2.0)
+        self.assertEqual(speed["prompt_seconds"], 0.5)
+        self.assertEqual(speed["timing_source"], "server")
+
+    def test_derives_rate_from_timing_durations(self) -> None:
+        from inferencedeck.benchmark import _speed_metrics
+
+        payload = {"timings": {"prompt_n": 10, "prompt_ms": 100.0, "predicted_n": 64, "predicted_ms": 1600.0}}
+        speed = _speed_metrics(payload, "reply", 3.0)
+        self.assertEqual(speed["completion_tokens"], 64)
+        self.assertEqual(speed["prompt_tokens"], 10)
+        self.assertEqual(speed["tokens_per_second"], 40.0)
+        self.assertEqual(speed["prompt_tokens_per_second"], 100.0)
+
+    def test_falls_back_to_wall_clock_without_timings(self) -> None:
+        from inferencedeck.benchmark import _speed_metrics
+
+        speed = _speed_metrics({"usage": {"completion_tokens": 30, "prompt_tokens": 5}}, "reply", 2.0)
+        self.assertEqual(speed["tokens_per_second"], 15.0)
+        self.assertIsNone(speed["prompt_tokens_per_second"])
+        self.assertEqual(speed["timing_source"], "wall_clock")
 
 
 if __name__ == "__main__":

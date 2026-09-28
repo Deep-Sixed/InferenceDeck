@@ -24,26 +24,60 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from .auth import LOOPBACK_HOSTS
+from .auth import LOOPBACK_HOSTS, token_from_environment
 from .paths import cache_dir, is_windows
 from .proc import NO_WINDOW, run as run_hidden
 
 BASE_URL = os.environ.get("INFERENCEDECK_URL", "http://127.0.0.1:8716").rstrip("/")
-TOKEN = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
 POLL_SECONDS = 5
+# After a 401 the tray polls less and less often (60 s doubling to 10 min), so a
+# stale token makes at most 3 failed attempts in the server's 5-minute window and
+# never trips the lockout that would also block the browser on this machine.
+AUTH_RETRY_SECONDS = 60
+AUTH_RETRY_MAX_SECONDS = 600
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
-# Server-side waits: start waits for the model to load (up to 45 s); stop allows
-# 5 s for a clean exit plus 3 s after a forced kill; restart does both.
-TIMEOUTS = {"start": 120, "restore": 120, "restart": 140, "stop": 20, "release": 20}
+# Server-side waits: start waits for the model to load (up to 600 s for
+# MLC LLM, see server_manager.READY_TIMEOUT_SECONDS) after finding the runtime
+# and launching it; stop allows 5 s for a clean exit plus 3 s after a forced
+# kill; restart does both. Each client timeout is the server's longest wait
+# plus a minute of headroom, so the tray never gives up on a start that is
+# still going to succeed.
+START_TIMEOUT_SECONDS = 660
+STOP_TIMEOUT_SECONDS = 20
+TIMEOUTS = {
+    "start": START_TIMEOUT_SECONDS,
+    "restore": START_TIMEOUT_SECONDS,
+    "restart": STOP_TIMEOUT_SECONDS + START_TIMEOUT_SECONDS,
+    "stop": STOP_TIMEOUT_SECONDS,
+    "release": STOP_TIMEOUT_SECONDS,
+}
+# Update checks detect every runtime and may ask GitHub about each one (the
+# server caches answers for an hour), so they run at startup and hourly, off
+# the 5 s status poll, with room for several slow GitHub calls.
+UPDATE_CHECK_SECONDS = 3600
+UPDATE_TIMEOUT_SECONDS = 120
 
 
 class ApiError(Exception):
     """A failed API call, carrying the API's own error message."""
 
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def configured_token() -> str:
+    """The token from the environment or token file; read per request so a rotated file is picked up."""
+    try:
+        return token_from_environment()
+    except RuntimeError:  # unreadable token file: send no token, get a clear 401
+        return ""
+
 
 class ApiClient:
-    def __init__(self, base_url: str = BASE_URL, token: str = TOKEN) -> None:
+    def __init__(self, base_url: str = BASE_URL, token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        # None: use INFERENCEDECK_TOKEN / INFERENCEDECK_TOKEN_FILE, like the server.
         self.token = token
 
     def request(self, path: str, body: dict[str, Any] | None = None, timeout: float = 5) -> dict[str, Any]:
@@ -52,8 +86,9 @@ class ApiClient:
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if self.token:
-            headers["X-Auth-Token"] = self.token
+        token = self.token if self.token is not None else configured_token()
+        if token:
+            headers["X-Auth-Token"] = token
         req = urllib.request.Request(self.base_url + path, data=data, headers=headers, method="POST" if data else "GET")
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -64,7 +99,7 @@ class ApiClient:
                 message = payload.get("error") or payload.get("message")
             except (ValueError, OSError, AttributeError):
                 message = None
-            raise ApiError(message or f"HTTP {exc.code}") from None
+            raise ApiError(message or f"HTTP {exc.code}", status=exc.code) from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise ApiError(f"InferenceDeck is not reachable at {self.base_url} ({exc})") from None
 
@@ -95,6 +130,10 @@ class ApiClient:
     def remote(self, action: str, name: str = "") -> dict[str, Any]:
         return self.request("/api/remote", {"action": action, "name": name})
 
+    def updates(self, refresh: bool = False) -> dict[str, Any]:
+        # A refresh (skip the server's cache and ask GitHub) is a POST.
+        return self.request("/api/updates", {} if refresh else None, timeout=UPDATE_TIMEOUT_SECONDS)
+
 
 def is_parked(server: dict[str, Any]) -> bool:
     # Released to free VRAM: no process, but Restore can start it again.
@@ -108,6 +147,7 @@ class TrayState:
     remotes: list[dict[str, Any]] = field(default_factory=list)
     remote_active: dict[str, Any] | None = None
     error: str | None = None
+    unauthorized: bool = False
 
     @property
     def active(self) -> dict[str, Any] | None:
@@ -147,6 +187,8 @@ class TrayState:
         return "idle"
 
     def status_text(self) -> str:
+        if self.unauthorized:
+            return "Not signed in - check INFERENCEDECK_TOKEN or INFERENCEDECK_TOKEN_FILE"
         if self.error:
             return "InferenceDeck unavailable"
         server = self.active
@@ -160,6 +202,32 @@ class TrayState:
         return "Stopped — no tracked server"
 
 
+def available_updates(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [u for u in (payload or {}).get("updates") or [] if u.get("update_available")]
+
+
+def updates_label(payload: dict[str, Any] | None, error: str | None = None) -> str:
+    """The "Runtime updates" menu entry: how many runtimes have a newer release."""
+    if error:
+        return "Runtime updates: check failed"
+    if payload is None:
+        return "Runtime updates: checking…"
+    count = len(available_updates(payload))
+    if count:
+        return f"Runtime updates: {count} available"
+    return "Runtime updates: up to date" if payload.get("updates") else "Runtime updates: nothing to check"
+
+
+def update_entry_label(update: dict[str, Any]) -> str:
+    return f"{update.get('runtime_name')} {update.get('current_version')} → {update.get('latest_version')}"
+
+
+def release_url(update: dict[str, Any]) -> str | None:
+    # Only ever open GitHub release pages from the tray.
+    url = str(update.get("release_url") or "")
+    return url if url.startswith("https://github.com/") else None
+
+
 def fetch_state(api: ApiClient) -> TrayState:
     try:
         status = api.status()
@@ -170,7 +238,15 @@ def fetch_state(api: ApiClient) -> TrayState:
             remote_active=status.get("remote_active"),
         )
     except ApiError as exc:
-        return TrayState(error=str(exc))
+        return TrayState(error=str(exc), unauthorized=exc.status == 401)
+
+
+def next_poll_delay(state: TrayState, auth_delay: float) -> tuple[float, float]:
+    """(seconds until the next poll, auth back-off to carry to the one after)."""
+    if not state.unauthorized:
+        return POLL_SECONDS, 0
+    delay = min(auth_delay * 2, AUTH_RETRY_MAX_SECONDS) if auth_delay else AUTH_RETRY_SECONDS
+    return delay, delay
 
 
 class TrayController:
@@ -188,6 +264,10 @@ class TrayController:
         self.on_change = on_change
         self.background = background or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self.state = TrayState(error="connecting")
+        # Kept apart from state: status polls every 5 s, update checks hourly.
+        self.updates: dict[str, Any] | None = None
+        self.updates_error: str | None = None
+        self._last_update_check = 0.0
 
     def refresh(self) -> None:
         self.state = fetch_state(self.api)
@@ -230,6 +310,37 @@ class TrayController:
 
     def disable_remotes(self) -> None:
         self._run(self.api.remote, "disable")
+
+    def check_updates(self, refresh: bool = False) -> None:
+        """Ask the API about runtime updates in the background.
+
+        ``refresh`` is the menu's "Check now": it skips the server's one-hour
+        cache and reports the outcome.
+        """
+        self._last_update_check = time.monotonic()
+
+        def work() -> None:
+            try:
+                self.updates = self.api.updates(refresh=refresh)
+                self.updates_error = None
+                if refresh:
+                    count = len(available_updates(self.updates))
+                    self.notify(f"{count} runtime update(s) available." if count else "All runtimes are up to date.")
+            except ApiError as exc:
+                self.updates_error = str(exc)
+                if refresh:
+                    self.notify(f"Update check failed: {exc}")
+            self.on_change()
+
+        self.background(work)
+
+    def updates_due(self, now: float | None = None) -> bool:
+        if self.state.error or self.state.unauthorized:
+            return False
+        now = time.monotonic() if now is None else now
+        # Compared against the deadline: now - last can round to just under the
+        # interval for large monotonic readings, deferring a due check.
+        return not self._last_update_check or now >= self._last_update_check + UPDATE_CHECK_SECONDS
 
     def active_command(self) -> str | None:
         return (self.state.active or {}).get("command_line") if self.state.alive else None
@@ -306,6 +417,12 @@ def menu_text(text: str) -> str:
     return text.replace("&", "&&") if is_windows() else text
 
 
+def remote_label(remote: dict[str, Any]) -> str:
+    name = str(remote.get("display_name") or remote.get("name") or "")
+    summary = remote.get("summary")
+    return f"{name} ({summary})" if summary else name
+
+
 def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], None], quit_tray: Callable[[], None]):
     Item, Menu = pystray.MenuItem, pystray.Menu
     st = lambda: controller.state  # noqa: E731 - always read the latest state
@@ -340,13 +457,23 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         for r in st().remotes:
             suffix = " — active" if r.get("enabled") else "" if r.get("selectable") else f" — set ${r.get('api_key_env')}"
             yield Item(
-                menu_text(f"{r.get('display_name') or r.get('name')}{suffix}"),
+                menu_text(f"{remote_label(r)}{suffix}"),
                 remote_action(r),
                 checked=lambda _item, on=bool(r.get("enabled")): on,
                 enabled=bool(r.get("enabled") or r.get("selectable")),
             )
         yield Menu.SEPARATOR
         yield Item("Disable all remote/cloud models", lambda: controller.disable_remotes())
+
+    def open_release(url: str) -> Callable[[], None]:
+        return lambda: webbrowser.open(url)
+
+    def update_items():
+        for update in available_updates(controller.updates):
+            url = release_url(update)
+            yield Item(menu_text(update_entry_label(update)), open_release(url) if url else None, enabled=bool(url))
+        yield Menu.SEPARATOR
+        yield Item("Check now", lambda: controller.check_updates(refresh=True))
 
     def context_items():
         for size in CONTEXT_PRESETS:
@@ -384,6 +511,7 @@ def build_menu(pystray: Any, controller: TrayController, open_web: Callable[[], 
         ),
         Menu.SEPARATOR,
         Item("Copy active command", copy_command, enabled=lambda _i: st().alive),
+        Item(lambda _i: menu_text(updates_label(controller.updates, controller.updates_error)), Menu(update_items)),
         Menu.SEPARATOR,
         Item("Exit tray", lambda: quit_tray()),
     )
@@ -426,12 +554,16 @@ def main() -> int:
 
     def poll(_icon: Any) -> None:
         _icon.visible = True
+        auth_delay = 0.0
         while not stop.is_set():
             try:
                 controller.refresh()
+                if controller.updates_due():
+                    controller.check_updates()
             except Exception as exc:  # one bad update must not freeze the tray for good
                 sys.stderr.write(f"inferencedeck tray refresh failed: {exc}\n")
-            stop.wait(POLL_SECONDS)
+            wait, auth_delay = next_poll_delay(controller.state, auth_delay)
+            stop.wait(wait)
 
     icon.run(setup=poll)
     return 0

@@ -57,6 +57,9 @@ GITHUB_REPOS: dict[str, str] = {
     "wsl-llama.cpp": "ggml-org/llama.cpp",
     "ollama": "ollama/ollama",
     "vllm": "vllm-project/vllm",
+    "vllm.cpp": "mudler/vllm.cpp",
+    "mlc-llm": "mlc-ai/mlc-llm",
+    "koboldcpp": "LostRuins/koboldcpp",
     "mlx": "ml-explore/mlx",
 }
 
@@ -67,6 +70,9 @@ def runtime_label(runtime_id: str) -> str:
         "wsl-llama.cpp": "llama.cpp (WSL)",
         "ollama": "Ollama",
         "vllm": "vLLM",
+        "vllm.cpp": "vllm.cpp",
+        "mlc-llm": "MLC LLM",
+        "koboldcpp": "KoboldCpp",
         "mlx": "MLX",
         "lm-studio": "LM Studio",
     }.get(runtime_id, runtime_id)
@@ -112,11 +118,18 @@ def parse_version(value: str | None) -> tuple[int, ...] | None:
     return None
 
 
+# PEP 440 pre-release and development forms right after a version number:
+# 0.26.dev0, 0.20.0rc1, 0.20.0a1, 0.20.0b2 (MLC LLM's wheels and tags use these).
+PEP440_PRERELEASE_RE = re.compile(r"\d(?:[.\-_]?(?:dev|rc)\d*|(?:a|b)\d+)(?![a-z])")
+
+
 def is_prerelease_tag(tag: str | None) -> bool:
     cleaned = (_strip_leading_v(tag) or "").lower()
     if not cleaned:
         return False
-    return any(marker in cleaned for marker in ("-rc", "-pre", "-alpha", "-beta", "-dev", "preview"))
+    if any(marker in cleaned for marker in ("-rc", "-pre", "-alpha", "-beta", "-dev", "preview")):
+        return True
+    return bool(PEP440_PRERELEASE_RE.search(cleaned))
 
 
 def compare_versions(current: str | None, latest: str | None) -> int:
@@ -143,6 +156,10 @@ def github_release_html_url(repo: str, tag: str | None) -> str:
     if tag:
         return f"https://github.com/{repo}/releases/tag/{tag}"
     return f"https://github.com/{repo}/releases"
+
+
+def github_tags_api_url(repo: str) -> str:
+    return f"https://api.github.com/repos/{repo}/tags?per_page=100"
 
 
 def _request_json(url: str, timeout: float = REQUEST_TIMEOUT_SECONDS) -> tuple[bool, Any, str | None]:
@@ -183,6 +200,11 @@ def fetch_latest_release(repo: str, channel: str, timeout: float = REQUEST_TIMEO
         channel = "stable"
     url = github_release_api_url(repo, channel)
     ok, payload, error = _request_json(url, timeout=timeout)
+    # Some projects tag versions without publishing GitHub releases (or publish
+    # only pre-releases, which /releases/latest skips). Fall back to their tags.
+    no_releases = (not ok and str(error or "").startswith("HTTP Error 404")) or (ok and payload in ([], None))
+    if no_releases:
+        return _latest_from_tags(repo, channel, timeout, releases_error=error)
     if not ok:
         return {
             "ok": False,
@@ -198,6 +220,33 @@ def fetch_latest_release(repo: str, channel: str, timeout: float = REQUEST_TIMEO
         "tag": tag,
         "release_url": github_release_html_url(repo, tag),
         "error": None,
+    }
+
+
+def _latest_from_tags(repo: str, channel: str, timeout: float, releases_error: str | None) -> dict[str, Any]:
+    """The highest version tag for ``channel``: stable tags, or pre-release tags."""
+
+    ok, payload, error = _request_json(github_tags_api_url(repo), timeout=timeout)
+    if not ok or not isinstance(payload, list):
+        return {
+            "ok": False,
+            "tag": None,
+            "release_url": github_release_html_url(repo, None),
+            "error": error or releases_error,
+        }
+    wanted_prerelease = channel == "prerelease"
+    tags = [
+        name
+        for name in (entry.get("name") for entry in payload if isinstance(entry, dict))
+        if name and parse_version(name) is not None and is_prerelease_tag(name) == wanted_prerelease
+    ]
+    tag = max(tags, key=lambda name: parse_version(name) or (), default=None)
+    return {
+        "ok": True,
+        "tag": tag,
+        "release_url": github_release_html_url(repo, tag),
+        "error": None,
+        "source": "tags",
     }
 
 

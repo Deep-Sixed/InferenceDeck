@@ -20,7 +20,31 @@ FAILURE_WINDOW_SECONDS = 300
 MAX_TRACKED_CLIENTS = 1024
 
 
-def _token_from_environment() -> str:
+def trusted_proxies_from_environment() -> frozenset[str]:
+    """INFERENCEDECK_TRUSTED_PROXIES: comma-separated addresses of reverse proxies in front of us."""
+    raw = os.environ.get("INFERENCEDECK_TRUSTED_PROXIES", "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def client_address(peer: str, forwarded_for: str, trusted_proxies: frozenset[str]) -> str:
+    """The address to throttle failed logins by.
+
+    Behind a reverse proxy every request comes from the proxy, so one person's
+    bad attempts would lock out everyone. X-Forwarded-For is honoured only when
+    the connection comes from a configured trusted proxy (anyone else could set
+    it to dodge the throttle), and is read right to left, skipping trusted hops,
+    so a client can't spoof it by adding entries of its own.
+    """
+    if peer not in trusted_proxies or not forwarded_for:
+        return peer
+    for hop in reversed([part.strip() for part in forwarded_for.split(",")]):
+        if hop and hop not in trusted_proxies:
+            return hop
+    return peer
+
+
+def token_from_environment() -> str:
+    """INFERENCEDECK_TOKEN, else the contents of INFERENCEDECK_TOKEN_FILE; "" when neither is set."""
     direct = os.environ.get("INFERENCEDECK_TOKEN", "").strip()
     if direct:
         return direct
@@ -36,7 +60,8 @@ def _token_from_environment() -> str:
 @dataclass
 class AuthState:
     username: str = field(default_factory=lambda: os.environ.get("INFERENCEDECK_USER", "admin").strip() or "admin")
-    token: str = field(default_factory=_token_from_environment)
+    token: str = field(default_factory=token_from_environment)
+    trusted_proxies: frozenset[str] = field(default_factory=trusted_proxies_from_environment)
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     # sid -> expiry; insertion order is issue order, so the oldest is evicted first.
     _sessions: OrderedDict[str, float] = field(default_factory=OrderedDict, init=False, repr=False)
@@ -154,6 +179,6 @@ def validate_bind_security(
         return
     raise RuntimeError(
         f"Refusing plain-HTTP bind on {host}: the login password, token and session cookie would "
-        "cross the network unencrypted. Use --tls-cert/--tls-key, bind to this machine's Tailscale "
+        "cross the network unencrypted. Use --certfile/--keyfile, bind to this machine's Tailscale "
         "address (100.x.y.z) instead of 0.0.0.0, or pass --allow-insecure-http to accept the risk."
     )
