@@ -125,6 +125,30 @@ class SessionLimitTests(unittest.TestCase):
         now[0] += 301
         self.assertEqual(auth.retry_after("10.0.0.5"), 0)
 
+    def test_many_clients_hit_the_global_cap(self) -> None:
+        from inferencedeck.auth import MAX_FAILURES, MAX_GLOBAL_FAILURES, MAX_TRACKED_CLIENTS
+
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        # Spread across clients so none reaches its own limit.
+        for n in range(MAX_GLOBAL_FAILURES):
+            client = f"10.0.{n // (MAX_FAILURES - 1)}.1"
+            self.assertEqual(auth.retry_after(client), 0)
+            auth.record_failure(client)
+        self.assertGreater(auth.retry_after("198.51.100.99"), 0)  # a fresh address is throttled too
+        self.assertLess(MAX_GLOBAL_FAILURES, MAX_TRACKED_CLIENTS)  # so recent failures are never evicted
+        now[0] += 301
+        self.assertEqual(auth.retry_after("198.51.100.99"), 0)
+
+    def test_success_does_not_clear_the_global_count(self) -> None:
+        from inferencedeck.auth import MAX_GLOBAL_FAILURES
+
+        auth = AuthState(username="admin", token="secret")
+        for _ in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure("shared")
+            auth.record_success("shared")
+        self.assertGreater(auth.retry_after("shared"), 0)
+
     def test_success_clears_failures(self) -> None:
         auth = AuthState(username="admin", token="secret")
         for _ in range(4):

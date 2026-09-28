@@ -49,7 +49,7 @@ Environment variables:
 - `INFERENCEDECK_USER` — login name, default `admin`.
 - `INFERENCEDECK_TOKEN` — shared password/token.
 - `INFERENCEDECK_TOKEN_FILE` — file containing the shared password/token.
-- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated addresses of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes); behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. This applies to the control API and the inference gateway alike. The header is ignored from any other address, so clients can't use it to dodge the throttle.
+- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated IP addresses or CIDR ranges (`10.0.0.0/8`; `localhost` means loopback) of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes; IPv6 clients per /64), and at most 50 failures from all clients together per 5 minutes, after which everyone waits until the window clears. Behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. This applies to the control API and the inference gateway alike. The header is ignored from any other address, so clients can't use it to dodge the throttle. Entries that aren't addresses or ranges (hostnames) are reported at startup and ignored.
 
 Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie (also `Secure` when served over HTTPS). Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
 
