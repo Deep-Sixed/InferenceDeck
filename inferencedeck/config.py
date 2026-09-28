@@ -37,6 +37,9 @@ class AppConfig:
     # MLC LLM's mlc_llm command; found on PATH or run as python -m mlc_llm when unset.
     mlc_llm_path: str = ""
     extra_mlc_llm_args: list[str] = field(default_factory=list)
+    # KoboldCpp's executable (or koboldcpp.py); found under runtime_dirs, KOBOLDCPP_HOME or PATH when unset.
+    koboldcpp_path: str = ""
+    extra_koboldcpp_args: list[str] = field(default_factory=list)
     update_channel: str = "stable"
     profile_names: dict[str, str] = field(default_factory=dict)
     server_history_limit: int = 5
@@ -46,6 +49,8 @@ class AppConfig:
     # one-minute averages kept on disk.
     telemetry_sample_seconds: int = 5
     telemetry_retention_days: int = 7
+    # Gateway loads the profile a request's model names, releasing the loaded one.
+    gateway_model_switching: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":
