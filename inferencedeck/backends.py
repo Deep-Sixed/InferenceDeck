@@ -451,6 +451,107 @@ def detect_mlc_llm(config: AppConfig | None = None) -> Environment:
     )
 
 
+# Release binaries (Linux/macOS names; Windows adds .exe), then a source checkout.
+KOBOLDCPP_NAMES = (
+    "koboldcpp",
+    "koboldcpp-linux-x64",
+    "koboldcpp-linux-x64-nocuda",
+    "koboldcpp-linux-x64-oldpc",
+    "koboldcpp-mac-arm64",
+    "koboldcpp_nocuda",
+    "koboldcpp_oldpc",
+    "koboldcpp_cu12",
+)
+
+# Version per (path, mtime): a one-file KoboldCpp build unpacks itself on every
+# run, so --version can take seconds; ask once per binary, not per inventory.
+_KOBOLDCPP_VERSIONS: dict[tuple[str, float], str | None] = {}
+
+
+def koboldcpp_invocation(config: AppConfig | None = None) -> list[str] | None:
+    """How to run KoboldCpp: its executable, or ``python koboldcpp.py`` for a source checkout."""
+
+    app_config = config or AppConfig.load()
+    configured = _configured_file(app_config.koboldcpp_path) or _env_file("KOBOLDCPP_BIN", "KOBOLDCPP")
+    found = configured
+    if not found:
+        roots = [Path(raw).expanduser() for raw in [os.environ.get("KOBOLDCPP_HOME", "")] + list(app_config.runtime_dirs) if raw]
+        roots = [root for root in roots if root.is_dir()]
+        for name in KOBOLDCPP_NAMES:
+            found = _find_executable(name, roots=roots)
+            if found:
+                break
+        if not found:
+            for root in roots:
+                if (root / "koboldcpp.py").is_file():
+                    found = str(root / "koboldcpp.py")
+                    break
+    if not found:
+        return None
+    return [sys.executable, found] if found.lower().endswith(".py") else [found]
+
+
+def _koboldcpp_version(invocation: list[str] | None) -> str | None:
+    if not invocation:
+        return None
+    target = invocation[-1]
+    try:
+        key = (target, Path(target).stat().st_mtime)
+    except OSError:
+        return None
+    if key not in _KOBOLDCPP_VERSIONS:
+        version = None
+        try:
+            result = run_hidden([*invocation, "--version"], capture_output=True, text=True, timeout=30.0, check=False)
+            # Prints the bare version, e.g. "1.122.1".
+            match = re.search(r"\b(\d+(?:\.\d+)+)\b", result.stdout or "")
+            version = match.group(1) if match else None
+        except (OSError, subprocess.SubprocessError):
+            version = None
+        _KOBOLDCPP_VERSIONS[key] = version
+    return _KOBOLDCPP_VERSIONS[key]
+
+
+def detect_koboldcpp(config: AppConfig | None = None) -> Environment:
+    """KoboldCpp: a single-executable llama.cpp fork serving GGUF over an OpenAI-compatible API."""
+
+    invocation = koboldcpp_invocation(config)
+    api_url = _normalize_base_url(os.environ.get("KOBOLDCPP_SERVER_URL"), "http://127.0.0.1:5001")
+    ok, payload, error = _request_json(f"{api_url}/v1/models")
+    model_count = None
+    if ok and isinstance(payload, dict):
+        model_count = len(payload.get("data", []) or [])
+    version = _koboldcpp_version(invocation)
+    version_source = "binary" if version else None
+    if not version and ok:
+        got, caps, _ = _request_json(f"{api_url}/api/extra/version")
+        if got and isinstance(caps, dict) and caps.get("version"):
+            version, version_source = str(caps["version"]), "server"
+    warnings: list[str] = []
+    if not invocation:
+        warnings.append(
+            "KoboldCpp was not found. Set koboldcpp_path in config or KOBOLDCPP_BIN to its executable "
+            "(or koboldcpp.py), or put it in KOBOLDCPP_HOME or runtime_dirs."
+        )
+    return Environment(
+        id="koboldcpp",
+        kind="local_binary",
+        name="KoboldCpp",
+        available=bool(invocation or ok),
+        binary_path=invocation[-1] if invocation else None,
+        api_url=api_url if ok else None,
+        version=version,
+        model_count=model_count,
+        details={
+            "invocation": invocation,
+            "probe_url": api_url,
+            "probe_error": None if ok else error,
+            "version_source": version_source,
+        },
+        warnings=warnings,
+    )
+
+
 def detect_mlx() -> Environment:
     module_available = importlib.util.find_spec("mlx_lm") is not None
     is_macos = os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
@@ -535,13 +636,14 @@ def detect_all(project_root: Path | None = None, config: AppConfig | None = None
         detect_vllm(),
         detect_vllm_cpp(config),
         detect_mlc_llm(config),
+        detect_koboldcpp(config),
         detect_mlx(),
     ]
 
 
 # Runtimes whose launch path is actually wired into prepare_launch_command.
 # Others are detectable (and selectable in the UI) but cannot be started yet.
-LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm")
+LAUNCHABLE_RUNTIMES = ("llama.cpp", "vllm.cpp", "mlc-llm", "koboldcpp")
 
 
 def detect_runtime(
@@ -559,6 +661,8 @@ def detect_runtime(
         return detect_vllm_cpp(config)
     if runtime_id == "mlc-llm":
         return detect_mlc_llm(config)
+    if runtime_id == "koboldcpp":
+        return detect_koboldcpp(config)
     detectors = {
         "ollama": detect_ollama,
         "lm-studio": detect_lm_studio,

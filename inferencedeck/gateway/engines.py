@@ -1,6 +1,6 @@
 """Engine adapters: canonical requests -> an inference server's own API.
 
-- ``OpenAICompatibleEngine``: llama.cpp, vllm.cpp, vLLM, LM Studio, OpenRouter.
+- ``OpenAICompatibleEngine``: llama.cpp, vllm.cpp, KoboldCpp, vLLM, LM Studio, OpenRouter.
 - ``OllamaEngine``: Ollama's native ``/api/chat``, which keeps its own options
   (``num_ctx``, ``keep_alive``, ...) and ``format`` structured output.
 """
