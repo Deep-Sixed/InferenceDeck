@@ -24,3 +24,7 @@ inferencedeck-tray = "inferencedeck.tray:main"
 
 [tool.setuptools.packages.find]
 include = ["inferencedeck*"]
+
+# The web UI's files; without this, built wheels ship no HTML/JS/CSS.
+[tool.setuptools.package-data]
+inferencedeck = ["web/*.html", "web/*.js", "web/*.css"]

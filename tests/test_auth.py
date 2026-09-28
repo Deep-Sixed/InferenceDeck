@@ -17,8 +17,15 @@ class AuthStateTests(unittest.TestCase):
     def test_nonloopback_requires_token(self) -> None:
         with self.assertRaises(RuntimeError):
             validate_bind_security("0.0.0.0", AuthState(token=""))
-        validate_bind_security("0.0.0.0", AuthState(token="secret"))
         validate_bind_security("127.0.0.1", AuthState(token=""))
+        # With a token, a LAN bind still needs an encrypted transport or an explicit opt-out.
+        with self.assertRaisesRegex(RuntimeError, "unencrypted"):
+            validate_bind_security("0.0.0.0", AuthState(token="secret"))
+        validate_bind_security("0.0.0.0", AuthState(token="secret"), tls=True)
+        validate_bind_security("0.0.0.0", AuthState(token="secret"), allow_insecure_http=True)
+        validate_bind_security("100.101.102.103", AuthState(token="secret"))  # Tailscale (WireGuard)
+        with self.assertRaises(RuntimeError):
+            validate_bind_security("100.101.102.103", AuthState(token=""))  # still needs auth
 
     def test_credentials_and_sessions(self) -> None:
         auth = AuthState(username="admin", token="secret")
@@ -124,6 +131,30 @@ class SessionLimitTests(unittest.TestCase):
         self.assertEqual(auth.retry_after("10.0.0.6"), 0)  # other clients unaffected
         now[0] += 301
         self.assertEqual(auth.retry_after("10.0.0.5"), 0)
+
+    def test_many_clients_hit_the_global_cap(self) -> None:
+        from inferencedeck.auth import MAX_FAILURES, MAX_GLOBAL_FAILURES, MAX_TRACKED_CLIENTS
+
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        # Spread across clients so none reaches its own limit.
+        for n in range(MAX_GLOBAL_FAILURES):
+            client = f"10.0.{n // (MAX_FAILURES - 1)}.1"
+            self.assertEqual(auth.retry_after(client), 0)
+            auth.record_failure(client)
+        self.assertGreater(auth.retry_after("198.51.100.99"), 0)  # a fresh address is throttled too
+        self.assertLess(MAX_GLOBAL_FAILURES, MAX_TRACKED_CLIENTS)  # so recent failures are never evicted
+        now[0] += 301
+        self.assertEqual(auth.retry_after("198.51.100.99"), 0)
+
+    def test_success_does_not_clear_the_global_count(self) -> None:
+        from inferencedeck.auth import MAX_GLOBAL_FAILURES
+
+        auth = AuthState(username="admin", token="secret")
+        for _ in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure("shared")
+            auth.record_success("shared")
+        self.assertGreater(auth.retry_after("shared"), 0)
 
     def test_success_clears_failures(self) -> None:
         auth = AuthState(username="admin", token="secret")
