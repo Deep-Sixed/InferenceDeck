@@ -131,7 +131,8 @@ class ApiClient:
         return self.request("/api/remote", {"action": action, "name": name})
 
     def updates(self, refresh: bool = False) -> dict[str, Any]:
-        return self.request("/api/updates" + ("?refresh=1" if refresh else ""), timeout=UPDATE_TIMEOUT_SECONDS)
+        # A refresh (skip the server's cache and ask GitHub) is a POST.
+        return self.request("/api/updates", {} if refresh else None, timeout=UPDATE_TIMEOUT_SECONDS)
 
 
 def is_parked(server: dict[str, Any]) -> bool:

@@ -224,6 +224,11 @@ def render_stream(events: Iterable[StreamEvent], model: str) -> Iterator[bytes]:
     except GatewayError as exc:
         yield _sse("error", render_error(exc))
         return
+    except Exception as exc:
+        # E.g. an upstream chunk of an unexpected shape: still an in-band error,
+        # never an exception out of a response that has already started.
+        yield _sse("error", render_error(GatewayError(502, f"upstream stream failed: {exc}")))
+        return
     if block >= 0:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": block})
     yield _sse("message_delta", {

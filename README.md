@@ -49,7 +49,7 @@ Environment variables:
 - `INFERENCEDECK_USER` — login name, default `admin`.
 - `INFERENCEDECK_TOKEN` — shared password/token.
 - `INFERENCEDECK_TOKEN_FILE` — file containing the shared password/token.
-- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated addresses of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes); behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. The header is ignored from any other address, so clients can't use it to dodge the throttle.
+- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated addresses of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes); behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. This applies to the control API and the inference gateway alike. The header is ignored from any other address, so clients can't use it to dodge the throttle.
 
 Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie (also `Secure` when served over HTTPS). Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
 
@@ -127,7 +127,7 @@ channel defaults to `update_channel` in config.
   its highest matching tag instead.
 
 The web UI's **Runtime updates** card and both trays' **Runtime updates** menu show
-the same results (API: `GET /api/updates`, `?refresh=1` to skip the cache). They check
+the same results (API: `GET /api/updates` for cached results; `POST /api/updates` with a JSON body skips the cache and asks GitHub again). They check
 when they start and then every 30 minutes (web) or hourly (trays); **Check now**
 asks GitHub again. Each update links to its GitHub release page.
 

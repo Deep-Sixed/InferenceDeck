@@ -235,6 +235,62 @@ class GatewayServerTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
+    def _broken_stream_target(self, released: list[bool]) -> Target:
+        class BrokenEngine:
+            api_base = "http://upstream.invalid/v1"
+
+            def stream(self, request):
+                def events():
+                    yield StreamEvent("text", text="Hel")
+                    # Not a GatewayError: e.g. an upstream chunk of an unexpected shape.
+                    raise AttributeError("'str' object has no attribute 'get'")
+                return events()
+
+        class Lease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                released.append(True)
+
+        return Target(BrokenEngine(), "broken", "m", lease=Lease)
+
+    def test_unexpected_stream_failure_is_reported_in_band(self) -> None:
+        chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        anthropic = {"model": "m", "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
+            with self.subTest(path=path):
+                released: list[bool] = []
+                self.target = self._broken_stream_target(released)
+                status, raw = self.post(path, body)
+                self.assertEqual(status, 200)
+                # One response only: no second status line written into the stream.
+                self.assertNotIn(b"HTTP/1.", raw)
+                self.assertIn(b"Hel", raw)
+                self.assertIn(b"upstream stream failed", raw)
+                self.assertEqual(released, [True])  # a model switch isn't left waiting on it
+
+    def test_trusted_proxy_throttles_each_gateway_client_separately(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+
+        def guess(client: str) -> int:
+            return self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": client})[0]
+
+        for _ in range(5):
+            self.assertEqual(guess("198.51.100.7"), 401)
+        self.assertEqual(guess("198.51.100.7"), 429)
+        self.assertEqual(guess("198.51.100.8"), 401)  # another user behind the proxy is not locked out
+
+    def test_untrusted_forwarded_for_cannot_dodge_the_gateway_throttle(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset()))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        for i in range(5):
+            self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": f"198.51.100.{i}"})
+        status, _raw = self.post("/v1/chat/completions", body,
+                                 {"Authorization": "Bearer wrong", "X-Forwarded-For": "198.51.100.99"})
+        self.assertEqual(status, 429)
+
     def test_cross_site_style_posts_never_reach_upstream(self) -> None:
         # What a web page can send without a CORS preflight: text/plain, or a form.
         chat = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
