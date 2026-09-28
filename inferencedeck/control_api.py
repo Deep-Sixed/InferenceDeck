@@ -162,8 +162,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/hf/files":
                 self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
             elif parsed.path == "/api/updates":
-                refresh = (query.get("refresh") or ["0"])[0] in ("1", "true")
-                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=refresh))
+                # Cached answers only. Asking GitHub again is POST /api/updates: a
+                # GET can be fired by any web page (an <img> tag), and each forced
+                # check spends this machine's GitHub API rate limit.
+                self._json(HTTPStatus.OK, self.control_plane.updates(refresh=False))
             elif parsed.path == "/api/logs":
                 server_id = (query.get("server_id") or [""])[0]
                 if not server_id:
@@ -265,6 +267,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     include_mmproj=bool(body.get("include_mmproj", True)),
                     dry_run=bool(body.get("dry_run", False)),
                 )
+            elif parsed.path == "/api/updates":
+                payload = self.control_plane.updates(refresh=True)
             elif parsed.path == "/api/runtime":
                 payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))
             elif parsed.path == "/api/remote":

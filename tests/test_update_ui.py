@@ -79,11 +79,27 @@ class UpdatesApiTests(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=5) as response:
             return json.load(response)
 
+    def _post(self, path: str, content_type: str = "application/json") -> int:
+        req = urllib.request.Request(self.url + path, data=b"{}", method="POST",
+                                     headers={"X-Auth-Token": "s3cret", "Content-Type": content_type})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
     def test_endpoint_serves_cached_results_and_refreshes_on_request(self) -> None:
         self.assertEqual(self._get("/api/updates")["updates"][0]["runtime_id"], "vllm.cpp")
         self.control.updates.assert_called_with(refresh=False)
-        self._get("/api/updates?refresh=1")
+        self.assertEqual(self._post("/api/updates"), 200)
         self.control.updates.assert_called_with(refresh=True)
+
+    def test_a_get_never_forces_a_github_check(self) -> None:
+        # Any web page can fire a GET (an <img> tag); a refresh must be a JSON POST.
+        self._get("/api/updates?refresh=1")
+        self.control.updates.assert_called_once_with(refresh=False)
+        self.assertEqual(self._post("/api/updates", "text/plain"), 415)
+        self.control.updates.assert_called_once_with(refresh=False)
 
     def test_endpoint_requires_auth(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as ctx:

@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from ..auth import LOOPBACK_HOSTS, AuthState, client_address, validate_bind_security
 from ..config import AppConfig
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
@@ -116,6 +116,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; closing the generator closes the upstream
+        except Exception:
+            # The 200 and part of the body are already on the wire, so nothing
+            # may escape to do_POST's error handler: it would write a second
+            # status line into the stream. render_stream reports upstream
+            # failures in-band; anything else just ends the stream here.
+            self.close_connection = True
         finally:
             close = getattr(chunks, "close", None)
             if close is not None:
@@ -127,7 +133,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(HTTPStatus.FORBIDDEN, render_error(GatewayError(403, "host not allowed", "authentication")))
             return False
-        client = str(self.client_address[0])
+        # Same client identity as the control API: behind a trusted reverse proxy
+        # (INFERENCEDECK_TRUSTED_PROXIES), throttle the real client, not the proxy.
+        client = client_address(
+            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
+        )
         wait = self.auth_state.retry_after(client)
         if wait:
             self._send(HTTPStatus.TOO_MANY_REQUESTS,

@@ -306,6 +306,10 @@ def render_stream(events: Iterable[StreamEvent], model: str, include_usage: bool
     except GatewayError as exc:
         # Headers are already sent; report the failure in-band.
         yield _sse(render_error(exc))
+    except Exception as exc:
+        # E.g. an upstream chunk of an unexpected shape: still an in-band error,
+        # never an exception out of a response that has already started.
+        yield _sse(render_error(GatewayError(502, f"upstream stream failed: {exc}")))
     if include_usage and usage is not None:
         yield _sse({
             "id": stream_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [],
