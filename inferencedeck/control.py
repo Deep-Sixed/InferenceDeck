@@ -6,26 +6,35 @@ from typing import Any
 
 from .backends import detect_all, detect_llama_cpp
 from .benchmark import load_benchmark_results, run_profile_benchmark
+from .capabilities import filter_profiles, profile_capabilities
 from .config import AppConfig
+from .config_check import check_all
 from .fit import run_fit_test
 from .hardware import detect_system_hardware
+from .inflight import snapshot as inflight_snapshot
 from .hf_download import download_model, repo_gguf_listing
 from .inventory import build_inventory
+from .live_config import rejected_files
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
-from . import telemetry_history
+from . import fleet as fleet_view
+from . import otlp, telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .runtime_updates import check_runtime_updates
+from .sampling import sampling_presets
 from .server_manager import (
     CONTEXT_PRESETS,
     list_servers,
+    plan_launch,
     prepare_launch_command,
     release_gpu,
     restart_server,
     restore_server,
     resume_server,
+    server_log_paths,
     server_logs,
+    set_idle_release,
     start_profile,
     stop_server,
     suspend_server,
@@ -51,9 +60,18 @@ class ControlPlane:
     def status(self) -> dict[str, Any]:
         servers = list_servers()
         running = [server for server in servers if server.get("running")]
+        # Gateway requests running on each server right now (see inflight.py).
+        gateway = inflight_snapshot()
+        for server in servers:
+            counts = gateway.get(str(server.get("id") or ""))
+            if counts:
+                server["in_flight"] = counts["in_flight"]
+                server["last_request_at"] = counts["last_request_at"]
         remote = active_endpoint()
         return {
             "version": 1,
+            # Config files whose latest edit was rejected; the previous version is in effect.
+            "config_rejected": rejected_files(),
             "running_count": len(running),
             "servers": servers,
             "remote_active": remote.to_dict() if remote else None,
@@ -69,27 +87,49 @@ class ControlPlane:
                 "restart": True,
                 "prepare": True,
                 "logs": True,
+                "idle_release": True,
                 "hf_download": True,
             },
             "context_presets": list(CONTEXT_PRESETS),
+            # Servers without their own idle_release_seconds use this; 0 = off.
+            "idle_release_default_seconds": self._config().idle_release_seconds,
         }
 
     def inventory(self) -> dict[str, Any]:
         return build_inventory(project_root=self.project_root, model_dirs=self.model_dirs)
 
-    def profiles(self) -> list[dict[str, Any]]:
-        return [profile.to_dict() for profile in resolve_profiles(self.project_root, self.model_dirs)]
+    def profiles(self, capability: str | None = None) -> list[dict[str, Any]]:
+        """Resolved profiles with their capabilities; ``capability`` filters (see capabilities.QUERIES)."""
+        profiles = []
+        for resolved in resolve_profiles(self.project_root, self.model_dirs):
+            item = resolved.to_dict()
+            # Cache-only: listing profiles must never block on reading GGUF headers.
+            item["capabilities"] = profile_capabilities(resolved.model, resolved.params, probe=False)
+            profiles.append(item)
+        return filter_profiles(profiles, capability) if capability else profiles
 
     def hardware(self) -> dict[str, Any]:
         return detect_system_hardware()
 
     def telemetry(self) -> dict[str, Any]:
         """Live system, GPU and per-server readings plus lifecycle counters. Collected locally; never sent anywhere."""
-        return telemetry_snapshot()
+        return {**telemetry_snapshot(), "otlp": otlp.status()}
 
     def metrics(self) -> str:
         """The telemetry snapshot in Prometheus text exposition format."""
         return render_prometheus(telemetry_snapshot())
+
+    def _fleet(self) -> fleet_view.Fleet:
+        config = self._config()
+        return fleet_view.current(config.fleet_peers, config.fleet_name)
+
+    def fleet(self) -> dict[str, Any]:
+        """This machine and every configured peer, one summary row each."""
+        return self._fleet().overview()
+
+    def fleet_placement(self, profile: str = "", model: str = "") -> dict[str, Any]:
+        """Machines ranked for running a profile or model file; advice only, nothing is started."""
+        return fleet_view.placement(self._fleet().overview(), profile=profile, model=model)
 
     def telemetry_history(self, range_name: str = "1h") -> dict[str, Any]:
         """Sampled telemetry over ``range_name`` (15m, 1h, 6h, 24h or 7d), bucketed for charts."""
@@ -209,7 +249,15 @@ class ControlPlane:
             "remote": remote.to_dict(),
         }
 
-    def start(self, mode: str, overrides: dict[str, Any] | None = None, *, stop_existing: bool = False) -> dict[str, Any]:
+    def start(
+        self,
+        mode: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        stop_existing: bool = False,
+        release_conflicts: bool = False,
+        force: bool = False,
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
@@ -219,7 +267,12 @@ class ControlPlane:
             model_dirs=self.model_dirs,
             overrides=overrides,
             stop_existing=stop_existing,
+            release_conflicts=release_conflicts,
+            force=force,
         )
+
+    def plan(self, mode: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        return plan_launch(mode, project_root=self.project_root, model_dirs=self.model_dirs, overrides=overrides)
 
     def stop(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
         return stop_server(server_id=server_id, mode=mode)
@@ -233,17 +286,40 @@ class ControlPlane:
     def release_gpu(self, *, server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
         return release_gpu(server_id=server_id, mode=mode)
 
-    def restore(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    def restore(
+        self, server_id: str, overrides: dict[str, Any] | None = None, *, release_conflicts: bool = False, force: bool = False
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
-        return restore_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+        return restore_server(
+            server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs,
+            release_conflicts=release_conflicts, force=force,
+        )
 
-    def restart(self, server_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    def restart(
+        self, server_id: str, overrides: dict[str, Any] | None = None, *, release_conflicts: bool = False, force: bool = False
+    ) -> dict[str, Any]:
         blocked = self._remote_blocks_local()
         if blocked:
             return blocked
-        return restart_server(server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs)
+        return restart_server(
+            server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs,
+            release_conflicts=release_conflicts, force=force,
+        )
+
+    def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
+        return set_idle_release(server_id, seconds)
+
+    def config_check(self) -> dict[str, Any]:
+        root = Path(self.project_root).expanduser() if self.project_root else None
+        return check_all(project_root=root)
+
+    def sampling_presets(self) -> dict[str, Any]:
+        return {"presets": sampling_presets()}
+
+    def log_paths(self, server_id: str) -> dict[str, str] | None:
+        return server_log_paths(server_id)
 
     def logs(self, server_id: str, *, lines: int = 200) -> dict[str, Any]:
         return server_logs(server_id, lines=lines)

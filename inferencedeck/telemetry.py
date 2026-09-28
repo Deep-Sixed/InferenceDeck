@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.request
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -395,6 +396,9 @@ def _server_entry(server: dict[str, Any], now: float, gpu_by_pid: dict[int, int]
         "server_id": server.get("id"),
         "profile": server.get("mode"),
         "runtime": server.get("runtime") or "llama.cpp",
+        # The model file name, so machines whose profiles are named differently
+        # can still be matched on the model they serve.
+        "model": Path(str(server["model_path"])).name if server.get("model_path") else None,
         "pid": pid,
         "status": server.get("status"),
         "running": running,
@@ -466,29 +470,53 @@ def _label_value(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
-class _Exposition:
+@dataclass(frozen=True)
+class Sample:
+    """One metric reading, independent of export format (Prometheus text or OTLP)."""
+
+    name: str
+    kind: str  # "gauge" or "counter"
+    help: str
+    value: float
+    labels: dict[str, Any] = field(default_factory=dict)
+    # When a counter started counting (epoch seconds); OTLP needs it, Prometheus doesn't.
+    start: float | None = None
+
+
+class _MetricSet:
     def __init__(self) -> None:
-        self._families: dict[str, tuple[str, str, list[str]]] = {}
+        self.samples: list[Sample] = []
 
-    def add(self, name: str, kind: str, help_text: str, value: Any, labels: dict[str, Any] | None = None) -> None:
-        if value is None:
-            return
-        family = self._families.setdefault(name, (kind, help_text, []))
-        label_text = ",".join(f'{k}="{_label_value(v)}"' for k, v in (labels or {}).items())
-        number = float(value)
-        rendered = str(int(number)) if number.is_integer() else repr(number)
-        family[2].append(f"{name}{{{label_text}}} {rendered}" if label_text else f"{name} {rendered}")
-
-    def render(self) -> str:
-        lines: list[str] = []
-        for name, (kind, help_text, samples) in self._families.items():
-            if samples:
-                lines += [f"# HELP {name} {help_text}", f"# TYPE {name} {kind}", *samples]
-        return "\n".join(lines) + "\n"
+    def add(
+        self,
+        name: str,
+        kind: str,
+        help_text: str,
+        value: Any,
+        labels: dict[str, Any] | None = None,
+        start: float | None = None,
+    ) -> None:
+        if value is not None:
+            self.samples.append(Sample(name, kind, help_text, float(value), dict(labels or {}), start))
 
 
 def render_prometheus(snap: dict[str, Any]) -> str:
-    out = _Exposition()
+    families: dict[str, tuple[Sample, list[str]]] = {}
+    for sample in metric_samples(snap):
+        family = families.setdefault(sample.name, (sample, []))
+        label_text = ",".join(f'{k}="{_label_value(v)}"' for k, v in sample.labels.items())
+        rendered = str(int(sample.value)) if sample.value.is_integer() else repr(sample.value)
+        family[1].append(f"{sample.name}{{{label_text}}} {rendered}" if label_text else f"{sample.name} {rendered}")
+    lines: list[str] = []
+    for name, (first, rows) in families.items():
+        lines += [f"# HELP {name} {first.help}", f"# TYPE {name} {first.kind}", *rows]
+    return "\n".join(lines) + "\n"
+
+
+def metric_samples(snap: dict[str, Any]) -> list[Sample]:
+    """Every metric in a snapshot, in export order."""
+    out = _MetricSet()
+    taken_at = _parse_iso(snap.get("timestamp")) or time.time()
     out.add("inferencedeck_control_uptime_seconds", "gauge", "Seconds since the control process started.", snap.get("control_uptime_seconds"))
 
     system = snap.get("system") or {}
@@ -518,18 +546,20 @@ def render_prometheus(snap: dict[str, Any]) -> str:
             by_profile[key] = server
     for (profile, runtime), server in sorted(by_profile.items()):
         labels = {"profile": profile, "runtime": runtime}
+        uptime = server.get("uptime_seconds")
+        counting_since = taken_at - uptime if uptime is not None else None
         out.add("inferencedeck_server_up", "gauge", "1 when the profile's server process is running.", 1 if server.get("running") else 0, labels)
         out.add("inferencedeck_server_suspended", "gauge", "1 when the server is paused with its model still loaded.", 1 if server.get("suspended") else 0, labels)
         out.add("inferencedeck_server_uptime_seconds", "gauge", "Seconds since the server was started.", server.get("uptime_seconds"), labels)
         out.add("inferencedeck_server_startup_seconds", "gauge", "Seconds from launch until the server answered its health check.", server.get("startup_seconds"), labels)
         out.add("inferencedeck_server_context_size", "gauge", "Configured context size in tokens.", server.get("context_size"), labels)
         out.add("inferencedeck_server_resident_memory_bytes", "gauge", "Server process resident memory.", server.get("rss_bytes"), labels)
-        out.add("inferencedeck_server_cpu_seconds_total", "counter", "Server process CPU time.", server.get("cpu_seconds"), labels)
+        out.add("inferencedeck_server_cpu_seconds_total", "counter", "Server process CPU time.", server.get("cpu_seconds"), labels, counting_since)
         out.add("inferencedeck_server_gpu_memory_bytes", "gauge", "GPU memory held by the server process.", server.get("gpu_memory_bytes"), labels)
         out.add("inferencedeck_server_requests_active", "gauge", "Requests the server is processing.", server.get("requests_active"), labels)
         out.add("inferencedeck_server_requests_deferred", "gauge", "Requests waiting for a free slot.", server.get("requests_deferred"), labels)
-        out.add("inferencedeck_server_prompt_tokens_total", "counter", "Prompt tokens processed since the server started.", server.get("prompt_tokens_total"), labels)
-        out.add("inferencedeck_server_generated_tokens_total", "counter", "Tokens generated since the server started.", server.get("tokens_generated_total"), labels)
+        out.add("inferencedeck_server_prompt_tokens_total", "counter", "Prompt tokens processed since the server started.", server.get("prompt_tokens_total"), labels, counting_since)
+        out.add("inferencedeck_server_generated_tokens_total", "counter", "Tokens generated since the server started.", server.get("tokens_generated_total"), labels, counting_since)
         out.add("inferencedeck_server_generation_tokens_per_second", "gauge", "Generation speed while generating, since the previous reading.", server.get("tokens_per_second"), labels)
         out.add("inferencedeck_server_prompt_tokens_per_second", "gauge", "Prompt processing speed while processing, since the previous reading.", server.get("prompt_tokens_per_second"), labels)
         out.add("inferencedeck_server_kv_cache_usage_ratio", "gauge", "Share of the KV cache in use.", None if server.get("kv_cache_usage_percent") is None else server["kv_cache_usage_percent"] / 100, labels)
@@ -537,6 +567,8 @@ def render_prometheus(snap: dict[str, Any]) -> str:
     for bench in snap.get("benchmarks") or []:
         out.add("inferencedeck_benchmark_tokens_per_second", "gauge", "Generation speed from the profile's most recent benchmark.", bench.get("tokens_per_second"), {"profile": bench.get("profile")})
 
+    control_uptime = snap.get("control_uptime_seconds")
+    control_start = taken_at - control_uptime if control_uptime is not None else None
     for counter in (snap.get("lifecycle") or {}).get("counters") or []:
         out.add(
             "inferencedeck_lifecycle_events_total",
@@ -544,5 +576,6 @@ def render_prometheus(snap: dict[str, Any]) -> str:
             "Server lifecycle events seen by this control process.",
             counter["count"],
             {"event": counter["event"], "profile": counter["profile"], "runtime": counter["runtime"]},
+            control_start,
         )
-    return out.render()
+    return out.samples
