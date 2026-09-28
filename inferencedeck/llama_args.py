@@ -306,7 +306,8 @@ def build_llama_server_args(
     args.append("--op-offload" if params.get("op_offload", True) else "--no-op-offload")
     # Serves llama-server's own Prometheus counters (tokens, requests, KV cache),
     # which InferenceDeck's telemetry reads for tokens/sec and request counts.
-    if params.get("metrics", True):
+    # Only on builds known to accept it: an unknown flag would stop the server starting.
+    if params.get("metrics", True) and (flags is None or "--metrics" in flags):
         args.append("--metrics")
 
     device = params.get("device", params.get("cuda_device"))

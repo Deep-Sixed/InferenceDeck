@@ -267,8 +267,8 @@ def run_profile_benchmark(
     emit_event(
         "benchmark.completed",
         server,
-        tokens_per_second=benchmark["tokens_per_second"],
-        completion_tokens=completion_count,
+        tokens_per_second=benchmark.get("tokens_per_second"),
+        completion_tokens=benchmark.get("completion_tokens"),
         elapsed_seconds=benchmark["elapsed_seconds"],
     )
 
