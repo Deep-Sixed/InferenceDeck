@@ -154,7 +154,22 @@ class SessionLimitTests(unittest.TestCase):
         for _ in range(MAX_GLOBAL_FAILURES):
             auth.record_failure("shared")
             auth.record_success("shared")
-        self.assertGreater(auth.retry_after("shared"), 0)
+        self.assertGreater(auth.retry_after("stranger"), 0)
+
+    def test_known_good_clients_ride_out_a_global_lockout(self) -> None:
+        from inferencedeck.auth import KNOWN_GOOD_SECONDS, MAX_FAILURES, MAX_GLOBAL_FAILURES
+
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        auth.record_success("10.9.9.9")  # a client that authenticated earlier
+        for n in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure(f"198.51.{n // (MAX_FAILURES - 1)}.1")
+        self.assertGreater(auth.retry_after("203.0.113.1"), 0)  # unknown clients wait
+        self.assertEqual(auth.retry_after("10.9.9.9"), 0)  # the known-good one doesn't
+        now[0] += KNOWN_GOOD_SECONDS + 1
+        for n in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure(f"192.0.{n // (MAX_FAILURES - 1)}.1")
+        self.assertGreater(auth.retry_after("10.9.9.9"), 0)  # exemption expires
 
     def test_success_clears_failures(self) -> None:
         auth = AuthState(username="admin", token="secret")
