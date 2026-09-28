@@ -337,7 +337,9 @@ class TrayController:
         if self.state.error or self.state.unauthorized:
             return False
         now = time.monotonic() if now is None else now
-        return not self._last_update_check or now - self._last_update_check >= UPDATE_CHECK_SECONDS
+        # Compared against the deadline: now - last can round to just under the
+        # interval for large monotonic readings, deferring a due check.
+        return not self._last_update_check or now >= self._last_update_check + UPDATE_CHECK_SECONDS
 
     def active_command(self) -> str | None:
         return (self.state.active or {}).get("command_line") if self.state.alive else None
