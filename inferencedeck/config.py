@@ -71,6 +71,19 @@ class AppConfig:
     server_history_limit: int = 5
     auto_generate_launch_scripts: bool = True
     auto_scan_on_startup: bool = True
+    # Telemetry history: seconds between samples (0 turns history off) and days of
+    # one-minute averages kept on disk.
+    telemetry_sample_seconds: int = 5
+    telemetry_retention_days: int = 7
+    # OpenTelemetry export (OTLP/HTTP JSON), off while empty. OTEL_EXPORTER_OTLP_ENDPOINT
+    # also enables it; put credentials in OTEL_EXPORTER_OTLP_HEADERS, not here.
+    otlp_endpoint: str = ""
+    otlp_export_seconds: int = 15
+    # Other InferenceDeck control panels to combine into the fleet view, as
+    # {"name", "url", "tokenEnv", "caFile"}; tokens are read from tokenEnv, never stored here.
+    fleet_peers: list[dict[str, Any]] = field(default_factory=list)
+    # This machine's name in the fleet view; empty means the host name.
+    fleet_name: str = ""
     # Release a server's GPU (stop and park it, like Release GPU) after this
     # many seconds without requests; 0 turns it off. A profile param or launch
     # override named idle_release_seconds sets it for one server.
@@ -81,6 +94,9 @@ class AppConfig:
     concurrent_vram_check: str = "block"
     # Gateway loads the profile a request's model names, releasing the loaded one.
     gateway_model_switching: bool = False
+    # With fleet_peers set, order gateway targets that share a model name by where
+    # the model runs best (loaded first). False keeps plain catalog order.
+    gateway_placement: bool = True
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

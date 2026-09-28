@@ -325,6 +325,11 @@ def build_llama_server_args(
         warnings.append("chat_template_kwargs must be a JSON object; it was not passed to llama-server.")
     args.append("--kv-offload" if params.get("kv_offload", True) else "--no-kv-offload")
     args.append("--op-offload" if params.get("op_offload", True) else "--no-op-offload")
+    # Serves llama-server's own Prometheus counters (tokens, requests, KV cache),
+    # which InferenceDeck's telemetry reads for tokens/sec and request counts.
+    # Only on builds known to accept it: an unknown flag would stop the server starting.
+    if params.get("metrics", True) and (flags is None or "--metrics" in flags):
+        args.append("--metrics")
 
     device = params.get("device", params.get("cuda_device"))
     if device not in (None, "", "auto"):

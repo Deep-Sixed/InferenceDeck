@@ -567,18 +567,64 @@ endpoints serve it, behind the same authentication as the rest of the API:
 
 | Endpoint | Format | Contents |
 |---|---|---|
-| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; lifecycle counters and the most recent lifecycle events |
+| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; per-server requests and tokens (see below); the latest benchmark per profile; lifecycle counters and the most recent lifecycle events |
 | `GET /metrics` | Prometheus text | The same readings as `inferencedeck_*` metrics, one series per profile |
 
 Lifecycle events are `server.started`, `server.ready`, `server.start_failed`,
 `server.stopped`, `server.stop_failed`, `server.suspended`, `server.resumed`,
-`server.released` and `server.restored`. Their counters live in memory and reset
+`server.released`, `server.restored` and `benchmark.completed`. Their counters live in memory and reset
 when the control process restarts, as Prometheus counters do. Readings are cached
 for two seconds so a UI poll and a scrape share one `nvidia-smi` call. GPU readings
 need `nvidia-smi`, and per-process memory and CPU time need Linux `/proc`. On other
 platforms those fields are left out. They are never reported as zero.
 
-Scrape it with Prometheus (the token goes in a bearer header, which Prometheus sends natively):
+#### Requests and tokens
+
+InferenceDeck doesn't sit between clients and the inference server, so it reads
+request and token counts from the server itself. llama-server is launched with
+`--metrics` (set `"metrics": false` in a profile to turn this off), and each live
+server's `/metrics` counters are read with a one-second timeout. Paused servers
+are skipped. The readings for each server are:
+
+| Field | Meaning |
+|---|---|
+| `requests_active`, `requests_deferred` | Requests being processed, and waiting for a free slot |
+| `prompt_tokens_total`, `tokens_generated_total` | Token counters since the server started |
+| `tokens_per_second` | Generation speed, over the time the server spent generating since the previous reading. Absent while idle, never zero |
+| `prompt_tokens_per_second` | Prompt-processing speed, measured the same way |
+| `throughput_tokens_per_second` | Tokens generated per wall-clock second since the previous reading (zero while idle) |
+| `kv_cache_usage_percent` | Share of the KV cache in use, on llama.cpp builds that report it |
+
+Rates are worked out from how InferenceDeck's own readings of the counters change,
+so another scraper doesn't change them. llama-server resets its
+`llamacpp:prompt_tokens_seconds` and `llamacpp:predicted_tokens_seconds` gauges on
+every scrape, though, so a separate Prometheus job scraping llama-server directly
+sees those two gauges cover shorter windows. The counters it scrapes are unaffected.
+vllm.cpp servers are read the same way if they serve vLLM-style `vllm:*` metrics.
+
+#### History and graphs
+
+`inferencedeck-web` also samples the snapshot every 5 seconds and keeps it for the
+**Telemetry** card in the web UI. That card has one chart per measure: GPU
+utilisation, VRAM, temperature, power and clock; GPU memory, generation speed,
+prompt-processing speed, active requests and KV cache per server; CPU and RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
+are marked on the charts, with failed starts and stops in red. A data table
+under the charts lists the latest, average and peak value of every series.
+
+The last hour is kept at full resolution in memory. One-minute averages are
+written to one JSON-lines file per UTC day under the cache directory's
+`telemetry/` folder, so the 6h, 24h and 7d views survive a restart. Lifecycle
+events go into the same files. Gaps in a chart mean the control process wasn't
+running. The same data is available as `GET /api/telemetry/history?range=15m|1h|6h|24h|7d`.
+
+| Setting (`config.json`) | Default | Meaning |
+|---|---|---|
+| `telemetry_sample_seconds` | `5` | Seconds between samples; `0` turns history off |
+| `telemetry_retention_days` | `7` | Days of one-minute averages kept on disk |
+
+#### Prometheus
+
+Scrape `/metrics` with Prometheus (the token goes in a bearer header, which Prometheus sends natively):
 
 ```yaml
 scrape_configs:
@@ -588,6 +634,83 @@ scrape_configs:
     authorization:
       credentials_file: /etc/prometheus/inferencedeck-token   # omit when auth is off
 ```
+
+#### OpenTelemetry
+
+`inferencedeck-web` can also push telemetry to an OpenTelemetry Collector, or any
+OTLP/HTTP receiver. It is off unless an endpoint is set, and it is the only
+telemetry that leaves the machine. It speaks OTLP over HTTP with JSON encoding
+(the collector's `otlp` receiver on port 4318), with no extra dependencies.
+
+| Signal | What is sent |
+|---|---|
+| Metrics | The same readings as `/metrics`, every `otlp_export_seconds`. Gauges stay gauges and counters become cumulative sums |
+| Logs | One record per lifecycle event. Failed starts and stops are `WARN` |
+| Traces | An `inferencedeck.server.startup` span from launch until ready (or until it gave up, with error status), and an `inferencedeck.benchmark` span per benchmark run |
+
+Turn it on with `otlp_endpoint` in `config.json`, or the standard environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20...'   # credentials belong here, not in config.json
+export OTEL_SERVICE_NAME=thanatos                                # default: inferencedeck
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=home
+inferencedeck-web
+```
+
+| Setting (`config.json`) | Default | Meaning |
+|---|---|---|
+| `otlp_endpoint` | `""` | OTLP/HTTP base URL; `/v1/metrics`, `/v1/logs` and `/v1/traces` are appended |
+| `otlp_export_seconds` | `15` | Seconds between exports |
+
+A collector that is down doesn't affect InferenceDeck. Events are queued (up to
+2,000) and retried, and a missed metrics round is replaced by the next one.
+`GET /api/telemetry` reports the exporter's state under `otlp`: last export time,
+last error, and counts exported and dropped.
+
+#### Machines (fleet view)
+
+With InferenceDeck running on several machines, one web UI can show them all.
+List the other machines as peers in `config.json`:
+
+```json
+{
+  "fleet_name": "thanatos",
+  "fleet_peers": [
+    {"name": "friday", "url": "https://friday.tail1234.ts.net:8716", "tokenEnv": "FRIDAY_DECK_TOKEN"},
+    {"name": "p70", "url": "http://192.168.1.70:8716", "tokenEnv": "P70_DECK_TOKEN", "caFile": "~/p70-ca.pem"}
+  ]
+}
+```
+
+A **Machines** card then appears in the web UI. It has one row per machine with
+GPU load, VRAM, the models loaded (with their live tok/s), active requests, and
+whether the machine answered. `GET /api/fleet` returns the same data.
+
+- Each peer's `/api/telemetry` is read with its own token, sent as `Authorization: Bearer`.
+  The token comes from the environment variable named by `tokenEnv`, never from
+  `config.json`. A peer bound to the LAN or tailnet requires a token.
+- Peers are asked in parallel with a 3-second timeout, and the combined view is
+  cached for 5 seconds. A slow or offline machine shows as unreachable (with the
+  reason, such as `HTTP 401 (check its token)`) rather than stalling the page.
+- Redirects are refused, so a token is never sent anywhere except the configured URL.
+  `caFile` trusts a private CA for a peer served over HTTPS with `--certfile`.
+- Only `/api/telemetry` is read, never a peer's own fleet view, so machines that
+  list each other don't loop.
+
+**Where should this run?** The card's form, and
+`GET /api/fleet/placement?profile=qwen3-30b` (or `?model=<file>.gguf`), rank the
+machines for a model:
+
+1. machines with it **loaded** and serving;
+2. machines with it loaded but **paused**;
+3. machines that have **run it before** (a stopped or released server, or a benchmark);
+4. the rest.
+
+Within each group, faster machines rank first (live tok/s, else the last benchmark),
+then less busy ones, then those with more free VRAM. Profiles are matched by name,
+or by model file name when profile names differ between machines. This is advice
+only: nothing is started or routed automatically.
 
 ## Inference gateway (API mapping)
 
@@ -672,6 +795,31 @@ The Anthropic API's `thinking` setting is dropped, and its server tools (such as
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
+### Choosing between machines that serve the same model
+
+Two targets can answer to the same name, for example a local `qwen3-30b` and the
+`friday` endpoint aliased `qwen3-30b`. When `fleet_peers` is configured (see
+**Machines** above), the gateway orders them by the fleet's placement ranking:
+
+1. machines with the model **loaded** and serving, fastest first (live tok/s, else
+   the last benchmark), then least busy;
+2. machines that answer but don't have it loaded;
+3. machines the fleet view can't see (for example, no peer entry for that endpoint's host);
+4. machines where it is loaded but **paused**, which can't answer until resumed.
+
+A remote endpoint is matched to a fleet machine by the host name in its `baseUrl`,
+its `host` label, or its file name. Local servers belong to this machine.
+
+This only reorders targets that already match the name. It never starts, stops or
+switches a model, and it never makes a request wait: the gateway reads the fleet
+view it last cached and refreshes it in the background. Until the first view
+arrives, and whenever telemetry is unavailable, targets keep their usual order.
+Without `fleet_peers`, or with `"gateway_placement": false`, routing is exactly as
+described above.
+
+Every reply carries `X-InferenceDeck-Target: <model> @ <endpoint|local>`.
+`GET /route?model=qwen3-30b` shows the target a name would route to and the
+ranking behind it, without loading anything.
 ### Requests in flight
 
 The gateway counts the requests it is sending to each local server, from the moment the

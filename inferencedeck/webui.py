@@ -9,15 +9,20 @@ from importlib.resources import files
 from pathlib import Path
 
 from .auth import AuthState, validate_bind_security
+from .config import AppConfig
 from .control import ControlPlane
 from .config_check import check_all, format_report
 from .control_api import ControlRequestHandler
+from .otlp import start_exporter
+from .telemetry_history import start_sampler
 from .idle import start_idle_monitor
 
 
 ASSET_TYPES = {
     "/app.js": "text/javascript; charset=utf-8",
     "/styles.css": "text/css; charset=utf-8",
+    "/telemetry.js": "text/javascript; charset=utf-8",
+    "/fleet.js": "text/javascript; charset=utf-8",
 }
 
 
@@ -82,6 +87,13 @@ def serve(
     server = make_server(
         host, port, control_plane, auth_state, certfile, keyfile, allow_insecure_http=allow_insecure_http
     )
+    config = AppConfig.load()
+    start_sampler(config.telemetry_sample_seconds, config.telemetry_retention_days)
+    try:
+        start_exporter(config.otlp_endpoint, config.otlp_export_seconds)
+    except ValueError as exc:
+        # A bad export setting shouldn't keep the control panel from starting.
+        print(f"inferencedeck-web: OpenTelemetry export disabled: {exc}", file=sys.stderr)
     # This process owns server state, so it is the one that releases idle servers.
     start_idle_monitor()
     server.serve_forever()

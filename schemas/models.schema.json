@@ -195,6 +195,9 @@
               "embedding": {
                 "type": "boolean"
               },
+              "metrics": {
+                "type": "boolean"
+              },
               "reranking": {
                 "type": "boolean"
               },

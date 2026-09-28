@@ -18,6 +18,8 @@ from .live_config import rejected_files
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
+from . import fleet as fleet_view
+from . import otlp, telemetry_history
 from .remotes import active_endpoint, disable_all, enable_endpoint, list_endpoints
 from .runtime_updates import check_runtime_updates
 from .sampling import sampling_presets
@@ -111,11 +113,32 @@ class ControlPlane:
 
     def telemetry(self) -> dict[str, Any]:
         """Live system, GPU and per-server readings plus lifecycle counters. Collected locally; never sent anywhere."""
-        return telemetry_snapshot()
+        return {**telemetry_snapshot(), "otlp": otlp.status()}
 
     def metrics(self) -> str:
         """The telemetry snapshot in Prometheus text exposition format."""
         return render_prometheus(telemetry_snapshot())
+
+    def _fleet(self) -> fleet_view.Fleet:
+        config = self._config()
+        return fleet_view.current(config.fleet_peers, config.fleet_name)
+
+    def fleet(self) -> dict[str, Any]:
+        """This machine and every configured peer, one summary row each."""
+        return self._fleet().overview()
+
+    def fleet_placement(self, profile: str = "", model: str = "") -> dict[str, Any]:
+        """Machines ranked for running a profile or model file; advice only, nothing is started."""
+        return fleet_view.placement(self._fleet().overview(), profile=profile, model=model)
+
+    def telemetry_history(self, range_name: str = "1h") -> dict[str, Any]:
+        """Sampled telemetry over ``range_name`` (15m, 1h, 6h, 24h or 7d), bucketed for charts."""
+        history = telemetry_history.current()
+        if history is None:
+            if range_name not in telemetry_history.RANGES:
+                raise ValueError(f"range must be one of {', '.join(telemetry_history.RANGES)}")
+            return {"enabled": False, "range": range_name, "timestamps": [], "series": {}, "labels": {}, "limits": {}, "events": []}
+        return {"enabled": True, **history.query(range_name)}
 
     def fit(self, mode: str, overrides: dict[str, Any] | None = None, *, target_mib: int = 1024) -> dict[str, Any]:
         return run_fit_test(
