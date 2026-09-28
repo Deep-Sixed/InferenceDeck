@@ -44,6 +44,7 @@ from typing import Any
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
 from .koboldcpp_args import build_koboldcpp_args
+from .llama_flags import supported_flags
 from .mlc_llm_args import build_mlc_llm_serve_args
 from .models import discover_models
 from .paths import (
@@ -532,7 +533,9 @@ def _build_script_command(
         return build_mlc_llm_serve_args(invocation, model_path, params, extra_args=config.extra_mlc_llm_args)
     if runtime == "vllm.cpp":
         return build_vllm_cpp_server_args(binary, model_path, params, extra_args=config.extra_vllm_cpp_args)
-    return build_llama_server_args(binary, model_path, params, extra_args=config.extra_llama_args)
+    return build_llama_server_args(
+        binary, model_path, params, extra_args=config.extra_llama_args, flags=supported_flags(binary)
+    )
 
 
 def _write_text_atomic(path: Path, content: str) -> None:

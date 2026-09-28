@@ -24,6 +24,7 @@ from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
 from .llama_args import LaunchCommand, build_llama_server_args
 from .koboldcpp_args import build_koboldcpp_args
+from .llama_flags import supported_flags
 from .mlc_llm_args import build_mlc_llm_serve_args
 from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
@@ -665,6 +666,7 @@ def prepare_launch_command(
         resolved.model["path"],
         params,
         extra_args=app_config.extra_llama_args,
+        flags=supported_flags(llama.binary_path),
     )
     warnings = resolved.warnings + command.warnings
     return {
