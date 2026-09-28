@@ -231,11 +231,15 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         api = APIS.get(urlparse(self.path).path)
+        # Each rejection below leaves the body unread; it is drained after the
+        # reply so the close is clean (see _discard_body).
         if api is None:
             if self._guard(openai_api.render_error):
                 self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
+            self._discard_body()
             return
         if not self._guard(api.render_error):
+            self._discard_body()
             return
         # Browsers send text/plain (or form) POSTs cross-origin without a CORS
         # preflight, so without this any web page could make a loopback gateway
