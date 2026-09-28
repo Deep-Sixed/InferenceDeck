@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ssl
+import sys
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
 from importlib.resources import files
@@ -9,7 +10,9 @@ from pathlib import Path
 
 from .auth import AuthState, validate_bind_security
 from .control import ControlPlane
+from .config_check import check_all, format_report
 from .control_api import ControlRequestHandler
+from .idle import start_idle_monitor
 
 
 ASSET_TYPES = {
@@ -76,9 +79,12 @@ def serve(
     *,
     allow_insecure_http: bool = False,
 ) -> None:
-    make_server(
+    server = make_server(
         host, port, control_plane, auth_state, certfile, keyfile, allow_insecure_http=allow_insecure_http
-    ).serve_forever()
+    )
+    # This process owns server state, so it is the one that releases idle servers.
+    start_idle_monitor()
+    server.serve_forever()
 
 
 def main() -> int:
@@ -92,9 +98,20 @@ def main() -> int:
         action="store_true",
         help="allow a plain-HTTP non-loopback bind (credentials travel unencrypted)",
     )
+    parser.add_argument(
+        "--check-config", action="store_true",
+        help="Validate config.json, models.json and remote endpoints, print the result and exit.",
+    )
     args = parser.parse_args()
     if args.keyfile and not args.certfile:
         parser.error("--keyfile needs --certfile")
+    report = check_all()
+    if args.check_config:
+        print(format_report(report))
+        return 1 if report["errors"] else 0
+    if report["errors"] or report["warnings"]:
+        # A broken config.json silently falls back to defaults, so say so up front.
+        print(format_report(report), file=sys.stderr)
     serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile, allow_insecure_http=args.allow_insecure_http)
     return 0
 

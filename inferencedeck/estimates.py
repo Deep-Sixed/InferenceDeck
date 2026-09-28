@@ -239,7 +239,8 @@ def _extract_kv_dims(reader, arch: str | None, n_layer: int | None) -> tuple[int
 # (keyed by size+mtime) survives restarts, so a profiles refresh never re-parses.
 _GGUF_META_CACHE_FILENAME = "gguf_meta_cache.json"
 _KV_META_CACHE_VERSION = 2  # bump when kv_dims computation changes to invalidate stale entries
-_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None, int | None]] = {}
+# path -> (signature, n_layer, kv_dims, supports_tools, n_ctx_train, info)
+_gguf_meta_mem: dict[str, tuple[tuple[int, int], int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]] = {}
 
 # Substrings that, in a GGUF chat template, indicate the model was trained to emit
 # tool calls (Qwen/Hermes use ``tool_call`` + a ``tools`` list; Mistral/Devstral use
@@ -292,6 +293,7 @@ def _store_meta_cache(
     kv_dims: tuple | None,
     supports_tools: bool | None,
     n_ctx_train: int | None = None,
+    info: dict[str, Any] | None = None,
 ) -> None:
     path = _meta_cache_file()
     if not path:
@@ -307,6 +309,7 @@ def _store_meta_cache(
             "kv_dims": list(kv_dims) if kv_dims else None,
             "supports_tools": supports_tools,
             "n_ctx_train": n_ctx_train,
+            "info": info,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -315,12 +318,40 @@ def _store_meta_cache(
         pass
 
 
-def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | None, int | None]:
-    """One GGUF reader pass: (n_layer, kv_dims, supports_tools, n_ctx_train). Empty on failure.
+def _model_info(reader: Any, arch: str | None) -> dict[str, Any]:
+    """Capability hints from GGUF header fields (see capabilities.py)."""
 
-    ``supports_tools`` reads ``tokenizer.chat_template`` and ``n_ctx_train`` reads
-    ``{arch}.context_length`` from the same (slow) header pass we already do for
-    dims, so neither adds an extra GGUF read.
+    def value(key: str) -> Any:
+        return _gguf_field_value(reader.get_field(key))
+
+    info: dict[str, Any] = {"arch": arch}
+    if arch:
+        context_length = value(f"{arch}.context_length")
+        if isinstance(context_length, int) and context_length > 0:
+            info["context_length"] = context_length
+        # llama.cpp pooling types: 0 none, 1 mean, 2 cls, 3 last, 4 rank.
+        pooling = value(f"{arch}.pooling_type")
+        if isinstance(pooling, int):
+            info["pooling_type"] = pooling
+        causal = value(f"{arch}.attention.causal")
+        if isinstance(causal, (bool, int)):
+            info["causal"] = bool(causal)
+    # Multimodal projector (mmproj) files describe their encoders.
+    for key, name in (("clip.has_vision_encoder", "vision_encoder"), ("clip.has_audio_encoder", "audio_encoder")):
+        flag = value(key)
+        if isinstance(flag, (bool, int)):
+            info[name] = bool(flag)
+    return info
+
+
+def _parse_gguf_meta(
+    model_path: str,
+) -> tuple[int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]:
+    """One GGUF reader pass: (n_layer, kv_dims, supports_tools, n_ctx_train, info). Empty on failure.
+
+    ``supports_tools`` reads ``tokenizer.chat_template``, ``n_ctx_train`` reads
+    ``{arch}.context_length`` and ``info`` the other capability fields, all from
+    the same (slow) header pass we already do for dims, so none adds a GGUF read.
     """
     try:
         import gguf as _gguf
@@ -335,13 +366,29 @@ def _parse_gguf_meta(model_path: str) -> tuple[int | None, tuple | None, bool | 
         n_ctx_train = _gguf_field_value(reader.get_field(f"{arch}.context_length")) if arch else None
         if not isinstance(n_ctx_train, int) or n_ctx_train <= 0:
             n_ctx_train = None
-        return (n_layer, kv_dims, supports_tools, n_ctx_train)
+        return (n_layer, kv_dims, supports_tools, n_ctx_train, _model_info(reader, arch))
     except Exception:
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
 
 def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple | None, bool | None, int | None]:
-    """Resolve (n_layer, kv_dims, supports_tools, n_ctx_train) for a GGUF via memory/disk cache.
+    """(n_layer, kv_dims, supports_tools, n_ctx_train); see ``_gguf_meta_full``."""
+    return _gguf_meta_full(model_path, parse)[:4]  # type: ignore[return-value]
+
+
+def gguf_model_info(model_path: str | None, probe: bool = False) -> dict[str, Any] | None:
+    """Capability hints read from a GGUF header (arch, context_length, pooling_type,
+    causal, vision/audio encoder for projector files); None when not (yet) known.
+
+    With ``probe`` False, only cached values are returned and the GGUF is never opened.
+    """
+    return _gguf_meta_full(model_path, probe)[4]
+
+
+def _gguf_meta_full(
+    model_path: str | None, parse: bool
+) -> tuple[int | None, tuple | None, bool | None, int | None, dict[str, Any] | None]:
+    """Resolve (n_layer, kv_dims, supports_tools, n_ctx_train, info) for a GGUF via memory/disk cache.
 
     When ``parse`` is False, never opens the GGUF — returns cached values or
     all ``None`` so callers (e.g. the profiles-list fit badge) stay fast
@@ -349,7 +396,7 @@ def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple |
     result for every later process.
     """
     if not model_path:
-        return (None, None, None, None)
+        return (None, None, None, None, None)
     key = str(model_path)
     sig = _file_signature(key)
 
@@ -360,22 +407,24 @@ def _gguf_meta(model_path: str | None, parse: bool) -> tuple[int | None, tuple |
     if sig:
         disk = _load_meta_cache().get(key)
         if disk and disk.get("size") == sig[0] and disk.get("mtime") == sig[1]:
-            # Older cache entries lack the tool flag / trained context; re-parse to
-            # backfill them when a parsing caller asks, otherwise serve them as-is.
-            # Only complete entries are memoized, so a later probe can still backfill.
-            complete = "supports_tools" in disk and "n_ctx_train" in disk
+            # Older cache entries lack the tool flag, trained context or capability
+            # info; re-parse to backfill them when a parsing caller asks, otherwise
+            # serve them as-is. Only complete entries are memoized, so a later probe
+            # can still backfill.
+            complete = all(k in disk for k in ("supports_tools", "n_ctx_train", "info"))
             if complete or not parse:
                 kv = tuple(disk["kv_dims"]) if disk.get("kv_dims") else None
-                meta = (disk.get("n_layer"), kv, disk.get("supports_tools"), disk.get("n_ctx_train"))
+                meta = (disk.get("n_layer"), kv, disk.get("supports_tools"), disk.get("n_ctx_train"), disk.get("info"))
                 if complete:
                     _gguf_meta_mem[key] = (sig, *meta)
                 return meta
 
     if not parse:
         # Don't cache the negative: a later parse=True call must still read it.
-        return (None, None, None, None)
+        return (None, None, None, None, None)
 
-    meta = _parse_gguf_meta(key)
+    # Padded so a parser returning fewer fields (older fakes in tests) still works.
+    meta = (tuple(_parse_gguf_meta(key)) + (None,) * 5)[:5]
     if sig:
         _gguf_meta_mem[key] = (sig, *meta)
         _store_meta_cache(key, sig, *meta)

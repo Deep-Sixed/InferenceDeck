@@ -61,6 +61,76 @@ SAMPLING_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+# Profile param / launch override that picks a preset; "none" means no preset.
+PRESET_KEY = "sampling_preset"
+NO_PRESET = "none"
+
+# Request settings llama-server takes as launch flags. They are per-server
+# defaults: a request that sends its own value (temperature, max_tokens, ...)
+# still wins. Forcing a value over the client's would need InferenceDeck to sit
+# in the request path, which it does not.
+REQUEST_DEFAULT_KEYS = (
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "repeat_penalty",
+    "repeat_last_n",
+    "presence_penalty",
+    "frequency_penalty",
+    "n_predict",
+    "seed",
+)
+
+
+def layer_sampling_preset(
+    base: dict[str, Any], overrides: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], list[str]]:
+    """Merge profile params, a sampling preset and launch overrides.
+
+    A preset named in the profile sits under the profile's own values, so a
+    profile can pick "coding" and still pin one field. A preset chosen as a
+    launch override sits over the profile (that is why it was chosen) but
+    under any other override. Explicit overrides always win.
+    """
+
+    overrides = dict(overrides or {})
+    from_override = PRESET_KEY in overrides
+    raw = overrides.get(PRESET_KEY) if from_override else base.get(PRESET_KEY)
+    key = str(raw or "").strip().lower()
+    merged = {**base, **overrides}
+    merged.pop(PRESET_KEY, None)
+    if not key or key == NO_PRESET:
+        return merged, []
+    preset = SAMPLING_PRESETS.get(key)
+    if preset is None:
+        return merged, [f"Unknown sampling preset '{raw}' was ignored."]
+    if from_override:
+        merged = {**base, **preset["params"], **overrides}
+    else:
+        merged = {**preset["params"], **base, **overrides}
+    merged[PRESET_KEY] = key
+    return merged, []
+
+
+def request_defaults(params: dict[str, Any]) -> dict[str, Any]:
+    """The per-request defaults a server launched with ``params`` will apply."""
+
+    values = {key: params[key] for key in REQUEST_DEFAULT_KEYS if params.get(key) is not None}
+    kwargs = params.get("chat_template_kwargs")
+    if isinstance(kwargs, dict) and kwargs:
+        values["chat_template_kwargs"] = dict(kwargs)
+    return {"preset": params.get(PRESET_KEY), "values": values}
+
+
+def sampling_presets() -> list[dict[str, Any]]:
+    return [
+        {"key": key, "label": preset["label"], "description": preset["description"],
+         "params": dict(preset["params"]), "rationale": dict(preset["rationale"])}
+        for key, preset in SAMPLING_PRESETS.items()
+    ]
+
+
 def list_sampling_intents() -> list[dict[str, str]]:
     return [{"key": key, "label": preset["label"], "description": preset["description"]}
             for key, preset in SAMPLING_PRESETS.items()]

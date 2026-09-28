@@ -5,6 +5,7 @@ import os
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -20,8 +21,12 @@ from .backends import (
     detect_runtime,
     detect_vllm_cpp,
 )
+from .capabilities import profile_capabilities, resolve_projector, with_served
 from .config import AppConfig
 from .fileio import atomic_write_text, lock_file as _lock_file, unlock_file as _unlock_file
+from .gpu_budget import estimate_server_vram_mib, live_free_mib, plan_start
+from .hardware import detect_system_hardware
+from .inflight import busy_servers
 from .llama_args import LaunchCommand, build_llama_server_args
 from .koboldcpp_args import build_koboldcpp_args
 from .llama_flags import supported_flags
@@ -30,6 +35,7 @@ from .vllm_cpp_args import build_vllm_cpp_server_args
 from .paths import cache_dir, find_project_root, is_windows
 from .profile_resolver import ResolvedProfile, resolve_profiles
 from .proc import run as run_hidden
+from .sampling import layer_sampling_preset, request_defaults
 from .telemetry import emit as emit_event
 
 
@@ -42,6 +48,12 @@ RESTORING = "restoring"
 EXITED = "exited"
 CONTEXT_PRESETS = (8192, 16384, 32768, 65536, 131072)
 LOG_DIRNAME = "logs"
+# Large GGUFs on slow disks routinely take over a minute to load; a short
+# deadline marks healthy servers as startup_timeout.
+DEFAULT_READY_TIMEOUT_SECONDS = 120
+MIN_READY_TIMEOUT_SECONDS = 15
+# llama-server /props modality keys mapped to input modalities.
+_PROPS_MODALITIES = (("vision", "image"), ("audio", "audio"), ("video", "video"))
 
 
 def _now() -> str:
@@ -269,16 +281,26 @@ def _wait_gone(pid: int, seconds: float) -> bool:
 
 
 def tail_file(path: str | Path | None, lines: int = 120) -> str:
+    """The last ``lines`` lines, read from the end so a huge log is never loaded whole."""
     if not path:
         return ""
     file_path = Path(path)
     if not file_path.is_file():
         return ""
     try:
-        with file_path.open("r", encoding="utf-8", errors="replace") as f:
-            return "".join(f.readlines()[-lines:])
+        with file_path.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            # Assume generous 512-byte lines; at most 4 MiB is read either way.
+            window = min(size, max(64 * 1024, lines * 512), 4 * 1024 * 1024)
+            f.seek(size - window)
+            data = f.read(window)
     except OSError as exc:
         return f"Could not read {file_path}: {exc}"
+    text = data.decode("utf-8", errors="replace")
+    kept = text.splitlines(keepends=True)
+    if window < size and kept:
+        kept = kept[1:]  # the first line was cut by the window
+    return "".join(kept[-lines:])
 
 
 def list_servers() -> list[dict[str, Any]]:
@@ -572,7 +594,9 @@ def _remove_server(server_id: str) -> None:
 # MLC LLM may first download HF:// weights and JIT-compile a model library.
 # KoboldCpp's one-file builds unpack themselves before loading, and its default
 # autofit probes memory first, so it gets more time than llama-server.
-READY_TIMEOUT_SECONDS = {"llama.cpp": 45, "vllm.cpp": 180, "mlc-llm": 600, "koboldcpp": 120}
+READY_TIMEOUT_SECONDS = {
+    "llama.cpp": DEFAULT_READY_TIMEOUT_SECONDS, "vllm.cpp": 180, "mlc-llm": 600, "koboldcpp": 180,
+}
 
 
 def http_base(host: str | None, port: int) -> str:
@@ -591,22 +615,90 @@ def http_base(host: str | None, port: int) -> str:
     return f"http://{host}:{int(port)}"
 
 
-def _health_url(host: str, port: int) -> str:
-    return f"{http_base(host, port)}/v1/models"
+
+def _probe_status(url: str) -> int | None:
+    """HTTP status for ``url``, or None when nothing answered."""
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except Exception:
+        return None
 
 
-def wait_until_ready(host: str, port: int, pid: int, timeout_seconds: int = 45) -> bool:
-    deadline = time.time() + timeout_seconds
-    url = _health_url(host, port)
+def wait_until_ready(
+    host: str, port: int, pid: int, timeout_seconds: int = DEFAULT_READY_TIMEOUT_SECONDS
+) -> bool:
+    """Wait for the server to report ready.
+
+    llama-server answers /health with 503 while the model loads and 200 once it
+    can serve. Servers without /health (404/405) fall back to /v1/models.
+    """
+    deadline = time.time() + max(int(timeout_seconds), MIN_READY_TIMEOUT_SECONDS)
+    base = http_base(host, port)
+    path = "/health"
     while time.time() < deadline:
         if not pid_is_running(pid):
             return False
-        try:
-            with urllib.request.urlopen(url, timeout=1):
-                return True
-        except Exception:
-            time.sleep(1)
+        status = _probe_status(base + path)
+        if status is not None and 200 <= status < 300:
+            return True
+        if path == "/health" and status in {404, 405, 501}:
+            path = "/v1/models"
+            continue
+        time.sleep(1)
     return False
+
+
+def parse_props(props: dict[str, Any]) -> dict[str, Any]:
+    """Capabilities reported by llama-server's GET /props."""
+    settings = props.get("default_generation_settings") or {}
+    slot_ctx = settings.get("n_ctx")
+    total_slots = props.get("total_slots")
+    modalities = props.get("modalities") or {}
+    template_caps = props.get("chat_template_caps")
+    if isinstance(template_caps, dict) and template_caps:
+        # Both are needed for a tool round trip (render tools, read calls back).
+        tools = bool(template_caps.get("supports_tools") and template_caps.get("supports_tool_calls"))
+    else:
+        # Builds older than chat_template_caps: the template itself is the only hint.
+        tools = "tools" in str(props.get("chat_template") or "")
+    caps: dict[str, Any] = {
+        "slot_ctx": int(slot_ctx) if isinstance(slot_ctx, int) and slot_ctx > 0 else None,
+        "total_slots": int(total_slots) if isinstance(total_slots, int) and total_slots > 0 else None,
+        "input_modalities": ["text"] + [name for key, name in _PROPS_MODALITIES if modalities.get(key) is True],
+        "tools": tools,
+    }
+    if props.get("build_info"):
+        caps["build_info"] = str(props["build_info"])
+    return caps
+
+
+def probe_capabilities(host: str, port: int, timeout: float = 3) -> dict[str, Any] | None:
+    """Read /props from a ready llama-server; None if it has no such endpoint."""
+    try:
+        with urllib.request.urlopen(f"{http_base(host, port)}/props", timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    return parse_props(payload) if isinstance(payload, dict) else None
+
+
+def _capability_warnings(caps: dict[str, Any], requested_ctx: Any) -> list[str]:
+    slot_ctx = caps.get("slot_ctx")
+    try:
+        requested = int(requested_ctx)
+    except (TypeError, ValueError):
+        return []
+    if slot_ctx and requested > slot_ctx:
+        slots = caps.get("total_slots")
+        split = f" across {slots} parallel slots" if slots and slots > 1 else ""
+        return [
+            f"Requested context {requested} but each request is limited to {slot_ctx} tokens{split}. "
+            "Lower --parallel or use a unified KV cache to give one request the full context."
+        ]
+    return []
 
 
 def _profile_by_mode(mode: str, project_root: str | Path | None, model_dirs: list[str | Path] | None) -> ResolvedProfile | None:
@@ -635,18 +727,21 @@ def prepare_launch_command(
             "profile": resolved.to_dict(),
         }
 
-    params = dict(resolved.params)
-    params.update(overrides or {})
+    params, preset_warnings = layer_sampling_preset(dict(resolved.params), overrides)
+    projector, projector_warnings = resolve_projector(resolved.model, params)
+    if projector:
+        params["mmproj"] = projector
+    preset_warnings = preset_warnings + projector_warnings
     params.setdefault("host", app_config.default_host)
     params.setdefault("port", app_config.default_port)
 
     runtime = str(params.get("runtime") or "llama.cpp").strip() or "llama.cpp"
     if runtime == "vllm.cpp":
-        return _prepare_vllm_cpp(resolved, params, app_config)
+        return _prepare_vllm_cpp(resolved, params, app_config, preset_warnings)
     if runtime == "mlc-llm":
-        return _prepare_mlc_llm(resolved, params, app_config)
+        return _prepare_mlc_llm(resolved, params, app_config, preset_warnings)
     if runtime == "koboldcpp":
-        return _prepare_koboldcpp(resolved, params, app_config)
+        return _prepare_koboldcpp(resolved, params, app_config, preset_warnings)
     if runtime != "llama.cpp":
         env = detect_runtime(runtime, root, config=app_config)
         if env is None:
@@ -675,7 +770,7 @@ def prepare_launch_command(
         extra_args=app_config.extra_llama_args,
         flags=supported_flags(llama.binary_path),
     )
-    warnings = resolved.warnings + command.warnings
+    warnings = resolved.warnings + preset_warnings + command.warnings
     return {
         "success": True,
         "runtime": "llama.cpp",
@@ -683,11 +778,15 @@ def prepare_launch_command(
         "environment": llama.to_dict(),
         "command": command.to_dict(),
         "params": params,
+        "request_defaults": request_defaults(params),
+        "capabilities": profile_capabilities(resolved.model, params, probe=True),
         "warnings": warnings,
     }
 
 
-def _prepare_vllm_cpp(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+def _prepare_vllm_cpp(
+    resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig, preset_warnings: list[str] | None = None
+) -> dict[str, Any]:
     env = detect_vllm_cpp(config=app_config)
     if not env.binary_path:
         return {"success": False, "error": "vllm-server (vllm.cpp) was not found.", "environment": env.to_dict()}
@@ -704,11 +803,14 @@ def _prepare_vllm_cpp(resolved: ResolvedProfile, params: dict[str, Any], app_con
         "environment": env.to_dict(),
         "command": command.to_dict(),
         "params": params,
-        "warnings": resolved.warnings + command.warnings,
+        "capabilities": profile_capabilities(resolved.model, params, probe=True),
+        "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
     }
 
 
-def _prepare_koboldcpp(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+def _prepare_koboldcpp(
+    resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig, preset_warnings: list[str] | None = None
+) -> dict[str, Any]:
     env = detect_koboldcpp(config=app_config)
     invocation = env.details.get("invocation")
     if not invocation:
@@ -726,11 +828,13 @@ def _prepare_koboldcpp(resolved: ResolvedProfile, params: dict[str, Any], app_co
         "environment": env.to_dict(),
         "command": command.to_dict(),
         "params": params,
-        "warnings": resolved.warnings + command.warnings,
+        "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
     }
 
 
-def _prepare_mlc_llm(resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig) -> dict[str, Any]:
+def _prepare_mlc_llm(
+    resolved: ResolvedProfile, params: dict[str, Any], app_config: AppConfig, preset_warnings: list[str] | None = None
+) -> dict[str, Any]:
     env = detect_mlc_llm(config=app_config)
     invocation = env.details.get("invocation")
     if not invocation:
@@ -748,8 +852,36 @@ def _prepare_mlc_llm(resolved: ResolvedProfile, params: dict[str, Any], app_conf
         "environment": env.to_dict(),
         "command": command.to_dict(),
         "params": params,
-        "warnings": resolved.warnings + command.warnings,
+        "capabilities": profile_capabilities(resolved.model, params, probe=True),
+        "warnings": resolved.warnings + (preset_warnings or []) + command.warnings,
     }
+
+
+def _vram_plan(prepared: dict[str, Any], exclude: set[str]) -> dict[str, Any]:
+    """How the prepared launch fits next to the tracked servers (see gpu_budget)."""
+
+    model = (prepared.get("profile") or {}).get("model")
+    need = estimate_server_vram_mib(prepared.get("params") or {}, model)
+    hardware = detect_system_hardware()
+    return plan_start(need, hardware, list_servers(), live_free=live_free_mib(hardware), exclude=exclude,
+                      busy=busy_servers())
+
+
+def plan_launch(
+    mode: str,
+    project_root: str | Path | None = None,
+    model_dirs: list[str | Path] | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Would starting ``mode`` now fit in GPU memory? Changes nothing."""
+
+    prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
+    if not prepared.get("success"):
+        return prepared
+    if prepared.get("runtime", "llama.cpp") != "llama.cpp":
+        return {"success": True, "vram_plan": {"status": "unknown", "message": "Only llama.cpp launches are checked."}}
+    same_mode = {str(s.get("id")) for s in list_servers() if s.get("mode") == mode}
+    return {"success": True, "vram_plan": _vram_plan(prepared, same_mode)}
 
 
 def start_profile(
@@ -760,25 +892,84 @@ def start_profile(
     stop_existing: bool = False,
     wait_ready: bool = True,
     ready_timeout_seconds: int | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
+    """Start ``mode``'s server.
+
+    If it would fit in GPU memory on its own but not next to the servers
+    already running, it is refused (``AppConfig.concurrent_vram_check``) unless
+    ``release_conflicts`` releases those servers first or ``force`` starts it
+    anyway.
+    """
+
     prepared = prepare_launch_command(mode, project_root, model_dirs, overrides)
     if not prepared.get("success"):
         return prepared
     if ready_timeout_seconds is None:
-        ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", 45)
+        ready_timeout_seconds = READY_TIMEOUT_SECONDS.get(prepared.get("runtime") or "llama.cpp", DEFAULT_READY_TIMEOUT_SECONDS)
 
     # Held from the "already running?" check until the new server is recorded,
     # so two Start requests (double-click, tray + browser, CLI + daemon) can't
     # both pass the check and launch two servers on one port.
     with launch_lock():
         existing = _find_server(mode=mode)
-        if existing and existing.get("running"):
-            if not stop_existing:
+        if existing and existing.get("running") and not stop_existing:
+            return {
+                "success": False,
+                "error": f"Profile '{mode}' already has a tracked running server.",
+                "server": existing,
+            }
+
+        vram_plan: dict[str, Any] | None = None
+        check_mode = str(AppConfig.load().concurrent_vram_check or "block").lower()
+        if check_mode != "off" and prepared.get("runtime", "llama.cpp") == "llama.cpp":
+            # A server of this mode that stop_existing replaces frees its memory first.
+            replaced = {str(s.get("id")) for s in list_servers() if s.get("mode") == mode} if stop_existing else set()
+            vram_plan = _vram_plan(prepared, replaced)
+            status = vram_plan.get("status")
+            if status == "busy" and not force and check_mode == "block":
                 return {
                     "success": False,
-                    "error": f"Profile '{mode}' already has a tracked running server.",
-                    "server": existing,
+                    "error": vram_plan["message"],
+                    "reason": "vram_busy",
+                    "vram_plan": vram_plan,
                 }
+            if status == "conflict" and not force:
+                if release_conflicts:
+                    # Requests may have arrived since the plan was made; check
+                    # every server before releasing any of them.
+                    now_busy = busy_servers()
+                    serving = [release_id for release_id in vram_plan["release"] if now_busy.get(release_id)]
+                    if serving:
+                        return {
+                            "success": False,
+                            "error": f"Not releasing {', '.join(serving)}: requests just started on it. Try again shortly.",
+                            "reason": "vram_busy",
+                            "vram_plan": vram_plan,
+                        }
+                    for release_id in vram_plan["release"]:
+                        released = release_gpu(server_id=release_id)
+                        if not released.get("success"):
+                            return {
+                                "success": False,
+                                "error": f"Could not release {release_id} to make room: {released.get('error')}",
+                                "vram_plan": vram_plan,
+                            }
+                    vram_plan["released"] = list(vram_plan["release"])
+                elif check_mode == "block":
+                    return {
+                        "success": False,
+                        "error": vram_plan["message"],
+                        "reason": "vram_conflict",
+                        "vram_plan": vram_plan,
+                    }
+            if status in ("tight", "too_big") or (status in ("conflict", "busy") and (force or check_mode == "warn")):
+                prepared["warnings"] = list(prepared.get("warnings") or []) + [vram_plan["message"]]
+            prepared["warnings"] = list(prepared.get("warnings") or []) + list(vram_plan.get("warnings") or [])
+
+        if existing and existing.get("running"):
             stop_result = stop_server(mode=mode)
             if not stop_result.get("success"):
                 return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
@@ -854,6 +1045,14 @@ def start_profile(
             # What Release GPU / Restart need to bring this server back as it was.
             "overrides": dict(overrides or {}),
             "ctx_size": params.get("ctx_size"),
+            # None falls back to AppConfig.idle_release_seconds (see idle.py).
+            "idle_release_seconds": params.get("idle_release_seconds"),
+            # Sampling/template defaults baked into the launch flags; requests may override them.
+            "request_defaults": prepared.get("request_defaults"),
+            # What gpu_budget counts for this server when the next one starts.
+            "estimated_vram_mib": (vram_plan or {}).get("need_mib"),
+            # What the model can do; /props refines it once the server is ready.
+            "capabilities": prepared.get("capabilities"),
         }
         _upsert_server(server)
         emit_event("server.started", server, model_path=server["model_path"], context_size=server["ctx_size"])
@@ -867,14 +1066,19 @@ def start_profile(
             emit_event("server.ready", server, startup_seconds=round(time.monotonic() - launched, 3))
         else:
             emit_event("server.start_failed", server, reason="startup_timeout")
-        _update_server(
-            server_id,
-            {
-                "status": "running" if ready else "startup_timeout",
-                "running": pid_is_running(proc.pid),
-                "ready_at": _now() if ready else None,
-            },
-        )
+        patch: dict[str, Any] = {
+            "status": "running" if ready else "startup_timeout",
+            "running": pid_is_running(proc.pid),
+            "ready_at": _now() if ready else None,
+        }
+        if ready:
+            caps = probe_capabilities(server["host"], server["port"])
+            if caps:
+                patch["capabilities"] = with_served(server.get("capabilities"), caps)
+                extra = _capability_warnings(caps, server.get("ctx_size"))
+                if extra:
+                    patch["warnings"] = list(server["warnings"]) + extra
+        _update_server(server_id, patch)
         if not ready:
             return {
                 "success": False,
@@ -883,7 +1087,7 @@ def start_profile(
                 "stderr_tail": tail_file(stderr_path),
             }
 
-    return {"success": True, "server": _find_server(server_id), "prepared": prepared}
+    return {"success": True, "server": _find_server(server_id), "prepared": prepared, "vram_plan": vram_plan}
 
 
 def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
@@ -916,13 +1120,54 @@ def release_gpu(server_id: str | None = None, mode: str | None = None) -> dict[s
     }
 
 
+def set_idle_release(server_id: str, seconds: int | None) -> dict[str, Any]:
+    """Set (or with None, clear back to the config default) a server's idle release window.
+
+    The value is also kept in the server's overrides, so a Restore or Restart
+    carries it over.
+    """
+
+    if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 0):
+        return {"success": False, "error": "seconds must be a non-negative integer or null."}
+    found: dict[str, Any] = {}
+
+    def change(state: dict[str, Any]) -> bool:
+        for record in state["servers"]:
+            if record.get("id") == server_id:
+                overrides = dict(record.get("overrides") or {})
+                if seconds is None:
+                    overrides.pop("idle_release_seconds", None)
+                else:
+                    overrides["idle_release_seconds"] = seconds
+                record["overrides"] = overrides
+                record["idle_release_seconds"] = seconds
+                restart = record.get("restart")
+                if isinstance(restart, dict):
+                    restart["overrides"] = dict(overrides)
+                found.update(record)
+                return True
+        return False
+
+    _mutate_state(change)
+    if not found:
+        return {"success": False, "error": "No tracked server matched the request."}
+    label = "the default" if seconds is None else ("off" if seconds == 0 else f"{seconds}s idle")
+    return {"success": True, "message": f"Auto-release set to {label}.", "server": _find_server(server_id)}
+
+
 def restore_server(
     server_id: str,
     overrides: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
     model_dirs: list[str | Path] | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Start a parked server again from its saved spec, optionally with changed overrides."""
+    """Start a parked server again from its saved spec, optionally with changed overrides.
+
+    ``release_conflicts`` and ``force`` are passed to start_profile's GPU memory check.
+    """
 
     claimed: dict[str, Any] = {}
 
@@ -945,6 +1190,8 @@ def restore_server(
         project_root=project_root,
         model_dirs=model_dirs,
         overrides=merged or None,
+        release_conflicts=release_conflicts,
+        force=force,
     )
     started = result.get("server") or {}
     if result.get("success") or started.get("running"):
@@ -961,6 +1208,9 @@ def restart_server(
     overrides: dict[str, Any] | None = None,
     project_root: str | Path | None = None,
     model_dirs: list[str | Path] | None = None,
+    *,
+    release_conflicts: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Reload & restart: stop, then start the same profile with optional changed overrides.
 
@@ -974,7 +1224,18 @@ def restart_server(
         released = release_gpu(server_id=server_id)
         if not released.get("success"):
             return released
-    return restore_server(server_id, overrides, project_root=project_root, model_dirs=model_dirs)
+    return restore_server(
+        server_id, overrides, project_root=project_root, model_dirs=model_dirs,
+        release_conflicts=release_conflicts, force=force,
+    )
+
+
+def server_log_paths(server_id: str) -> dict[str, str] | None:
+    """A tracked server's log files by stream name, or None if it is not tracked."""
+    server = _find_server(server_id)
+    if not server:
+        return None
+    return {name: str(server[key]) for name, key in (("stderr", "stderr_log"), ("stdout", "stdout_log")) if server.get(key)}
 
 
 def server_logs(server_id: str, lines: int = 200) -> dict[str, Any]:
