@@ -1,0 +1,384 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InferenceDeck models.json (profiles)",
+  "type": "object",
+  "required": [
+    "models"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "script": {
+            "type": "string"
+          },
+          "model_size_gb": {
+            "type": "number",
+            "minimum": 0
+          },
+          "recommended_params": {
+            "type": "object",
+            "properties": {
+              "runtime": {
+                "enum": [
+                  "llama.cpp",
+                  "vllm.cpp",
+                  "mlc-llm",
+                  "koboldcpp",
+                  "wsl-llama.cpp",
+                  "ollama",
+                  "lm-studio",
+                  "vllm",
+                  "mlx"
+                ]
+              },
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "alias": {
+                "type": "string"
+              },
+              "ctx_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "gpu_layers": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "enum": [
+                      "all",
+                      "auto",
+                      "max"
+                    ]
+                  }
+                ]
+              },
+              "threads": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "threads_batch": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "batch_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "ubatch_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "cache_type_k": {
+                "enum": [
+                  "bf16",
+                  "f16",
+                  "f32",
+                  "iq4_nl",
+                  "q4_0",
+                  "q4_1",
+                  "q5_0",
+                  "q5_1",
+                  "q8_0"
+                ]
+              },
+              "cache_type_v": {
+                "enum": [
+                  "bf16",
+                  "f16",
+                  "f32",
+                  "iq4_nl",
+                  "q4_0",
+                  "q4_1",
+                  "q5_0",
+                  "q5_1",
+                  "q8_0"
+                ]
+              },
+              "cache_ram_mib": {
+                "type": "integer",
+                "minimum": -1
+              },
+              "cache_reuse": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "flash_attn": {
+                "type": "boolean"
+              },
+              "jinja": {
+                "type": "boolean"
+              },
+              "reasoning": {
+                "type": "boolean"
+              },
+              "reasoning_budget": {
+                "type": "integer",
+                "minimum": -1
+              },
+              "mmap": {
+                "type": "boolean"
+              },
+              "mlock": {
+                "type": "boolean"
+              },
+              "load_mode": {
+                "enum": [
+                  "auto",
+                  "dio",
+                  "mlock",
+                  "mmap",
+                  "mmap+mlock",
+                  "none"
+                ]
+              },
+              "numa": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "enum": [
+                      "distribute",
+                      "isolate",
+                      "numactl"
+                    ]
+                  }
+                ]
+              },
+              "split_mode": {
+                "enum": [
+                  "layer",
+                  "none",
+                  "row",
+                  "tensor"
+                ]
+              },
+              "main_gpu": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "kv_offload": {
+                "type": "boolean"
+              },
+              "op_offload": {
+                "type": "boolean"
+              },
+              "embedding": {
+                "type": "boolean"
+              },
+              "metrics": {
+                "type": "boolean"
+              },
+              "reranking": {
+                "type": "boolean"
+              },
+              "vision": {
+                "type": "boolean"
+              },
+              "mmproj": {
+                "type": "string",
+                "minLength": 1
+              },
+              "n_predict": {
+                "type": "integer",
+                "minimum": -1
+              },
+              "seed": {
+                "type": "integer",
+                "minimum": -1
+              },
+              "temperature": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 5
+              },
+              "top_k": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "min_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "repeat_penalty": {
+                "type": "number",
+                "minimum": 0
+              },
+              "repeat_last_n": {
+                "type": "integer",
+                "minimum": -1
+              },
+              "presence_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2
+              },
+              "frequency_penalty": {
+                "type": "number",
+                "minimum": -2,
+                "maximum": 2
+              },
+              "slot_prompt_similarity": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "sampling_preset": {
+                "enum": [
+                  "none",
+                  "coding",
+                  "factual",
+                  "balanced",
+                  "creative"
+                ]
+              },
+              "chat_template_kwargs": {
+                "type": [
+                  "object",
+                  "string"
+                ]
+              },
+              "idle_release_seconds": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "draft_model": {
+                "type": "string"
+              },
+              "draft_max": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "draft_min": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "draft_p_min": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "spec_draft_n_max": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tensor_overrides": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": "string"
+                }
+              },
+              "fit_target_mib": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "block_size": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "num_blocks": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "kv_cache_memory_mib": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max_num_seqs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "max_num_batched_tokens": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "gpu_memory_utilization": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "capabilities": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "input": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "text",
+                        "image",
+                        "audio",
+                        "video"
+                      ]
+                    }
+                  },
+                  "output": {
+                    "type": "array",
+                    "items": {
+                      "enum": [
+                        "text",
+                        "embedding",
+                        "score"
+                      ]
+                    }
+                  },
+                  "tools": {
+                    "type": "boolean"
+                  },
+                  "embedding": {
+                    "type": "boolean"
+                  },
+                  "reranker": {
+                    "type": "boolean"
+                  },
+                  "context_max": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

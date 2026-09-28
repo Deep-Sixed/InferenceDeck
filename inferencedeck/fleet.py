@@ -180,6 +180,7 @@ class Fleet:
         self._config_errors = list(config_errors or [])
         self._lock = threading.Lock()
         self._cache: tuple[float, dict[str, Any]] | None = None
+        self._refreshing = threading.Event()
 
     def _build(self) -> dict[str, Any]:
         hosts = [summarize_host(self.name, self._collect_local(), local=True)]
@@ -220,6 +221,28 @@ class Fleet:
             self._cache = (time.monotonic(), result)
             return result
 
+    def overview_nowait(self, max_stale: float = 60.0) -> dict[str, Any] | None:
+        """The cached view without waiting on the network; None until a first one exists.
+
+        A view older than the cache age is refreshed in the background, so a
+        caller on a latency-sensitive path (the gateway routing a request)
+        never waits for peers to answer.
+        """
+        cached = self._cache
+        age = time.monotonic() - cached[0] if cached else None
+        if (age is None or age >= self._max_age) and not self._refreshing.is_set():
+            self._refreshing.set()
+            threading.Thread(target=self._refresh, name="inferencedeck-fleet", daemon=True).start()
+        return cached[1] if cached and age is not None and age < max_stale else None
+
+    def _refresh(self) -> None:
+        try:
+            self.overview()
+        except Exception:
+            pass
+        finally:
+            self._refreshing.clear()
+
 
 # --- placement --------------------------------------------------------------
 
@@ -227,9 +250,11 @@ TIER_LABELS = {0: "loaded", 1: "loaded, paused", 2: "known", 3: "not seen"}
 
 
 def _matches(entry: dict[str, Any], profile: str, model: str) -> bool:
+    served = str(entry.get("model") or "").lower()
+    # A model may be named by its file (qwen3-30b.gguf) or its stem (qwen3-30b), as the gateway does.
     return bool(
         (profile and str(entry.get("profile") or "").lower() == profile)
-        or (model and str(entry.get("model") or "").lower() == model)
+        or (model and served and model in (served, served.removesuffix(".gguf")))
     )
 
 

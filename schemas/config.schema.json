@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InferenceDeck config.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "model_dirs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Extra folders scanned for GGUF models."
+    },
+    "default_host": {
+      "type": "string",
+      "minLength": 1
+    },
+    "default_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "default_backend": {
+      "type": "string"
+    },
+    "runtime_dirs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Extra folders searched for runtime builds."
+    },
+    "llama_server_path": {
+      "type": "string"
+    },
+    "llama_runtime": {
+      "type": "string",
+      "description": "\"auto\", a runtime id such as \"cuda-avx1\", or a path."
+    },
+    "llama_fit_params_path": {
+      "type": "string"
+    },
+    "extra_llama_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "vllm_cpp_server_path": {
+      "type": "string"
+    },
+    "extra_vllm_cpp_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "mlc_llm_path": {
+      "type": "string"
+    },
+    "extra_mlc_llm_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "koboldcpp_path": {
+      "type": "string"
+    },
+    "extra_koboldcpp_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "update_channel": {
+      "enum": [
+        "stable",
+        "prerelease"
+      ]
+    },
+    "profile_names": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "server_history_limit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "auto_generate_launch_scripts": {
+      "type": "boolean"
+    },
+    "auto_scan_on_startup": {
+      "type": "boolean"
+    },
+    "idle_release_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Release a server's GPU after this long idle; 0 = off."
+    },
+    "concurrent_vram_check": {
+      "enum": [
+        "block",
+        "warn",
+        "off"
+      ]
+    },
+    "gateway_model_switching": {
+      "type": "boolean",
+      "description": "Load the profile a gateway request names."
+    },
+    "gateway_placement": {
+      "type": "boolean",
+      "description": "Order gateway targets sharing a name by fleet placement."
+    },
+    "telemetry_sample_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds between telemetry samples; 0 = history off."
+    },
+    "telemetry_retention_days": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "otlp_endpoint": {
+      "type": "string",
+      "description": "OTLP/HTTP endpoint for OpenTelemetry export; empty = off."
+    },
+    "otlp_export_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "fleet_peers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tokenEnv": {
+            "type": "string"
+          },
+          "token_env": {
+            "type": "string"
+          },
+          "caFile": {
+            "type": "string"
+          },
+          "ca_file": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "fleet_name": {
+      "type": "string"
+    }
+  }
+}

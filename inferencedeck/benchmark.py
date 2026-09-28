@@ -107,7 +107,7 @@ def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[s
     if prompt_speed is None and prompt_ms and _positive(timings.get("prompt_n")):
         prompt_speed = float(timings["prompt_n"]) / (prompt_ms / 1000.0)
 
-    return {
+    metrics: dict[str, Any] = {
         "completion_tokens": completion_count,
         "prompt_tokens": prompt_count,
         # Generation speed: the server's decode rate when reported, else wall-clock.
@@ -118,6 +118,10 @@ def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[s
         "generation_seconds": round(predicted_ms / 1000.0, 3) if predicted_ms else None,
         "timing_source": "server" if generation is not None else "wall_clock",
     }
+    if timings.get("cache_n") is not None:
+        # Prompt tokens reused from the KV cache (not re-processed).
+        metrics["cached_prompt_tokens"] = int(timings.get("cache_n") or 0)
+    return metrics
 
 
 def send_chat_prompt(
