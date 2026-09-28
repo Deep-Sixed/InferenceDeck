@@ -63,7 +63,9 @@ def rank_hosts(overview: dict[str, Any], model: str) -> dict[str, Rank]:
         tier = candidate["tier"]
         group = LOADED if tier == 0 else PAUSED if tier == 1 else AVAILABLE
         reason = "; ".join(candidate["reasons"])
-        host = next((h for h in overview.get("hosts") or [] if h["name"] == candidate["host"]), {})
+        # The candidate carries its own identity: joining it back to a host by
+        # display name would pick the wrong machine if two shared a name.
+        host = {"name": candidate["host"], "local": candidate.get("local"), "url": candidate.get("url")}
         for key in host_keys(host):
             ranks.setdefault(key, Rank(group, position, candidate["host"], reason))
     return ranks

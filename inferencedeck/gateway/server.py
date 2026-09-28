@@ -11,7 +11,8 @@ A request's ``model`` picks the target it names (see router.py); ``--switch-mode
 (or ``gateway_model_switching`` in config) also loads a named profile on demand.
 
 Requests to local servers are counted while they run (see inflight.py), so
-idle release and making room for another model leave a busy server alone.
+idle release, making room for another model and model switching leave a busy
+server alone.
 
 Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
@@ -113,7 +114,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_stream(self, chunks: Iterator[bytes], lease: Any = None, headers: dict[str, str] | None = None) -> None:
+    def _send_stream(self, chunks: Iterator[bytes], headers: dict[str, str] | None = None) -> None:
         try:
             self.send_response(HTTPStatus.OK)
             for name, value in (headers or {}).items():
@@ -138,8 +139,6 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             close = getattr(chunks, "close", None)
             if close is not None:
                 close()
-            if lease is not None:
-                lease.__exit__(None, None, None)
 
     def _guard(self, render_error: Callable[[GatewayError], Any]) -> bool:
         if not self._host_ok():
@@ -257,25 +256,17 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             # Says which machine answered, for when placement picked between several.
             routed = {"X-InferenceDeck-Target": _header_value(target)}
             # Counted until the last byte is sent, so a streaming reply keeps
-            # its server from being released by idle release or to make room.
-            # The lease tells a model switch this server is still busy; for a
-            # stream it is held until the last chunk is written.
+            # its server from being released by idle release, to make room, or
+            # by a model switch from this or any other gateway process.
             with (self.inflight or tracker()).track(target.server_id):
-                lease = target.lease()
-                lease.__enter__()
-                try:
-                    if request.stream:
-                        events = target.engine.stream(request)
-                        stream_lease, lease = lease, None
-                        self._send_stream(api.render_stream(events, model, body), stream_lease, routed)
-                    else:
-                        result = target.engine.complete(request)
-                        # Report the model the client asked for, so aliases stay stable.
-                        result.model = model
-                        self._send(HTTPStatus.OK, api.render_result(result), headers=routed)
-                finally:
-                    if lease is not None:
-                        lease.__exit__(None, None, None)
+                if request.stream:
+                    events = target.engine.stream(request)
+                    self._send_stream(api.render_stream(events, model, body), routed)
+                else:
+                    result = target.engine.complete(request)
+                    # Report the model the client asked for, so aliases stay stable.
+                    result.model = model
+                    self._send(HTTPStatus.OK, api.render_result(result), headers=routed)
         except GatewayError as exc:
             self._send(exc.status, api.render_error(exc))
         except Exception as exc:  # pragma: no cover - last-resort guard

@@ -18,6 +18,7 @@ from .api_params import validate_overrides
 from .auth import SESSION_TTL_SECONDS, AuthState, host_header_ok, request_client
 from .control import ControlPlane
 from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
+from .model_switch import MAX_DRAIN_TIMEOUT_SECONDS
 
 MAX_BODY_BYTES = 1024 * 1024
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -347,6 +348,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     stop_existing=bool(body.get("stop_existing", False)),
                     **vram_flags,
                 )
+            elif parsed.path == "/api/switch":
+                drain = body.get("drain_timeout")
+                if drain is not None and (isinstance(drain, bool) or not isinstance(drain, (int, float))
+                                          or not 0 <= drain <= MAX_DRAIN_TIMEOUT_SECONDS):
+                    raise ValueError(f"drain_timeout must be a number from 0 to {MAX_DRAIN_TIMEOUT_SECONDS:g}")
+                payload = self.control_plane.switch(str(body.get("mode") or ""), drain_timeout=drain)
             elif parsed.path == "/api/plan":
                 payload = self.control_plane.plan(str(body.get("mode") or ""), validate_overrides(body.get("overrides")))
             elif parsed.path == "/api/stop":
@@ -413,7 +420,7 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return
             if payload.get("success", True):
                 code = HTTPStatus.OK
-            elif payload.get("reason") in ("vram_conflict", "vram_busy"):
+            elif payload.get("reason") in ("vram_conflict", "vram_busy", "switch_busy"):
                 code = HTTPStatus.CONFLICT
             else:
                 code = HTTPStatus.BAD_REQUEST
