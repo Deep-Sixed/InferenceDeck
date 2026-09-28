@@ -18,7 +18,7 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
 - Generate portable launch scripts without overwriting hand-written scripts.
-- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`).
+- Serve one OpenAI- and Anthropic-compatible inference API in front of whichever local or remote target is active (`inferencedeck-gateway`), optionally loading the profile each request names.
 
 ### Frontends
 
@@ -102,6 +102,8 @@ Commands (all print JSON; with no command, `inventory` runs):
 | `servers` | Servers started by InferenceDeck. |
 | `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
 | `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+| `hf-files REPO` | List the GGUF quants (split shards grouped) and vision projectors in a Hugging Face repo. |
+| `pull REPO --quant Q4_K_M` / `pull REPO --pattern GLOB` | Download one quant: every shard, plus the repo's mmproj (`--no-mmproj` to skip). `--dry-run` shows the files first. |
 | `updates [--channel stable\|prerelease] [--refresh]` | Compare each installed runtime's version with its latest upstream release (see below). |
 
 Discovery commands accept `--project-root`, `--model-dir` (repeatable), `--max-files`
@@ -178,6 +180,59 @@ pins), under `runtime_dirs`, `LLAMA_CPP_HOME`, the project root and working dire
   ```
 - the build's `CMakeCache.txt` (`GGML_AVX`, `GGML_AVX2`, `GGML_FMA`, `GGML_F16C`, `GGML_CUDA`);
 - otherwise it is assumed to be a standard build that needs AVX2.
+
+## Downloading models from Hugging Face
+
+`inferencedeck pull` (and `POST /api/hf/download`) fetch exactly one quant of a repo.
+Split GGUFs (`-00001-of-00003`) are grouped so all shards come down together, and a
+vision projector (`mmproj`, preferring F16) is added when the repo has one. No match,
+or more than one, fails with the list of available quants instead of guessing.
+
+```bash
+inferencedeck hf-files unsloth/gemma-3-4b-it-GGUF --pretty
+inferencedeck pull unsloth/gemma-3-4b-it-GGUF --quant Q4_K_M
+inferencedeck pull unsloth/gemma-3-4b-it-GGUF --pattern '*UD-Q4_K_XL*' --dest ~/models
+```
+
+Files go to the Hugging Face cache (already scanned for models) unless `--dest` is
+given; the control API always uses the cache. The download runs the `hf` CLI
+(`huggingface-cli` on older installs, from `pip install huggingface_hub`), which
+resumes interrupted downloads and uses `HF_TOKEN` for gated repos.
+
+## Multi-GPU, LoRA and other launch options
+
+Profile `recommended_params` map to `llama-server` flags:
+
+| Param | Flag | Example |
+|---|---|---|
+| `split_mode` | `--split-mode` | `"layer"`, `"row"`, `"tensor"`, `"none"` |
+| `tensor_split` | `--tensor-split` | `[3, 1]` or `"3,1"` |
+| `main_gpu` | `--main-gpu` | `0` |
+| `rpc_servers` | `--rpc` | `["10.0.0.2:50052"]` |
+| `lora` | `--lora` / `--lora-scaled` | `["style.gguf", {"path": "domain.gguf", "scale": 0.5}]` |
+| `override_kv` | `--override-kv` (one per entry) | `["tokenizer.ggml.add_bos_token=bool:false"]` |
+| `rope_scaling`, `rope_scale`, `rope_freq_base`, `rope_freq_scale` | `--rope-*` | `"yarn"`, `4` |
+| `yarn_orig_ctx`, `yarn_ext_factor`, `yarn_attn_factor`, `yarn_beta_slow`, `yarn_beta_fast` | `--yarn-*` | `32768` |
+| `numa` | `--numa` | `true` (distribute), `"isolate"`, `"numactl"` |
+| `mmap`, `mlock` | `--load-mode`, or `--no-mmap`/`--mlock` on older builds | `false`, `true` |
+| `load_mode` | `--load-mode` (translated for older builds) | `"mmap+mlock"`, `"dio"` |
+
+llama.cpp renames flags between releases, so InferenceDeck reads each `llama-server`'s
+`--help` once (cached until the binary changes) and spells renamed flags the way that
+build expects: `--load-mode` versus `--no-mmap`/`--mlock`, and `--spec-draft-n-max`/`-n-min`
+versus `--draft-max`/`--draft-min` for the `draft_max`/`draft_min` keys. A flag the build
+doesn't list is reported as a warning before launch.
+
+Invalid values are left out of the command and reported as warnings. These params pick
+hardware and files, so they live in the profile and can't be changed over the control
+API. The fit test passes the split to `llama-fit-params` and applies the `-ts`/`-sm`/`-mg`
+it suggests.
+
+The memory-fit estimate and Smart Tune size a split across every GPU it uses: all
+discrete GPUs on the primary GPU's backend by default (llama.cpp's own default), only
+`main_gpu` with `split_mode: "none"`, the listed ones with `device: "CUDA0,CUDA1"`, and
+with `tensor_split` the card that fills first bounds the total. Each GPU is charged its
+own runtime overhead and keeps its own headroom.
 
 ## Running a profile on vllm.cpp
 
@@ -371,7 +426,7 @@ This means clients with a hard-coded model name keep working. An enabled endpoin
 |---|---|
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | Anthropic Messages | `POST /v1/messages` |
-| Model list (the current target) | `GET /v1/models` |
+| Model list (every routable name, plus loadable profiles when switching is on) | `GET /v1/models` |
 
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
@@ -407,6 +462,37 @@ There are three engine adapters:
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+### Switching models on demand
+
+```bash
+inferencedeck-gateway --switch-models   # or "gateway_model_switching": true in config.json
+```
+
+With switching on, a request can also name a launchable profile that isn't running, by
+its mode, display name or `alias`, and the gateway loads it, as Ollama does. Names that
+already route somewhere (a running server, a routable endpoint) are used as they are,
+without switching. A client can move between local models just by changing `model`:
+
+1. every other running local server is released (stopped; its settings are kept, so
+   Restore in the web UI or tray brings it back);
+2. the named profile is resumed if paused, restored if released, or started;
+3. the request is answered once the server reports ready.
+
+Only one model is loaded at a time, since profiles usually share the GPU and the
+default port. Switches are serialized: concurrent requests for the same model load it
+once. Before releasing a server, the gateway waits up to two minutes for requests it
+is still answering from that server, including streams. It can't see clients that
+talk to `llama-server` directly.
+
+The gateway does not start processes itself. Like the trays, it asks the
+`inferencedeck-web` control API at `INFERENCEDECK_URL` (default
+`http://127.0.0.1:8716`, with `INFERENCEDECK_TOKEN` when set), so that process remains
+the only owner of server state. If the control API can't be reached, a switch fails
+with a 503 that says so. A model name that matches no profile is not an error: it goes
+to the default target as before. While a remote endpoint is enabled, local models are
+not loaded (local starts are refused then); requests that name one go to the default
+target. `GET /v1/models` adds each loadable profile with `"loaded": false`.
 
 The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
 
