@@ -103,6 +103,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         return request_client(self)
 
     def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+        if status >= 400 and not getattr(self, "_body_read", False):
+            # An early refusal (401, 429, 404, 415, …) leaves the request body
+            # unread; on Windows closing with unread bytes resets the connection
+            # and the client never sees this reply.
+            self._discard_body()
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -174,6 +179,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             if not chunk:
                 break
             remaining -= len(chunk)
+        self._body_read = True
         self.close_connection = True
 
     def _body(self) -> dict[str, Any]:
@@ -186,6 +192,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             raise GatewayError(413, "request body too large", "invalid_request")
         try:
+            self._body_read = True
             value = json.loads(self.rfile.read(length))
         except json.JSONDecodeError as exc:
             raise GatewayError(400, "invalid JSON", "invalid_request") from exc
@@ -194,6 +201,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:
+        self._body_read = False  # a keep-alive connection reuses this handler
         path = urlparse(self.path).path
         if path == "/healthz" and self._host_ok():
             self._send(HTTPStatus.OK, {"ok": True})
@@ -231,6 +239,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
 
     def do_POST(self) -> None:
+        self._body_read = False  # a keep-alive connection reuses this handler
         api = APIS.get(urlparse(self.path).path)
         if api is None:
             if self._guard(openai_api.render_error):
@@ -245,7 +254,6 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         # which this server never grants.
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
-            self._discard_body()
             self._send(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, api.render_error(
                 GatewayError(415, "Content-Type must be application/json", "invalid_request")))
             return
