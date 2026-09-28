@@ -8,12 +8,12 @@ InferenceDeck is a clean continuation of the portable core developed in the earl
 
 ### Core
 
-- Discover local `llama.cpp`, `vllm.cpp`, MLC LLM, Ollama, LM Studio, vLLM, and MLX runtimes.
+- Discover local `llama.cpp`, `vllm.cpp`, MLC LLM, KoboldCpp, Ollama, LM Studio, vLLM, and MLX runtimes.
 - Discover GGUF models from configured and common model locations.
 - Detect CPU, GPU, system memory, VRAM, and available acceleration backends.
 - Estimate model fit and performance, with `llama-fit-params` integration when available.
 - Resolve and manage portable model profiles.
-- Prepare `llama-server`, `vllm-server` (vllm.cpp) or `mlc_llm serve` (MLC LLM) launch commands and manage servers started by InferenceDeck.
+- Prepare `llama-server`, `vllm-server` (vllm.cpp), `mlc_llm serve` (MLC LLM) or KoboldCpp launch commands and manage servers started by InferenceDeck.
 - Pause/resume tracked servers without losing process state, or release the GPU (stop the server, keep its settings) and restore it later.
 - Benchmark local OpenAI-compatible inference endpoints and retain bounded benchmark history.
 - Inspect Hugging Face tooling and runtime update availability.
@@ -38,7 +38,7 @@ How requests reach the endpoint is a separate, optional `transport` field: `tail
 
 Endpoint definitions live under the per-user InferenceDeck configuration directory in `remote_endpoints/*.json`. Generic examples are provided in `examples/remote_endpoints/`.
 
-Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` is required for `true_cloud` endpoints and optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
+Only one remote/cloud endpoint may be active at a time. When one is active, starting a local profile is refused until the remote endpoint is disabled. API-key **values are never stored in endpoint JSON**; configs contain only an environment-variable name such as `PROVIDER_API_KEY`. `apiKeyEnv` and `model` are required for `true_cloud` endpoints (the model is pinned, so a client's default model name is never billed to your key; pick another model explicitly with `<endpoint>/<model>` through the gateway). `apiKeyEnv` is optional for `remote_host` endpoints, so a self-hosted server that does not check keys, such as `llama-server` without `--api-key`, needs no dummy variable. If a `remote_host` config does name `apiKeyEnv`, that variable must be set before the endpoint can be enabled.
 
 ### Web/control authentication
 
@@ -110,7 +110,7 @@ and `--no-manifest`.
 ### Update checks
 
 `inferencedeck updates` compares installed versions with the latest GitHub release
-for llama.cpp, Ollama, vLLM, vllm.cpp, MLC LLM and MLX. It never downloads or
+for llama.cpp, Ollama, vLLM, vllm.cpp, MLC LLM, KoboldCpp and MLX. It never downloads or
 replaces anything, and caches results for an hour (`--refresh` skips the cache). The
 channel defaults to `update_channel` in config.
 
@@ -140,7 +140,8 @@ asks GitHub again. Each update links to its GitHub release page.
 
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
-`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `koboldcpp_path`,
+`extra_koboldcpp_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -252,6 +253,45 @@ Start waits up to 600 s, since the first start may download weights and compile 
 model library. Generated launch scripts call `mlc_llm serve $model …`; Fit stays
 llama.cpp-only.
 
+## Running a profile on KoboldCpp
+
+[KoboldCpp](https://github.com/LostRuins/koboldcpp) is a llama.cpp fork shipped as a
+single executable. It loads the same GGUF files, so a KoboldCpp profile is matched
+against discovered models exactly like a llama.cpp one; set `"runtime": "koboldcpp"`:
+
+```json
+{"mode": "qwen-kobold", "name": "Qwen3 8B (KoboldCpp)",
+ "recommended_params": {"runtime": "koboldcpp", "ctx_size": 16384}}
+```
+
+InferenceDeck runs the executable from `koboldcpp_path` in config, `KOBOLDCPP_BIN`,
+`KOBOLDCPP_HOME` or `runtime_dirs` (the release names `koboldcpp`,
+`koboldcpp-linux-x64`, `koboldcpp-mac-arm64`, `koboldcpp.exe`, `koboldcpp_nocuda.exe`,
+… are all recognized) or `PATH`, or `koboldcpp.py` under Python for a source checkout.
+It always passes `--skiplauncher`, so the Tk launcher never opens.
+
+KoboldCpp picks its own GPU backend (CUDA, Vulkan or CPU, with no-AVX2 and failsafe
+modes for older CPUs), thread counts and GPU layers (autofit) when a profile leaves them
+unset, so a profile needs nothing beyond `runtime` (its context defaults to 16K). llama.cpp-style
+settings map to KoboldCpp's flags:
+
+| Profile param | KoboldCpp flag |
+|---|---|
+| `ctx_size`, `threads`, `threads_batch` | `--contextsize`, `--threads`, `--blasthreads` |
+| `gpu_layers` | `--gpulayers` (`auto` or unset: KoboldCpp's autofit) |
+| `acceleration_backend` `cuda`/`rocm`/`vulkan`/`cpu`, `device` | `--usecuda`/`--usevulkan`/`--usecpu`, with the device's GPU index |
+| `batch_size` | `--batchsize`, rounded down to one KoboldCpp accepts (16-4096, powers of two) |
+| `cache_type_k`/`cache_type_v` | `--quantkv` (one type for both: f16, bf16, q8_0, q5_1, q4_0) |
+| `flash_attn: false`, `kv_offload: false`, `mmap: true` | `--noflashattention`, `--lowvram`, `--usemmap` |
+| `jinja`, `reasoning` | `--jinja_tools`, `--jinjathink true/false` |
+| `draft_model`, `draft_max` | `--draftmodel`, `--draftamount` |
+| `tensor_overrides`, `mmproj`, `n_predict` | `--overridetensors`, `--mmproj`, `--defaultgenamt` |
+
+Settings KoboldCpp has no flag for (`ubatch_size`, `cache_reuse`, …) and sampling values
+produce a warning. Start waits up to 120 s, since one-file builds unpack themselves
+before loading. Generated launch scripts call it with `--model $model …`; update checks
+use `LostRuins/koboldcpp` releases; Fit stays llama.cpp-only.
+
 ## Local control API and web UI
 
 ```bash
@@ -346,7 +386,7 @@ The translation covers:
 
 For example, an Anthropic SDK can talk to a local `llama.cpp` server. Engine-specific OpenAI fields (such as `repeat_penalty`) are passed through unchanged.
 
-There are two engine adapters:
+There are three engine adapters:
 
 - **OpenAI-compatible**, for `llama.cpp`, `vllm.cpp`, vLLM, LM Studio and OpenRouter.
 - **Native Ollama** (`/api/chat`), used for endpoints with `"provider": "ollama"`. Its `baseUrl` is the server root, e.g. `http://thanatos:11434`; a URL ending in `/v1` or `/api` also works.
@@ -355,12 +395,20 @@ There are two engine adapters:
   - `response_format` becomes Ollama's `format` (JSON mode or a JSON schema).
   - Images must be inline (base64); image URLs are refused with a 400.
   - Ollama has no `tool_choice`. `none` is honoured by not offering the tools; a forced or required choice is left to the model.
+- **Anthropic Messages API** (`/v1/messages`), used for endpoints with `"provider": "anthropic"`. Its `baseUrl` is the API root, `https://api.anthropic.com`; a URL ending in `/v1` or `/v1/messages` also works. The key from `apiKeyEnv` is sent as `x-api-key`. See `examples/remote_endpoints/anthropic.example.json`.
+  - System messages are combined into the top-level `system` prompt.
+  - Tool results become `tool_result` blocks, and results for parallel calls share one user turn. Tool-call ids are rewritten to the characters the API allows.
+  - `max_tokens` is required by the API. When the client leaves it out, the gateway sends 16000, or 64000 for a streamed request.
+  - Only `temperature`, `top_p`, `top_k` and stop sequences are forwarded, because the API rejects unknown fields. `min_p`, penalties, `seed` and engine-specific fields are dropped. Newer Claude models also reject `temperature`/`top_p`/`top_k`; that error reaches the client unchanged.
+  - A JSON-schema `response_format` becomes `output_config.format`. JSON mode without a schema has no equivalent and is ignored.
+  - `required` becomes `tool_choice` `any`, and a named tool becomes `tool`. Some newer models reject forced tool use; that error also reaches the client unchanged.
+  - Thinking blocks in replies are not passed on. Prompt caching counts toward the reported input tokens. A 529 (overloaded) reaches the client as a 503.
 
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
-The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like the control API, and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle.
+The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like the control API, and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
 
 ## Development
 
