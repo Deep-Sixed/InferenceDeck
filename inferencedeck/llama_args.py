@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -302,8 +303,33 @@ def build_llama_server_args(
     # injected wrong and tool-capable models loop the same call forever.
     if params.get("jinja"):
         args.append("--jinja")
+    # Default kwargs for the chat template (e.g. {"enable_thinking": false} or
+    # {"reasoning_effort": "high"}); a request's own chat_template_kwargs win.
+    template_kwargs = params.get("chat_template_kwargs")
+    if isinstance(template_kwargs, str) and template_kwargs.strip():
+        try:
+            template_kwargs = json.loads(template_kwargs)
+        except json.JSONDecodeError:
+            template_kwargs = None
+        if not isinstance(template_kwargs, dict):
+            warnings.append("chat_template_kwargs must be a JSON object; it was not passed to llama-server.")
+            template_kwargs = None
+    if isinstance(template_kwargs, dict) and template_kwargs:
+        args.extend(["--chat-template-kwargs", json.dumps(template_kwargs, separators=(",", ":"), sort_keys=True)])
+        if not params.get("jinja"):
+            warnings.append(
+                "chat_template_kwargs are read by the Jinja chat template; jinja is off for this profile, "
+                "so llama.cpp builds that do not default to Jinja will ignore them."
+            )
+    elif template_kwargs not in (None, "", {}) and not isinstance(template_kwargs, (dict, str)):
+        warnings.append("chat_template_kwargs must be a JSON object; it was not passed to llama-server.")
     args.append("--kv-offload" if params.get("kv_offload", True) else "--no-kv-offload")
     args.append("--op-offload" if params.get("op_offload", True) else "--no-op-offload")
+    # Serves llama-server's own Prometheus counters (tokens, requests, KV cache),
+    # which InferenceDeck's telemetry reads for tokens/sec and request counts.
+    # Only on builds known to accept it: an unknown flag would stop the server starting.
+    if params.get("metrics", True) and (flags is None or "--metrics" in flags):
+        args.append("--metrics")
 
     device = params.get("device", params.get("cuda_device"))
     if device not in (None, "", "auto"):
@@ -311,6 +337,12 @@ def build_llama_server_args(
     args.extend(_load_mode_args(params, flags, warnings))
     if params.get("embedding", False):
         args.append("--embedding")
+    if params.get("reranking", False):
+        args.append("--reranking")
+    # Multimodal projector: without it llama-server cannot take image/audio input.
+    mmproj = str(params.get("mmproj") or "").strip()
+    if mmproj:
+        args.extend(["--mmproj", mmproj])
     numa = params.get("numa")
     if numa is True:
         args.extend(["--numa", "distribute"])

@@ -11,9 +11,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from .sampling import NO_PRESET, SAMPLING_PRESETS
+
 CACHE_TYPES = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"}
 
-# key -> (kind, low, high); kind is "int", "float", "bool" or "cache"
+# key -> (kind, low, high); kind is "int", "float", "bool", "cache" or "preset"
 ALLOWED_OVERRIDES: dict[str, tuple[str, float, float]] = {
     "ctx_size": ("int", 512, 1_048_576),
     "gpu_layers": ("int", 0, 999),
@@ -35,6 +37,13 @@ ALLOWED_OVERRIDES: dict[str, tuple[str, float, float]] = {
     "reasoning": ("bool", 0, 0),
     "cache_type_k": ("cache", 0, 0),
     "cache_type_v": ("cache", 0, 0),
+    # Not a llama-server flag: InferenceDeck's idle auto-release window (0 = off).
+    "idle_release_seconds": ("int", 0, 7 * 24 * 3600),
+    "repeat_last_n": ("int", -1, 1_000_000),
+    # A sampling preset from sampling.py (or "none"); explicit overrides still win.
+    "sampling_preset": ("preset", 0, 0),
+    # Pass the projector found next to the model (--mmproj) for image/audio input.
+    "vision": ("bool", 0, 0),
 }
 
 
@@ -54,6 +63,9 @@ def validate_overrides(raw: Any) -> dict[str, Any] | None:
         if kind == "bool":
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be true or false")
+        elif kind == "preset":
+            if value != NO_PRESET and value not in SAMPLING_PRESETS:
+                raise ValueError(f"{key} must be one of {', '.join([NO_PRESET, *SAMPLING_PRESETS])}")
         elif kind == "cache":
             if value not in CACHE_TYPES:
                 raise ValueError(f"{key} must be one of {', '.join(sorted(CACHE_TYPES))}")

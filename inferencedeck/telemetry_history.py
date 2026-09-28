@@ -67,7 +67,15 @@ def flatten(snap: dict[str, Any]) -> tuple[dict[str, float], dict[str, Any]]:
         profile = server.get("profile")
         if not profile or not server.get("running"):
             continue
-        for field in ("gpu_memory_bytes", "rss_bytes"):
+        for field in (
+            "gpu_memory_bytes",
+            "rss_bytes",
+            "tokens_per_second",
+            "prompt_tokens_per_second",
+            "throughput_tokens_per_second",
+            "requests_active",
+            "kv_cache_usage_percent",
+        ):
             put(f"server:{profile}.{field}", server.get(field))
     return values, meta
 

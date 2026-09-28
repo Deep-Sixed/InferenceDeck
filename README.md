@@ -102,6 +102,8 @@ Commands (all print JSON; with no command, `inventory` runs):
 | `servers` | Servers started by InferenceDeck. |
 | `stop --server-id ID` / `stop --mode MODE` | Stop a tracked server. |
 | `logs SERVER_ID [--lines N]` | Read a tracked server's log. |
+| `config validate [--strict] [--json]` | Check `config.json`, `models.json` and remote endpoint files without starting anything (see below). Exits 1 on errors. |
+| `config schema config\|profiles\|endpoint` | Print the JSON Schema for a configuration file. |
 | `hf-files REPO` | List the GGUF quants (split shards grouped) and vision projectors in a Hugging Face repo. |
 | `pull REPO --quant Q4_K_M` / `pull REPO --pattern GLOB` | Download one quant: every shard, plus the repo's mmproj (`--no-mmproj` to skip). `--dry-run` shows the files first. |
 | `updates [--channel stable\|prerelease] [--refresh]` | Compare each installed runtime's version with its latest upstream release (see below). |
@@ -143,10 +145,11 @@ asks GitHub again. Each update links to its GitHub release page.
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
 `extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `koboldcpp_path`,
-`extra_koboldcpp_args`, `default_host`, `default_port` and `server_history_limit` (see
-`inferencedeck/config.py` for the full list and defaults). Stopped servers stay listed,
-with their logs, as history; `server_history_limit` (default 5) sets how many are kept
-before the oldest records and their log files are deleted.
+`extra_koboldcpp_args`, `default_host`, `default_port`, `server_history_limit`,
+`idle_release_seconds` and `concurrent_vram_check` (see `inferencedeck/config.py` for the
+full list and defaults). Stopped servers stay listed, with their logs, as history;
+`server_history_limit` (default 5) sets how many are kept before the oldest records and
+their log files are deleted.
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -158,7 +161,48 @@ Runtime discovery also checks for already-running servers at `LLAMA_SERVER_URL` 
 `VLLM_CPP_SERVER_URL` and `MLC_LLM_SERVER_URL`. `HF_TOKEN` (or `HUGGINGFACE_TOKEN`) is sent with Hugging Face
 metadata requests when set.
 
+
+### Checking the configuration
+
+`inferencedeck config validate` (or `inferencedeck-web --check-config`) checks the three
+files that shape what InferenceDeck does, without launching servers, probing hardware or
+opening ports:
+
+- `config.json`: key types and allowed values, unknown keys (a typo such as
+  `idel_release_seconds` is otherwise silently ignored), and configured paths that don't
+  exist. A `config.json` that isn't valid JSON is an error, since InferenceDeck then runs
+  on defaults.
+- `models.json`: each profile has a unique `mode`, typed `recommended_params` (for
+  example `ctx_size` must be an integer and `flash_attn` a boolean), unknown params with a
+  "did you mean" hint, and runtimes that are detected but cannot be launched.
+- `remote_endpoints/*.json`: the same rules the endpoint loader enforces, plus unknown
+  keys; an `apiKey` stored in the file is an error.
+
+Errors mean a file won't work as written; warnings mean it will, but probably not as
+meant. `inferencedeck-web` prints any problems when it starts, the web UI shows them in the
+Status card, and `GET /api/config/check` returns them as JSON. `--strict` makes warnings
+fail the command too, for CI.
+
+The schemas are also in `schemas/` (`config.schema.json`, `models.schema.json`,
+`remote-endpoint.schema.json`). Point an editor at one for completion and inline checks,
+e.g. `"$schema": "https://raw.githubusercontent.com/Deep-Sixed/InferenceDeck/main/schemas/models.schema.json"`
+in `models.json`.
 ## Choosing a llama.cpp build
+
+### Editing configuration while InferenceDeck runs
+
+`config.json`, `models.json` and the remote endpoint files are read on use, so edits take
+effect without a restart. An edit only takes effect if the file still parses and, for
+`config.json`, passes the checks above (a wrong type or value, not just an unknown key).
+Otherwise the previous version stays in effect and the rejected one is reported until it
+is fixed or reverted. That covers a file caught half-saved by an editor as well as a real
+mistake. The web UI shows an "edit not applied" note in the Status card, and
+`GET /api/status` lists the file under `config_rejected`.
+
+A file with no previous good version runs on defaults (no profiles, for `models.json`),
+as does a deleted file. While `config.json` holds a rejected edit, settings the web UI
+would save there (such as the pinned runtime) are refused, so your edit isn't
+overwritten.
 
 InferenceDeck picks the llama-server build this CPU can run:
 
@@ -374,6 +418,124 @@ Starts run one at a time. Start is refused when the profile already has a runnin
 (unless the caller asks to stop it first) or when another tracked server is using the same
 port.
 
+### Idle auto-release
+
+InferenceDeck can release a server's GPU (the same as **Release GPU**) once it has
+gone a set time without requests; **Restore** starts it again with the same settings.
+It is off by default. Set a default for all servers with `idle_release_seconds` in the
+app config, or per server with the **Auto-release** buttons in the web UI (`POST
+/api/idle` with `server_id` and `seconds`, or `null` to use the default). A profile
+param or launch override named `idle_release_seconds` sets it at start.
+
+InferenceDeck is not in the request path, so `inferencedeck-web` polls each server's
+llama-server `/slots` every 15 seconds. A slot that is processing, or one that took a
+new task since the last poll, counts as activity. A server whose `/slots` cannot be
+read (started with `--no-slots` or `--api-key`, not responding, or a vllm.cpp server,
+which has no `/slots`) is never auto-released. The idle clock restarts when `inferencedeck-web` restarts.
+Requests through the gateway also count (see [Requests in flight](#requests-in-flight)): a server with a
+gateway request running is never released, even before any slot starts processing it.
+
+### Model capabilities
+
+Profiles (`GET /api/profiles`) and tracked servers carry a `capabilities` object:
+`input` (`text`, `image`, `audio`), `output` (`text`, `embedding` or `score`), `tools`,
+`embedding`, `reranker` and `context_max` (the context the model was trained for), with
+`sources` saying where each came from. Filter profiles with
+`GET /api/profiles?capability=tools` (or `image`, `audio`, `embedding`, `reranker`).
+
+- **GGUF header** (read once and cached, never while listing): a tool-calling chat
+  template, the trained context length, and the pooling type, which marks embedding
+  and reranking models. Until a model has been started or fitted once, the profile list
+  shows these as unknown.
+- **The launch:** image/audio input only when a projector is passed. Set
+  `"vision": true` on the profile (or as a launch override) to pass the `mmproj-*.gguf`
+  found next to the model as `--mmproj`, or name one with `"mmproj"`. The web UI notes
+  when a projector is found but not enabled. The projector's size is included in the GPU
+  memory check. `"reranking": true` adds `--reranking` for reranker models (`"embedding":
+  true` already adds `--embedding`).
+- **The profile:** a `capabilities` object in the profile's params overrides any
+  field, e.g. `{"capabilities": {"tools": false, "context_max": 32768}}`.
+- **The running server:** once llama-server is ready, what its `/props` reports
+  (modalities, tool support, per-request context) replaces the guesses.
+
+Generated launch scripts now use the same launch params as Start, so they also pick up the
+profile's sampling preset and projector.
+
+### Live logs
+
+Each tracked server has a **Logs** button in the web UI that opens a live view of its
+log. Behind it is `GET /api/logs/stream?server_id=…` (server-sent events; add
+`&stream=stderr` or `stdout` for one file, `&history=` bytes of backlog, default 64 KiB).
+It sends recent history, then new lines as llama-server writes them.
+
+Servers write straight to their log files under the cache dir, so the files stay the
+complete record and a slow browser can never stall a server. The stream is what's
+bounded: history is capped, a viewer that falls more than 1 MiB behind skips ahead
+(and is told how much it missed), at most 8 streams run at once, and the web view
+keeps the last 2000 lines. A stream ends when its server is no longer tracked; a
+restart gives the server a new id, so reopen **Logs** after one. `GET /api/logs` (the
+last N lines) now reads only the end of the file instead of loading all of it.
+
+### Starting a server next to running ones
+
+Before a llama.cpp server starts (Start, Restore, Reload & restart, Benchmark), InferenceDeck
+checks that it fits in GPU memory next to the servers already running. It estimates the new
+server's VRAM with the same estimator as the fit badges, and compares it with:
+
+- **free VRAM right now**, from `nvidia-smi` (or available memory on Apple silicon), which
+  already counts running servers; or, when that isn't available,
+- **total VRAM minus the estimates of the tracked servers that are running** (paused ones
+  included, since they keep their VRAM; released ones are not counted).
+
+If the model would fit on its own but not alongside what is running, the start is refused
+(HTTP 409, `"reason": "vram_conflict"`) with a `vram_plan` naming the fewest servers to
+release, biggest first. The web UI then offers to release them and continue (Restore brings
+them back) or to start anyway. Over the API, send `"release_conflicts": true` or
+`"force": true` with `/api/start`, `/api/restore` or `/api/restart`. `POST /api/plan` with a
+`mode` reports the plan without starting anything.
+
+A server answering gateway requests is never picked for release. If only releasing such a
+server would make room, the start is refused (HTTP 409, `"reason": "vram_busy"`) even with
+`release_conflicts`; try again once its requests finish, or send `"force": true`.
+
+A tight fit, or a model too big for the GPU even alone, starts with a warning as before;
+the Fit tools are the place to shrink it. Set `concurrent_vram_check` in the app config to
+`"warn"` to never refuse, or `"off"` to skip the check. Only the primary GPU is checked, and
+vllm.cpp launches are not checked.
+
+### Request defaults and sampling presets
+
+A profile can set what requests get when they don't choose for themselves:
+
+```json
+{
+  "sampling_preset": "coding",
+  "temperature": 0.3,
+  "n_predict": 2048,
+  "jinja": true,
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+- `sampling_preset` is one of `coding`, `factual`, `balanced` or `creative`
+  (`GET /api/sampling` lists their values). A profile's own values sit on top of
+  its preset, so the example above is the coding preset with `temperature` 0.3.
+- A preset picked at launch (the web UI's preset menu next to **Start**, or
+  `"overrides": {"sampling_preset": "creative"}` on `POST /api/start`) replaces the
+  profile's sampling values; other explicit overrides still win over it. `"none"`
+  drops the profile's preset.
+- `chat_template_kwargs` becomes llama-server's `--chat-template-kwargs`, for switches
+  such as `enable_thinking` or `reasoning_effort`. It is read by the Jinja chat
+  template, so pair it with `"jinja": true`. It can only be set in the profile, not
+  over the API.
+
+These become llama-server launch flags, so they are **defaults**: a request that sends
+its own `temperature`, `max_tokens` or `chat_template_kwargs` still gets what it asked
+for. The web UI shows each running server's defaults. Forcing a value over the
+client's (llama-swap's `setParams`) would need InferenceDeck in the request path, which
+it is not. vllm.cpp servers take sampling per request only, so presets there only
+produce the usual "not applied" warning.
+
 ### Remote access
 
 Off loopback, InferenceDeck requires authentication **and** an encrypted transport,
@@ -405,23 +567,47 @@ endpoints serve it, behind the same authentication as the rest of the API:
 
 | Endpoint | Format | Contents |
 |---|---|---|
-| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; lifecycle counters and the most recent lifecycle events |
+| `GET /api/telemetry` | JSON | System CPU, load and memory; live NVIDIA GPU utilisation, VRAM, temperature, power and clock; per-server state, uptime, startup time, context size, resident memory, CPU time and GPU memory; per-server requests and tokens (see below); the latest benchmark per profile; lifecycle counters and the most recent lifecycle events |
 | `GET /metrics` | Prometheus text | The same readings as `inferencedeck_*` metrics, one series per profile |
 
 Lifecycle events are `server.started`, `server.ready`, `server.start_failed`,
 `server.stopped`, `server.stop_failed`, `server.suspended`, `server.resumed`,
-`server.released` and `server.restored`. Their counters live in memory and reset
+`server.released`, `server.restored` and `benchmark.completed`. Their counters live in memory and reset
 when the control process restarts, as Prometheus counters do. Readings are cached
 for two seconds so a UI poll and a scrape share one `nvidia-smi` call. GPU readings
 need `nvidia-smi`, and per-process memory and CPU time need Linux `/proc`. On other
 platforms those fields are left out. They are never reported as zero.
 
+#### Requests and tokens
+
+InferenceDeck doesn't sit between clients and the inference server, so it reads
+request and token counts from the server itself. llama-server is launched with
+`--metrics` (set `"metrics": false` in a profile to turn this off), and each live
+server's `/metrics` counters are read with a one-second timeout. Paused servers
+are skipped. The readings for each server are:
+
+| Field | Meaning |
+|---|---|
+| `requests_active`, `requests_deferred` | Requests being processed, and waiting for a free slot |
+| `prompt_tokens_total`, `tokens_generated_total` | Token counters since the server started |
+| `tokens_per_second` | Generation speed, over the time the server spent generating since the previous reading. Absent while idle, never zero |
+| `prompt_tokens_per_second` | Prompt-processing speed, measured the same way |
+| `throughput_tokens_per_second` | Tokens generated per wall-clock second since the previous reading (zero while idle) |
+| `kv_cache_usage_percent` | Share of the KV cache in use, on llama.cpp builds that report it |
+
+Rates are worked out from how InferenceDeck's own readings of the counters change,
+so another scraper doesn't change them. llama-server resets its
+`llamacpp:prompt_tokens_seconds` and `llamacpp:predicted_tokens_seconds` gauges on
+every scrape, though, so a separate Prometheus job scraping llama-server directly
+sees those two gauges cover shorter windows. The counters it scrapes are unaffected.
+vllm.cpp servers are read the same way if they serve vLLM-style `vllm:*` metrics.
+
 #### History and graphs
 
 `inferencedeck-web` also samples the snapshot every 5 seconds and keeps it for the
 **Telemetry** card in the web UI. That card has one chart per measure: GPU
-utilisation, VRAM, temperature, power and clock; GPU memory per server; CPU and
-RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
+utilisation, VRAM, temperature, power and clock; GPU memory, generation speed,
+prompt-processing speed, active requests and KV cache per server; CPU and RAM. Hovering one chart moves a crosshair across all of them. Lifecycle events
 are marked on the charts, with failed starts and stops in red. A data table
 under the charts lists the latest, average and peak value of every series.
 
@@ -448,6 +634,83 @@ scrape_configs:
     authorization:
       credentials_file: /etc/prometheus/inferencedeck-token   # omit when auth is off
 ```
+
+#### OpenTelemetry
+
+`inferencedeck-web` can also push telemetry to an OpenTelemetry Collector, or any
+OTLP/HTTP receiver. It is off unless an endpoint is set, and it is the only
+telemetry that leaves the machine. It speaks OTLP over HTTP with JSON encoding
+(the collector's `otlp` receiver on port 4318), with no extra dependencies.
+
+| Signal | What is sent |
+|---|---|
+| Metrics | The same readings as `/metrics`, every `otlp_export_seconds`. Gauges stay gauges and counters become cumulative sums |
+| Logs | One record per lifecycle event. Failed starts and stops are `WARN` |
+| Traces | An `inferencedeck.server.startup` span from launch until ready (or until it gave up, with error status), and an `inferencedeck.benchmark` span per benchmark run |
+
+Turn it on with `otlp_endpoint` in `config.json`, or the standard environment variables:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20...'   # credentials belong here, not in config.json
+export OTEL_SERVICE_NAME=thanatos                                # default: inferencedeck
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=home
+inferencedeck-web
+```
+
+| Setting (`config.json`) | Default | Meaning |
+|---|---|---|
+| `otlp_endpoint` | `""` | OTLP/HTTP base URL; `/v1/metrics`, `/v1/logs` and `/v1/traces` are appended |
+| `otlp_export_seconds` | `15` | Seconds between exports |
+
+A collector that is down doesn't affect InferenceDeck. Events are queued (up to
+2,000) and retried, and a missed metrics round is replaced by the next one.
+`GET /api/telemetry` reports the exporter's state under `otlp`: last export time,
+last error, and counts exported and dropped.
+
+#### Machines (fleet view)
+
+With InferenceDeck running on several machines, one web UI can show them all.
+List the other machines as peers in `config.json`:
+
+```json
+{
+  "fleet_name": "thanatos",
+  "fleet_peers": [
+    {"name": "friday", "url": "https://friday.tail1234.ts.net:8716", "tokenEnv": "FRIDAY_DECK_TOKEN"},
+    {"name": "p70", "url": "http://192.168.1.70:8716", "tokenEnv": "P70_DECK_TOKEN", "caFile": "~/p70-ca.pem"}
+  ]
+}
+```
+
+A **Machines** card then appears in the web UI. It has one row per machine with
+GPU load, VRAM, the models loaded (with their live tok/s), active requests, and
+whether the machine answered. `GET /api/fleet` returns the same data.
+
+- Each peer's `/api/telemetry` is read with its own token, sent as `Authorization: Bearer`.
+  The token comes from the environment variable named by `tokenEnv`, never from
+  `config.json`. A peer bound to the LAN or tailnet requires a token.
+- Peers are asked in parallel with a 3-second timeout, and the combined view is
+  cached for 5 seconds. A slow or offline machine shows as unreachable (with the
+  reason, such as `HTTP 401 (check its token)`) rather than stalling the page.
+- Redirects are refused, so a token is never sent anywhere except the configured URL.
+  `caFile` trusts a private CA for a peer served over HTTPS with `--certfile`.
+- Only `/api/telemetry` is read, never a peer's own fleet view, so machines that
+  list each other don't loop.
+
+**Where should this run?** The card's form, and
+`GET /api/fleet/placement?profile=qwen3-30b` (or `?model=<file>.gguf`), rank the
+machines for a model:
+
+1. machines with it **loaded** and serving;
+2. machines with it loaded but **paused**;
+3. machines that have **run it before** (a stopped or released server, or a benchmark);
+4. the rest.
+
+Within each group, faster machines rank first (live tok/s, else the last benchmark),
+then less busy ones, then those with more free VRAM. Profiles are matched by name,
+or by model file name when profile names differ between machines. This is advice
+only: nothing is started or routed automatically.
 
 ## Inference gateway (API mapping)
 
@@ -531,6 +794,53 @@ There are three engine adapters:
 The Anthropic API's `thinking` setting is dropped, and its server tools (such as `web_search`) are rejected.
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
+
+### Choosing between machines that serve the same model
+
+Two targets can answer to the same name, for example a local `qwen3-30b` and the
+`friday` endpoint aliased `qwen3-30b`. When `fleet_peers` is configured (see
+**Machines** above), the gateway orders them by the fleet's placement ranking:
+
+1. machines with the model **loaded** and serving, fastest first (live tok/s, else
+   the last benchmark), then least busy;
+2. machines that answer but don't have it loaded;
+3. machines the fleet view can't see (for example, no peer entry for that endpoint's host);
+4. machines where it is loaded but **paused**, which can't answer until resumed.
+
+A remote endpoint is matched to a fleet machine by the host name in its `baseUrl`,
+its `host` label, or its file name. Local servers belong to this machine.
+
+This only reorders targets that already match the name. It never starts, stops or
+switches a model, and it never makes a request wait: the gateway reads the fleet
+view it last cached and refreshes it in the background. Until the first view
+arrives, and whenever telemetry is unavailable, targets keep their usual order.
+Without `fleet_peers`, or with `"gateway_placement": false`, routing is exactly as
+described above.
+
+Every reply carries `X-InferenceDeck-Target: <model> @ <endpoint|local>`.
+`GET /route?model=qwen3-30b` shows the target a name would route to and the
+ranking behind it, without loading anything.
+### Requests in flight
+
+The gateway counts the requests it is sending to each local server, from the moment the
+request is routed until the last byte of the reply (streamed or not) has been sent. Each
+gateway process keeps its counts in `<cache>/inflight/gateway-<pid>.json`; `inferencedeck-web`
+reads them, ignoring (and deleting) the files of gateways that are no longer running.
+
+- **Idle auto-release** treats a server with requests in flight as busy, and each finished
+  request restarts its idle clock.
+- **Making room** for another model (`release_conflicts`) never releases a server with
+  requests in flight; the start is refused with `"reason": "vram_busy"` instead. The check
+  runs again just before releasing, so a request that arrived after the plan was made still
+  holds the server.
+- **Status**: `/api/status` adds `in_flight` and `last_request_at` to each server the gateway
+  has sent requests to, and the web UI shows "N in flight".
+
+Only requests through the gateway are counted. Requests sent straight to a server's own
+port are still seen by idle release through `/slots`, but not by the making-room check.
+Stop, Release GPU and Reload & restart are explicit and act immediately. Two Start requests
+for the same profile were already serialised: the second one is refused while the first
+server is tracked.
 
 ### Switching models on demand
 

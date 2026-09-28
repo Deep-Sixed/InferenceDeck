@@ -11,6 +11,7 @@ from typing import Any
 from .paths import cache_dir
 from .fileio import atomic_write_text, locked
 from .server_manager import http_base, list_servers, start_profile, stop_server
+from .telemetry import emit as emit_event
 
 
 RESULTS_FILENAME = "benchmarks.json"
@@ -106,7 +107,7 @@ def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[s
     if prompt_speed is None and prompt_ms and _positive(timings.get("prompt_n")):
         prompt_speed = float(timings["prompt_n"]) / (prompt_ms / 1000.0)
 
-    return {
+    metrics: dict[str, Any] = {
         "completion_tokens": completion_count,
         "prompt_tokens": prompt_count,
         # Generation speed: the server's decode rate when reported, else wall-clock.
@@ -117,6 +118,10 @@ def _speed_metrics(payload: dict[str, Any], text: str, elapsed: float) -> dict[s
         "generation_seconds": round(predicted_ms / 1000.0, 3) if predicted_ms else None,
         "timing_source": "server" if generation is not None else "wall_clock",
     }
+    if timings.get("cache_n") is not None:
+        # Prompt tokens reused from the KV cache (not re-processed).
+        metrics["cached_prompt_tokens"] = int(timings.get("cache_n") or 0)
+    return metrics
 
 
 def send_chat_prompt(
@@ -263,6 +268,13 @@ def run_profile_benchmark(
         "timings": response_payload.get("timings"),
     }
     save_benchmark_result(benchmark)
+    emit_event(
+        "benchmark.completed",
+        server,
+        tokens_per_second=benchmark.get("tokens_per_second"),
+        completion_tokens=benchmark.get("completion_tokens"),
+        elapsed_seconds=benchmark["elapsed_seconds"],
+    )
 
     stop_result = None
     if stop_after and server.get("id"):

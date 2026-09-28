@@ -5,6 +5,7 @@ import re
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from .live_config import Rejected, live_file
 from .paths import find_project_root
 from .schema import ModelProfile
 
@@ -51,9 +52,26 @@ def _parse_model_path(script_path: Path | None) -> str | None:
     return None
 
 
+def _parse_manifest(data: bytes) -> dict[str, Any]:
+    try:
+        manifest = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Rejected([f"not valid JSON: {exc}"]) from None
+    if not isinstance(manifest, dict):
+        raise Rejected(['must be a JSON object with a "models" list'])
+    if not isinstance(manifest.get("models", []), list):
+        raise Rejected(['"models" must be a list'])
+    return manifest
+
+
 def load_manifest(manifest_path: Path) -> dict[str, Any]:
-    with manifest_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    """models.json as last saved in a usable state.
+
+    A version that is not valid JSON (for example caught mid-save) is not
+    applied: the previous one stays in effect, or no profiles if there is none,
+    and live_config.rejected_files() reports it.
+    """
+    return live_file(manifest_path, _parse_manifest, "models.json").get() or {"models": []}
 
 
 def load_profiles(

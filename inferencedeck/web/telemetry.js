@@ -12,6 +12,11 @@
     {id: 'gpu-power', title: 'GPU power', unit: 'W', match: /^gpu(\d+)\.power_watts$/, fmt: v => `${Math.round(v)} W`},
     {id: 'gpu-clock', title: 'GPU core clock', unit: 'MHz', match: /^gpu(\d+)\.sm_clock_mhz$/, fmt: v => `${Math.round(v)} MHz`},
     {id: 'server-vram', title: 'GPU memory by server', unit: 'GB', match: /^server:(.+)\.gpu_memory_bytes$/, scale: 1 / GB, fmt: v => `${v.toFixed(1)} GB`},
+    // Speeds are measured only while a server works, so idle stretches are gaps, not zeros.
+    {id: 'server-gen', title: 'Generation speed', unit: 'tok/s', match: /^server:(.+)\.tokens_per_second$/, fmt: v => `${v.toFixed(1)} tok/s`},
+    {id: 'server-prompt', title: 'Prompt processing', unit: 'tok/s', match: /^server:(.+)\.prompt_tokens_per_second$/, fmt: v => `${Math.round(v)} tok/s`},
+    {id: 'server-requests', title: 'Active requests', unit: '', match: /^server:(.+)\.requests_active$/, integer: true, fmt: v => Number.isInteger(v) ? String(v) : v.toFixed(1)},
+    {id: 'server-kv', title: 'KV cache used', unit: '%', match: /^server:(.+)\.kv_cache_usage_percent$/, max: 100, fmt: v => `${Math.round(v)}%`},
     {id: 'cpu', title: 'CPU utilization', unit: '%', match: /^cpu_percent$/, max: 100, fmt: v => `${Math.round(v)}%`},
     {id: 'ram', title: 'RAM used', unit: 'GB', match: /^memory_used_bytes$/, scale: 1 / GB, limit: true, fmt: v => `${v.toFixed(1)} GB`},
   ];
@@ -19,6 +24,7 @@
     'server.started': 'started', 'server.ready': 'ready', 'server.start_failed': 'start failed',
     'server.stopped': 'stopped', 'server.stop_failed': 'stop failed', 'server.suspended': 'paused',
     'server.resumed': 'resumed', 'server.released': 'released GPU', 'server.restored': 'restored',
+    'benchmark.completed': 'benchmark',
   };
   const FAILED = new Set(['server.start_failed', 'server.stop_failed']);
   const NS = 'http://www.w3.org/2000/svg';
@@ -55,7 +61,7 @@
       const m = key.match(chart.match);
       if (!m || !values.some(v => v != null)) continue;
       const id = m[1] ?? '';
-      const name = chart.id.startsWith('gpu') ? (data.labels[`gpu${id}`] || `GPU ${id}`) : chart.id === 'server-vram' ? id : chart.title;
+      const name = chart.id.startsWith('gpu') ? (data.labels[`gpu${id}`] || `GPU ${id}`) : chart.id.startsWith('server-') ? id : chart.title;
       const scale = chart.scale || 1;
       const limit = chart.limit && data.limits[key] ? data.limits[key] * scale : null;
       out.push({key, name, values: values.map(v => v == null ? null : v * scale), limit});
@@ -90,7 +96,8 @@
     const svg = el('svg', {viewBox: `0 0 ${width} ${HEIGHT}`, width: '100%', height: HEIGHT, role: 'img', 'aria-label': `${chart.title} over the last ${range}`}, card);
     const ts = data.timestamps, n = ts.length;
     const peak = Math.max(...series.flatMap(s => [...s.values.filter(v => v != null), s.limit || 0]));
-    const yMax = chart.max || niceMax(peak * 1.05);
+    // Counts get an even whole-number top so the midline tick is a whole number too.
+    const yMax = chart.max || (chart.integer ? Math.max(2, Math.ceil(peak / 2) * 2) : niceMax(peak * 1.05));
     const x = i => PAD.l + (n > 1 ? i / (n - 1) : 0.5) * (width - PAD.l - PAD.r);
     const y = v => PAD.t + (1 - Math.min(v, yMax) / yMax) * (HEIGHT - PAD.t - PAD.b);
 
@@ -124,12 +131,17 @@
     // Lines bridge a missed sample or two but break across real gaps (the
     // control process was down), so an outage never looks like a flat line.
     for (const s of series) {
-      let d = '', gap = Infinity;
+      let d = '', gap = Infinity, run = [];
+      // A reading with no neighbour (a short burst) has no line to draw, so it gets a dot.
+      const flush = () => { if (run.length === 1) el('circle', {cx: x(run[0][0]), cy: y(run[0][1]), r: 2, fill: s.color}, svg); run = []; };
       s.values.forEach((v, i) => {
         if (v == null) { gap++; return; }
+        if (gap >= 3) flush();
         d += `${gap >= 3 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+        run.push([i, v]);
         gap = 0;
       });
+      flush();
       if (d) el('path', {d: d.replace(/^L/, 'M'), class: 'tline', stroke: s.color}, svg);
     }
 
@@ -223,7 +235,8 @@
       const row = html('div', 'meta', null, events);
       html('span', null, `${clock(e.t, true)} · `, row);
       html('span', FAILED.has(e.type) ? 'tfailtext' : null, `${e.profile || e.server_id || ''} ${EVENT_LABELS[e.type] || e.type}`.trim(), row);
-      const extra = e.startup_seconds != null ? ` · ready in ${e.startup_seconds.toFixed(1)} s` : e.reason ? ` · ${e.reason}` : '';
+      const extra = e.startup_seconds != null ? ` · ready in ${e.startup_seconds.toFixed(1)} s`
+        : e.tokens_per_second != null ? ` · ${e.tokens_per_second} tok/s` : e.reason ? ` · ${e.reason}` : '';
       if (extra) html('span', null, extra, row);
     }
   }
