@@ -136,6 +136,21 @@ class OptionalKeyTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     enable_endpoint("ep", root)
 
+    def test_cloud_without_model_is_invalid(self) -> None:
+        # Unpinned, a paid endpoint would get whatever model name a client sent.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="openrouter", lane="true_cloud", apiKeyEnv="OR_KEY")
+            cfg = list_endpoints(root)[0]
+            self.assertFalse(cfg.valid)
+            self.assertIn("model", cfg.error)
+            with mock.patch.dict(os.environ, {"OR_KEY": "k"}), self.assertRaises(ValueError):
+                enable_endpoint("ep", root)
+
+    def test_self_hosted_without_model_is_still_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._root(tmp, provider="llamacpp", lane="remote_host")
+            self.assertTrue(list_endpoints(root)[0].valid)
+
     def test_cloud_without_key_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = self._root(tmp, provider="openrouter", lane="true_cloud")
@@ -145,3 +160,24 @@ class OptionalKeyTests(unittest.TestCase):
             # A config with no lane falls back to true_cloud unless it is llama.cpp.
             (Path(tmp) / "ep.json").write_text(json.dumps({"provider": "openai", "baseUrl": "https://x/v1"}))
             self.assertFalse(list_endpoints(root)[0].valid)
+
+
+class RoutingFieldTests(unittest.TestCase):
+    def _parse(self, **fields):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "ep.json").write_text(json.dumps({"baseUrl": "http://x:8080/v1", "apiKeyEnv": "K", **fields}))
+            return list_endpoints(Path(tmp))[0]
+
+    def test_routable_defaults_by_lane(self) -> None:
+        self.assertTrue(self._parse(provider="llamacpp").routable)
+        self.assertFalse(self._parse(provider="openrouter", lane="true_cloud").routable)
+        self.assertTrue(self._parse(provider="openrouter", lane="true_cloud", routable=True).routable)
+        self.assertFalse(self._parse(provider="llamacpp", routable=False).routable)
+
+    def test_aliases_are_validated(self) -> None:
+        cfg = self._parse(provider="llamacpp", aliases=["big", " ", "qwen"])
+        self.assertEqual(cfg.aliases, ("big", "qwen"))
+        self.assertEqual(json.loads(json.dumps(cfg.to_dict()))["aliases"], ["big", "qwen"])
+        for bad in ("big", [1], {"a": 1}):
+            self.assertFalse(self._parse(provider="llamacpp", aliases=bad).valid)
+        self.assertFalse(self._parse(provider="llamacpp", routable="yes").valid)

@@ -59,6 +59,10 @@ class RemoteEndpoint:
     tags: tuple[str, ...] = ()
     host: str = ""
     transport: str = ""
+    # Gateway name routing: extra model names clients may request, and whether
+    # the endpoint takes name-routed requests while it is not the enabled one.
+    aliases: tuple[str, ...] = ()
+    routable: bool = False
 
     @property
     def name(self) -> str:
@@ -153,6 +157,11 @@ def _parse(path: Path) -> RemoteEndpoint:
         error = "lane must be remote_host or true_cloud"
     elif not api_key_env and lane != LANE_REMOTE_HOST:
         error = "apiKeyEnv is required for true_cloud endpoints"
+    elif not model and lane != LANE_REMOTE_HOST:
+        # Unpinned, a paid endpoint would get whatever model name a client sent
+        # when it falls through to the default target (e.g. an SDK's built-in
+        # default). Choosing another model stays explicit: <endpoint>/<model>.
+        error = "model is required for true_cloud endpoints"
     transport = str(data.get("transport") or "").strip().lower()
     if transport and transport not in VALID_TRANSPORTS:
         error = error or "transport must be tailscale, lan or https"
@@ -166,6 +175,17 @@ def _parse(path: Path) -> RemoteEndpoint:
         context_size = None
         error = error or "contextSize must be an integer"
     tags = tuple(str(tag) for tag in (data.get("tags") or []) if str(tag).strip())
+    raw_aliases = data.get("aliases") or []
+    if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
+        error = error or "aliases must be a list of strings"
+        raw_aliases = []
+    aliases = tuple(a.strip() for a in raw_aliases if a.strip())
+    # Self-hosted endpoints are routable by name unless opted out; a cloud
+    # endpoint must opt in, so no request leaves your machines by accident.
+    raw_routable = data.get("routable", lane == LANE_REMOTE_HOST)
+    if not isinstance(raw_routable, bool):
+        error = error or "routable must be true/false"
+        raw_routable = False
     return RemoteEndpoint(
         path=path,
         provider=provider,
@@ -181,6 +201,8 @@ def _parse(path: Path) -> RemoteEndpoint:
         tags=tags,
         host=host,
         transport=transport,
+        aliases=aliases,
+        routable=raw_routable,
     )
 
 
