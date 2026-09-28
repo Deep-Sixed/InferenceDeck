@@ -498,9 +498,9 @@ to the default target as before. While a remote endpoint is enabled, local model
 not loaded (local starts are refused then); requests that name one go to the default
 target. `GET /v1/models` adds each loadable profile with `"loaded": false`.
 
-The gateway uses the same bind rule as the control API: loopback only, unless a token is set (`INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE`). With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`, or `X-Auth-Token`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled the same way as web logins (5 per 5 minutes per client address). POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
+The gateway uses the same bind rule as the control API: loopback only, unless a token is set (`INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE`). With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`, or `X-Auth-Token`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like web logins (5 per 5 minutes), and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
 
-The gateway serves plain HTTP only; it has no `--certfile` option. For use across a LAN, reach it over a tailnet or put it behind a TLS reverse proxy. The gateway does not read `INFERENCEDECK_TRUSTED_PROXIES`, so behind a proxy all clients share the proxy's throttle.
+The gateway serves plain HTTP only; it has no `--certfile` option. For use across a LAN, reach it over a tailnet or put it behind a TLS reverse proxy.
 
 ## Development
 

@@ -347,6 +347,29 @@ class GatewayServerTests(unittest.TestCase):
         status, _ = self.post("/v1/messages", {"max_tokens": 5, **body}, {"x-api-key": "s3cret"})
         self.assertEqual(status, 200)
 
+    def test_trusted_proxy_throttles_by_forwarded_client(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        attacker = {"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.5"}
+        for _ in range(5):
+            self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 429)
+        # Another client behind the same proxy has its own bucket.
+        other = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        self.assertEqual(self.post("/v1/chat/completions", body, other)[0], 200)
+
+    def test_forwarded_for_ignored_from_untrusted_peer(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset()))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for n in range(5):
+            headers = {"Authorization": "Bearer wrong", "X-Forwarded-For": f"203.0.113.{n}"}
+            self.assertEqual(self.post("/v1/chat/completions", body, headers)[0], 401)
+        # Rotating the header doesn't dodge the throttle: the peer address is the key.
+        fresh = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        status, raw = self.post("/v1/chat/completions", body, fresh)
+        self.assertEqual(status, 429)
+        self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
     def test_non_loopback_bind_needs_token(self) -> None:
         with self.assertRaises(Exception):
             make_server("0.0.0.0", 0, AuthState(token=""))
