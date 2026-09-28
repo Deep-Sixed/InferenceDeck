@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import tempfile
@@ -235,6 +236,62 @@ class GatewayServerTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
+    def _broken_stream_target(self, released: list[bool]) -> Target:
+        class BrokenEngine:
+            api_base = "http://upstream.invalid/v1"
+
+            def stream(self, request):
+                def events():
+                    yield StreamEvent("text", text="Hel")
+                    # Not a GatewayError: e.g. an upstream chunk of an unexpected shape.
+                    raise AttributeError("'str' object has no attribute 'get'")
+                return events()
+
+        class Lease:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                released.append(True)
+
+        return Target(BrokenEngine(), "broken", "m", lease=Lease)
+
+    def test_unexpected_stream_failure_is_reported_in_band(self) -> None:
+        chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        anthropic = {"model": "m", "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
+            with self.subTest(path=path):
+                released: list[bool] = []
+                self.target = self._broken_stream_target(released)
+                status, raw = self.post(path, body)
+                self.assertEqual(status, 200)
+                # One response only: no second status line written into the stream.
+                self.assertNotIn(b"HTTP/1.", raw)
+                self.assertIn(b"Hel", raw)
+                self.assertIn(b"upstream stream failed", raw)
+                self.assertEqual(released, [True])  # a model switch isn't left waiting on it
+
+    def test_trusted_proxy_throttles_each_gateway_client_separately(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+
+        def guess(client: str) -> int:
+            return self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": client})[0]
+
+        for _ in range(5):
+            self.assertEqual(guess("198.51.100.7"), 401)
+        self.assertEqual(guess("198.51.100.7"), 429)
+        self.assertEqual(guess("198.51.100.8"), 401)  # another user behind the proxy is not locked out
+
+    def test_untrusted_forwarded_for_cannot_dodge_the_gateway_throttle(self) -> None:
+        self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset()))
+        body = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
+        for i in range(5):
+            self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong", "X-Forwarded-For": f"198.51.100.{i}"})
+        status, _raw = self.post("/v1/chat/completions", body,
+                                 {"Authorization": "Bearer wrong", "X-Forwarded-For": "198.51.100.99"})
+        self.assertEqual(status, 429)
+
     def test_cross_site_style_posts_never_reach_upstream(self) -> None:
         # What a web page can send without a CORS preflight: text/plain, or a form.
         chat = {"model": "qwen", "messages": [{"role": "user", "content": "hi"}]}
@@ -346,6 +403,64 @@ class GatewayServerTests(unittest.TestCase):
         self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
         status, _ = self.post("/v1/messages", {"max_tokens": 5, **body}, {"x-api-key": "s3cret"})
         self.assertEqual(status, 200)
+
+    def test_trusted_proxy_throttles_by_forwarded_client(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        attacker = {"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.5"}
+        for _ in range(5):
+            self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, attacker)[0], 429)
+        # Another client behind the same proxy has its own bucket.
+        other = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        self.assertEqual(self.post("/v1/chat/completions", body, other)[0], 200)
+
+    def test_forwarded_for_ignored_from_untrusted_peer(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset()))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for n in range(5):
+            headers = {"Authorization": "Bearer wrong", "X-Forwarded-For": f"203.0.113.{n}"}
+            self.assertEqual(self.post("/v1/chat/completions", body, headers)[0], 401)
+        # Rotating the header doesn't dodge the throttle: the peer address is the key.
+        fresh = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "198.51.100.7"}
+        status, raw = self.post("/v1/chat/completions", body, fresh)
+        self.assertEqual(status, 429)
+        self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
+    def test_valid_token_clears_earlier_failures(self) -> None:
+        self.start_gateway(AuthState(token="s3cret"))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for _ in range(4):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+        # One more typo later doesn't trip the lockout.
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+
+    def test_client_forwarded_for_line_cannot_dodge_the_throttle(self) -> None:
+        # A proxy that adds its own X-Forwarded-For line (HAProxy) leaves the
+        # client's forged line first; the throttle must key on the proxy's.
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        port = int(self.base.rsplit(":", 1)[1])
+        payload = json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode()
+
+        def guess(forged: str) -> int:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                conn.putrequest("POST", "/v1/chat/completions")
+                conn.putheader("Content-Type", "application/json")
+                conn.putheader("Content-Length", str(len(payload)))
+                conn.putheader("Authorization", "Bearer wrong")
+                conn.putheader("X-Forwarded-For", forged)
+                conn.putheader("X-Forwarded-For", "203.0.113.5")
+                conn.endheaders(payload)
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        for n in range(5):
+            self.assertEqual(guess(f"10.9.9.{n}"), 401)
+        self.assertEqual(guess("10.9.9.99"), 429)
 
     def test_non_loopback_bind_needs_token(self) -> None:
         with self.assertRaises(Exception):

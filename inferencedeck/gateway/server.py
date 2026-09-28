@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from ..auth import AuthState, host_header_ok, request_client, validate_bind_security
 from ..config import AppConfig
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
@@ -81,14 +81,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
     def _host_ok(self) -> bool:
         # Same DNS-rebinding guard as the control API.
-        if self.auth_state.enabled:
-            return True
-        host = self.headers.get("Host", "")
-        if host.startswith("["):
-            name = host[1:].partition("]")[0]
-        else:
-            name = host.rpartition(":")[0] if host.count(":") == 1 else host
-        return name.lower() in LOOPBACK_HOSTS
+        return host_header_ok(self.headers, self.auth_state)
 
     def _token_ok(self) -> bool:
         if not self.auth_state.enabled:
@@ -98,6 +91,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
         ) or self.headers.get("x-api-key", "") or self.headers.get("X-Auth-Token", "")
         return bool(supplied) and secrets.compare_digest(supplied, self.auth_state.token)
+
+    def _client(self) -> str:
+        # Same throttle key as the control API: X-Forwarded-For only from a trusted proxy.
+        return request_client(self)
 
     def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -125,6 +122,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; closing the generator closes the upstream
+        except Exception:
+            # The 200 and part of the body are already on the wire, so nothing
+            # may escape to do_POST's error handler: it would write a second
+            # status line into the stream. render_stream reports upstream
+            # failures in-band; anything else just ends the stream here.
+            self.close_connection = True
         finally:
             close = getattr(chunks, "close", None)
             if close is not None:
@@ -136,7 +139,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(HTTPStatus.FORBIDDEN, render_error(GatewayError(403, "host not allowed", "authentication")))
             return False
-        client = str(self.client_address[0])
+        client = self._client()
         wait = self.auth_state.retry_after(client)
         if wait:
             self._send(HTTPStatus.TOO_MANY_REQUESTS,
@@ -147,6 +150,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.auth_state.record_failure(client)
             self._send(HTTPStatus.UNAUTHORIZED, render_error(GatewayError(401, "invalid or missing token", "authentication")))
             return False
+        if self.auth_state.enabled:
+            # Earlier typos (a stale key during setup) shouldn't linger and
+            # lock out a client that now authenticates.
+            self.auth_state.record_success(client)
         return True
 
     def _body(self) -> dict[str, Any]:
@@ -254,7 +261,9 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 def make_server(host: str, port: int, auth_state: AuthState | None = None,
                 router: Router | None = None) -> ThreadingHTTPServer:
     auth = auth_state or AuthState()
-    validate_bind_security(host, auth)
+    # The gateway has no TLS option of its own; off loopback it still needs a
+    # token, and the README points LAN use at a tailnet or a TLS reverse proxy.
+    validate_bind_security(host, auth, allow_insecure_http=True)
     attrs: dict[str, Any] = {"auth_state": auth}
     if router is not None:
         attrs["router"] = router
