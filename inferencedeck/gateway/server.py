@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from ..auth import LOOPBACK_HOSTS, AuthState, client_address, validate_bind_security
+from ..auth import AuthState, host_header_ok, request_client, validate_bind_security
 from ..config import AppConfig
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
@@ -74,14 +74,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
     def _host_ok(self) -> bool:
         # Same DNS-rebinding guard as the control API.
-        if self.auth_state.enabled:
-            return True
-        host = self.headers.get("Host", "")
-        if host.startswith("["):
-            name = host[1:].partition("]")[0]
-        else:
-            name = host.rpartition(":")[0] if host.count(":") == 1 else host
-        return name.lower() in LOOPBACK_HOSTS
+        return host_header_ok(self.headers, self.auth_state)
 
     def _token_ok(self) -> bool:
         if not self.auth_state.enabled:
@@ -94,9 +87,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
 
     def _client(self) -> str:
         # Same throttle key as the control API: X-Forwarded-For only from a trusted proxy.
-        return client_address(
-            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
-        )
+        return request_client(self)
 
     def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -150,6 +141,10 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.auth_state.record_failure(client)
             self._send(HTTPStatus.UNAUTHORIZED, render_error(GatewayError(401, "invalid or missing token", "authentication")))
             return False
+        if self.auth_state.enabled:
+            # Earlier typos (a stale key during setup) shouldn't linger and
+            # lock out a client that now authenticates.
+            self.auth_state.record_success(client)
         return True
 
     def _body(self) -> dict[str, Any]:

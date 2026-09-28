@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from inferencedeck import benchmark, webui
-from inferencedeck.auth import AuthState, client_address
+from inferencedeck.auth import AuthState, TrustedProxies, client_address, forwarded_for
 from inferencedeck.config import AppConfig
 from inferencedeck.control import ControlPlane
 from inferencedeck.control_api import ControlRequestHandler
@@ -46,6 +46,45 @@ class ClientAddressTests(unittest.TestCase):
     def test_all_trusted_or_empty_falls_back_to_peer(self) -> None:
         self.assertEqual(client_address("10.0.0.1", "10.0.0.1", self.PROXY), "10.0.0.1")
         self.assertEqual(client_address("10.0.0.1", "", self.PROXY), "10.0.0.1")
+
+    def test_cidr_and_localhost_entries_match(self) -> None:
+        pool = TrustedProxies(["10.0.0.0/8"])
+        self.assertEqual(client_address("10.0.3.7", "198.51.100.7", pool), "198.51.100.7")
+        local = TrustedProxies(["localhost"])
+        self.assertEqual(client_address("127.0.0.1", "198.51.100.7", local), "198.51.100.7")
+        self.assertEqual(client_address("::1", "198.51.100.7", local), "198.51.100.7")
+        self.assertEqual(client_address("::ffff:127.0.0.1", "198.51.100.7", local), "198.51.100.7")
+
+    def test_unusable_entries_are_reported_not_silently_ignored(self) -> None:
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            proxies = TrustedProxies(["proxy.internal.example", "10.0.0.1"], warn=True)
+        self.assertIn("proxy.internal.example", err.getvalue())
+        self.assertIn("10.0.0.1", proxies)
+        self.assertNotIn("10.0.0.2", proxies)
+
+    def test_hops_are_normalized(self) -> None:
+        # Ports (a new one per connection) must not give each attempt its own bucket.
+        self.assertEqual(client_address("10.0.0.1", "203.0.113.5:51234", self.PROXY), "203.0.113.5")
+        self.assertEqual(client_address("10.0.0.1", "[2001:db8::5]:443", self.PROXY), "2001:db8::/64")
+        self.assertEqual(client_address("10.0.0.1", "::ffff:203.0.113.5", self.PROXY), "203.0.113.5")
+
+    def test_ipv6_clients_share_a_bucket_per_64(self) -> None:
+        self.assertEqual(client_address("10.0.0.1", "2001:db8::1", self.PROXY),
+                         client_address("10.0.0.1", "2001:db8::ffff:2", self.PROXY))
+        self.assertEqual(client_address("2001:db8::1", "", frozenset()), "2001:db8::/64")
+
+    def test_non_address_hop_falls_back_to_the_proxy(self) -> None:
+        self.assertEqual(client_address("10.0.0.1", "unknown", self.PROXY), "10.0.0.1")
+        self.assertEqual(client_address("10.0.0.1", "198.51.100.7, garbage", self.PROXY), "10.0.0.1")
+
+    def test_every_forwarded_for_line_is_read(self) -> None:
+        from email.message import Message
+
+        headers = Message()
+        headers["X-Forwarded-For"] = "10.9.9.9"  # the client's own header
+        headers["X-Forwarded-For"] = "198.51.100.7"  # the line HAProxy added
+        self.assertEqual(forwarded_for(headers), "10.9.9.9,198.51.100.7")
+        self.assertEqual(client_address("10.0.0.1", forwarded_for(headers), self.PROXY), "198.51.100.7")
 
 
 class _Server:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import tempfile
@@ -425,6 +426,41 @@ class GatewayServerTests(unittest.TestCase):
         status, raw = self.post("/v1/chat/completions", body, fresh)
         self.assertEqual(status, 429)
         self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
+    def test_valid_token_clears_earlier_failures(self) -> None:
+        self.start_gateway(AuthState(token="s3cret"))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for _ in range(4):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+        # One more typo later doesn't trip the lockout.
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+
+    def test_client_forwarded_for_line_cannot_dodge_the_throttle(self) -> None:
+        # A proxy that adds its own X-Forwarded-For line (HAProxy) leaves the
+        # client's forged line first; the throttle must key on the proxy's.
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        port = int(self.base.rsplit(":", 1)[1])
+        payload = json.dumps({"messages": [{"role": "user", "content": "x"}]}).encode()
+
+        def guess(forged: str) -> int:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                conn.putrequest("POST", "/v1/chat/completions")
+                conn.putheader("Content-Type", "application/json")
+                conn.putheader("Content-Length", str(len(payload)))
+                conn.putheader("Authorization", "Bearer wrong")
+                conn.putheader("X-Forwarded-For", forged)
+                conn.putheader("X-Forwarded-For", "203.0.113.5")
+                conn.endheaders(payload)
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        for n in range(5):
+            self.assertEqual(guess(f"10.9.9.{n}"), 401)
+        self.assertEqual(guess("10.9.9.99"), 429)
 
     def test_non_loopback_bind_needs_token(self) -> None:
         with self.assertRaises(Exception):
