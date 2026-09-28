@@ -34,11 +34,11 @@ from typing import Any
 
 from ..remotes import RemoteEndpoint, list_endpoints
 from ..server_manager import http_base, list_servers
-from .engines import OllamaEngine, OpenAICompatibleEngine
+from .engines import AnthropicEngine, OllamaEngine, OpenAICompatibleEngine
 from .ir import GatewayError
 from .switching import ModelSwitcher
 
-Engine = OpenAICompatibleEngine | OllamaEngine
+Engine = OpenAICompatibleEngine | OllamaEngine | AnthropicEngine
 
 
 @dataclass
@@ -67,13 +67,17 @@ def _api_base(base_url: str) -> str:
     return base if base.endswith("/v1") else f"{base}/v1"
 
 
-def _ollama_base(base_url: str) -> str:
-    # Accept the server root, or a URL copied from its OpenAI layer (/v1) or native API (/api).
+def _root(base_url: str, suffixes: tuple[str, ...]) -> str:
     base = base_url.rstrip("/")
-    for suffix in ("/v1", "/api"):
+    for suffix in suffixes:
         if base.endswith(suffix):
             return base[: -len(suffix)]
     return base
+
+
+def _ollama_base(base_url: str) -> str:
+    # Accept the server root, or a URL copied from its OpenAI layer (/v1) or native API (/api).
+    return _root(base_url, ("/v1", "/api"))
 
 
 def _unique(names: list[str]) -> tuple[str, ...]:
@@ -97,8 +101,12 @@ def _remote_key(remote: RemoteEndpoint) -> str:
 def remote_target(remote: RemoteEndpoint, default: bool = False) -> Target:
     key = _remote_key(remote)
     engine: Engine
-    if remote.provider.lower() == "ollama":
+    provider = remote.provider.lower()
+    if provider == "ollama":
         engine = OllamaEngine(_ollama_base(remote.base_url), model=remote.model, api_key=key)
+    elif provider == "anthropic":
+        # Accept https://api.anthropic.com, .../v1 or .../v1/messages.
+        engine = AnthropicEngine(_root(remote.base_url, ("/v1/messages", "/v1")), model=remote.model, api_key=key)
     else:
         engine = OpenAICompatibleEngine(_api_base(remote.base_url), model=remote.model, api_key=key)
     label = f"{remote.display_name} ({remote.summary})" if remote.summary else remote.display_name

@@ -157,6 +157,11 @@ def _parse(path: Path) -> RemoteEndpoint:
         error = "lane must be remote_host or true_cloud"
     elif not api_key_env and lane != LANE_REMOTE_HOST:
         error = "apiKeyEnv is required for true_cloud endpoints"
+    elif not model and lane != LANE_REMOTE_HOST:
+        # Unpinned, a paid endpoint would get whatever model name a client sent
+        # when it falls through to the default target (e.g. an SDK's built-in
+        # default). Choosing another model stays explicit: <endpoint>/<model>.
+        error = "model is required for true_cloud endpoints"
     transport = str(data.get("transport") or "").strip().lower()
     if transport and transport not in VALID_TRANSPORTS:
         error = error or "transport must be tailscale, lan or https"
