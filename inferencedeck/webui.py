@@ -50,10 +50,12 @@ def make_server(
     auth_state: AuthState | None = None,
     certfile: str | None = None,
     keyfile: str | None = None,
+    *,
+    allow_insecure_http: bool = False,
 ) -> ThreadingHTTPServer:
     """Build the server; with ``certfile`` it speaks HTTPS and marks the session cookie Secure."""
     auth = auth_state or AuthState()
-    validate_bind_security(host, auth)
+    validate_bind_security(host, auth, tls=bool(certfile), allow_insecure_http=allow_insecure_http)
     handler = type("BoundWebRequestHandler", (WebRequestHandler,), {})
     handler.control_plane = control_plane or ControlPlane()
     handler.auth_state = auth
@@ -74,8 +76,12 @@ def serve(
     auth_state: AuthState | None = None,
     certfile: str | None = None,
     keyfile: str | None = None,
+    *,
+    allow_insecure_http: bool = False,
 ) -> None:
-    server = make_server(host, port, control_plane, auth_state, certfile, keyfile)
+    server = make_server(
+        host, port, control_plane, auth_state, certfile, keyfile, allow_insecure_http=allow_insecure_http
+    )
     # This process owns server state, so it is the one that releases idle servers.
     start_idle_monitor()
     server.serve_forever()
@@ -85,8 +91,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="InferenceDeck local web control panel")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8716)
-    parser.add_argument("--certfile", help="PEM certificate (with chain) to serve HTTPS; recommended for LAN/tailnet binds")
+    parser.add_argument("--certfile", help="PEM certificate (with chain) to serve HTTPS; needed off loopback unless on Tailscale")
     parser.add_argument("--keyfile", help="PEM private key, if not included in --certfile")
+    parser.add_argument(
+        "--allow-insecure-http",
+        action="store_true",
+        help="allow a plain-HTTP non-loopback bind (credentials travel unencrypted)",
+    )
     parser.add_argument(
         "--check-config", action="store_true",
         help="Validate config.json, models.json and remote endpoints, print the result and exit.",
@@ -101,7 +112,7 @@ def main() -> int:
     if report["errors"] or report["warnings"]:
         # A broken config.json silently falls back to defaults, so say so up front.
         print(format_report(report), file=sys.stderr)
-    serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile)
+    serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile, allow_insecure_http=args.allow_insecure_http)
     return 0
 
 

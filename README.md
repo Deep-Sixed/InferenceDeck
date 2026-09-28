@@ -55,7 +55,7 @@ Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` co
 
 Do not bind the web/control service to a LAN or tailnet address without setting a token; InferenceDeck will fail closed rather than expose unauthenticated process controls.
 
-Over plain HTTP the token and session cookie cross the network unencrypted. For a LAN bind, serve HTTPS (a tailnet already encrypts traffic between its devices):
+Over plain HTTP the token and session cookie cross the network unencrypted, so a plain-HTTP bind off loopback is refused unless it is a Tailscale address or you pass `--allow-insecure-http`. For a LAN bind, serve HTTPS (a tailnet already encrypts traffic between its devices):
 
 ```bash
 inferencedeck-web --host 0.0.0.0 --certfile cert.pem --keyfile key.pem
@@ -536,15 +536,29 @@ client's (llama-swap's `setParams`) would need InferenceDeck in the request path
 it is not. vllm.cpp servers take sampling per request only, so presets there only
 produce the usual "not applied" warning.
 
-For authenticated LAN/tailnet use:
+### Remote access
+
+Off loopback, InferenceDeck requires authentication **and** an encrypted transport,
+because the login password, token and session cookie would otherwise cross the network
+in the clear. Authentication alone doesn't protect them.
 
 ```bash
 export INFERENCEDECK_USER=admin
 export INFERENCEDECK_TOKEN='use-a-secret-from-your-secret-manager'
-inferencedeck-web --host 0.0.0.0 --port 8716
+
+# Over Tailscale: bind to this machine's Tailscale address (WireGuard encrypts it).
+inferencedeck-web --host 100.x.y.z --port 8716
+
+# Over a LAN: serve HTTPS (session cookies are then marked Secure).
+inferencedeck-web --host 192.168.1.20 --port 8716 --certfile cert.pem --keyfile key.pem
 ```
 
-The example above is illustrative; do not commit the token to the repository or a config file.
+Don't use `--host 0.0.0.0` for "the tailnet": it listens on every interface, including
+the ordinary LAN. A plain-HTTP non-loopback bind is refused unless you pass
+`--allow-insecure-http`, or put InferenceDeck behind an HTTPS reverse proxy and keep it
+on loopback.
+
+The token above is illustrative; don't commit it to the repository or a config file.
 
 ## Inference gateway (API mapping)
 
