@@ -162,6 +162,20 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             self.auth_state.record_success(client)
         return True
 
+    def _discard_body(self) -> None:
+        """Read and drop a body we won't use. Closing with unread bytes makes
+        Windows reset the connection, so the client never sees our reply."""
+        try:
+            remaining = min(max(int(self.headers.get("Content-Length", "0")), 0), MAX_BODY_BYTES)
+        except ValueError:
+            remaining = 0
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+        self.close_connection = True
+
     def _body(self) -> dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -231,6 +245,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         # which this server never grants.
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
+            self._discard_body()
             self._send(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, api.render_error(
                 GatewayError(415, "Content-Type must be application/json", "invalid_request")))
             return

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -180,11 +181,19 @@ class StartProfileVramTests(unittest.TestCase):
         self.addCleanup(self._reap)
 
     def _reap(self) -> None:
+        pids = []
         for server in server_manager.read_state().get("servers", []):
-            pid = server.get("pid")
+            pid = server.get("pid") or server.get("last_pid")
             if pid and server_manager.pid_is_running(pid):
+                pids.append(int(pid))
                 if not server_manager.stop_server(server_id=server["id"]).get("success"):
                     os.kill(int(pid), signal.SIGTERM)
+        # Windows keeps a log file locked until its process has fully exited, so
+        # wait for that before the temp dir is deleted.
+        deadline = time.monotonic() + 10
+        for pid in pids:
+            while server_manager.pid_is_running(pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
         for p in self.procs:
             if p.poll() is None:
                 p.kill()
