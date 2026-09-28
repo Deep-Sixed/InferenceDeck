@@ -49,7 +49,7 @@ Environment variables:
 - `INFERENCEDECK_USER` — login name, default `admin`.
 - `INFERENCEDECK_TOKEN` — shared password/token.
 - `INFERENCEDECK_TOKEN_FILE` — file containing the shared password/token.
-- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated IP addresses or CIDR ranges (`10.0.0.0/8`; `localhost` means loopback) of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes; IPv6 clients per /64), and at most 50 failures from all clients together per 5 minutes, after which everyone waits until the window clears. Behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. The header is ignored from any other address, so clients can't use it to dodge the throttle. Entries that aren't addresses or ranges (hostnames) are reported at startup and ignored.
+- `INFERENCEDECK_TRUSTED_PROXIES` — comma-separated IP addresses or CIDR ranges (`10.0.0.0/8`; `localhost` means loopback) of reverse proxies in front of InferenceDeck. Failed logins are throttled per client address (5 per 5 minutes; IPv6 clients per /64), and at most 50 failures from all clients together per 5 minutes, after which everyone waits until the window clears. Behind a proxy every request comes from the proxy, so list it here and InferenceDeck throttles by the client in `X-Forwarded-For` instead. This applies to the control API and the inference gateway alike. The header is ignored from any other address, so clients can't use it to dodge the throttle. Entries that aren't addresses or ranges (hostnames) are reported at startup and ignored.
 
 Browser login creates an in-memory session and an `HttpOnly; SameSite=Strict` cookie (also `Secure` when served over HTTPS). Programmatic clients and tray frontends may send the same token in `X-Auth-Token`.
 
@@ -127,7 +127,7 @@ channel defaults to `update_channel` in config.
   its highest matching tag instead.
 
 The web UI's **Runtime updates** card and both trays' **Runtime updates** menu show
-the same results (API: `GET /api/updates`, `?refresh=1` to skip the cache). They check
+the same results (API: `GET /api/updates` for cached results; `POST /api/updates` with a JSON body skips the cache and asks GitHub again). They check
 when they start and then every 30 minutes (web) or hourly (trays); **Check now**
 asks GitHub again. Each update links to its GitHub release page.
 
@@ -143,7 +143,10 @@ asks GitHub again. Each update links to its GitHub release page.
 `config.json` keys include `model_dirs`, `runtime_dirs`, `llama_server_path`,
 `llama_runtime`, `llama_fit_params_path`, `extra_llama_args`, `vllm_cpp_server_path`,
 `extra_vllm_cpp_args`, `mlc_llm_path`, `extra_mlc_llm_args`, `koboldcpp_path`,
-`extra_koboldcpp_args`, `default_host` and `default_port` (see `inferencedeck/config.py` for the full list and defaults).
+`extra_koboldcpp_args`, `default_host`, `default_port` and `server_history_limit` (see
+`inferencedeck/config.py` for the full list and defaults). Stopped servers stay listed,
+with their logs, as history; `server_history_limit` (default 5) sets how many are kept
+before the oldest records and their log files are deleted.
 
 GGUF models are scanned in `model_dirs`, the `LCC_MODEL_DIRS`, `LLAMA_MODELS_DIR` and
 `LLAMA_CPP_MODEL_DIRS` path lists, `LLAMA_CPP_HOME/models`, `models/` under the project
@@ -427,6 +430,7 @@ This means clients with a hard-coded model name keep working. An enabled endpoin
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | Anthropic Messages | `POST /v1/messages` |
 | Model list (every routable name, plus loadable profiles when switching is on) | `GET /v1/models` |
+| Health check (no token needed) | `GET /healthz` |
 
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
@@ -494,7 +498,9 @@ to the default target as before. While a remote endpoint is enabled, local model
 not loaded (local starts are refused then); requests that name one go to the default
 target. `GET /v1/models` adds each loadable profile with `"loaded": false`.
 
-The gateway uses the same bind rule as the control API: loopback only, unless `INFERENCEDECK_TOKEN` is set. With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like the control API, and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
+The gateway uses the same bind rule as the control API: loopback only, unless a token is set (`INFERENCEDECK_TOKEN` or `INFERENCEDECK_TOKEN_FILE`). With a token set, clients send it as their API key (`Authorization: Bearer …` or `x-api-key`, or `X-Auth-Token`), so standard OpenAI and Anthropic SDKs work unchanged. Failed tokens are throttled per client like web logins (5 per 5 minutes), and `INFERENCEDECK_TRUSTED_PROXIES` applies here too, so behind a reverse proxy each client keeps its own throttle. POST requests must be sent as `Content-Type: application/json`, as the OpenAI and Anthropic SDKs do; anything else gets 415, which stops a web page you visit from quietly using the gateway.
+
+The gateway serves plain HTTP only; it has no `--certfile` option. For use across a LAN, reach it over a tailnet or put it behind a TLS reverse proxy.
 
 ## Development
 

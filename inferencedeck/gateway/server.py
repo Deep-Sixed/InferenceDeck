@@ -113,6 +113,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; closing the generator closes the upstream
+        except Exception:
+            # The 200 and part of the body are already on the wire, so nothing
+            # may escape to do_POST's error handler: it would write a second
+            # status line into the stream. render_stream reports upstream
+            # failures in-band; anything else just ends the stream here.
+            self.close_connection = True
         finally:
             close = getattr(chunks, "close", None)
             if close is not None:
