@@ -11,15 +11,18 @@ from pathlib import Path
 from .auth import AuthState, validate_bind_security
 from .config import AppConfig
 from .control import ControlPlane
+from .config_check import check_all, format_report
 from .control_api import ControlRequestHandler
 from .otlp import start_exporter
 from .telemetry_history import start_sampler
+from .idle import start_idle_monitor
 
 
 ASSET_TYPES = {
     "/app.js": "text/javascript; charset=utf-8",
     "/styles.css": "text/css; charset=utf-8",
     "/telemetry.js": "text/javascript; charset=utf-8",
+    "/fleet.js": "text/javascript; charset=utf-8",
 }
 
 
@@ -91,6 +94,8 @@ def serve(
     except ValueError as exc:
         # A bad export setting shouldn't keep the control panel from starting.
         print(f"inferencedeck-web: OpenTelemetry export disabled: {exc}", file=sys.stderr)
+    # This process owns server state, so it is the one that releases idle servers.
+    start_idle_monitor()
     server.serve_forever()
 
 
@@ -105,9 +110,20 @@ def main() -> int:
         action="store_true",
         help="allow a plain-HTTP non-loopback bind (credentials travel unencrypted)",
     )
+    parser.add_argument(
+        "--check-config", action="store_true",
+        help="Validate config.json, models.json and remote endpoints, print the result and exit.",
+    )
     args = parser.parse_args()
     if args.keyfile and not args.certfile:
         parser.error("--keyfile needs --certfile")
+    report = check_all()
+    if args.check_config:
+        print(format_report(report))
+        return 1 if report["errors"] else 0
+    if report["errors"] or report["warnings"]:
+        # A broken config.json silently falls back to defaults, so say so up front.
+        print(format_report(report), file=sys.stderr)
     serve(args.host, args.port, certfile=args.certfile, keyfile=args.keyfile, allow_insecure_http=args.allow_insecure_http)
     return 0
 

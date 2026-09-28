@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .capabilities import resolve_projector
 from .config import AppConfig
 from .llama_args import LaunchCommand, build_llama_server_args
 from .koboldcpp_args import build_koboldcpp_args
@@ -53,6 +54,7 @@ from .paths import (
     launch_scripts_dir,
 )
 from .profile_resolver import resolve_profiles
+from .sampling import layer_sampling_preset
 from .vllm_cpp_args import build_vllm_cpp_server_args
 
 
@@ -727,11 +729,17 @@ def generate_all_launch_scripts(
             )
             continue
         model_path = profile.model["path"]
+        # Same launch params as Start: sampling preset layered in, and the
+        # projector passed when the profile turns vision on.
+        params, _ = layer_sampling_preset(dict(profile.params))
+        projector, _ = resolve_projector(profile.model, params)
+        if projector:
+            params["mmproj"] = projector
         try:
             payload = generate_launch_script(
                 mode=profile.mode,
                 model_path=model_path,
-                params=dict(profile.params),
+                params=params,
                 project_root=root,
                 config=app_config,
                 binary_path=binary_for(profile.params),

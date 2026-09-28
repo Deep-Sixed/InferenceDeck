@@ -13,6 +13,23 @@
     <h2>Status</h2>
     <div id="status" class="muted">Loading…</div>
     <div id="server-actions"></div>
+    <div id="config-rejected" class="list"></div>
+    <div id="config-problems" class="list"></div>
+  </section>
+  <section class="card" id="fleet-card" hidden>
+    <h2>Machines</h2>
+    <div class="fleet-scroll"><table class="ttable fleet-table">
+      <thead><tr><th>Machine</th><th>GPU</th><th>VRAM</th><th>Loaded</th><th>Requests</th><th>State</th></tr></thead>
+      <tbody id="fleet-rows"></tbody>
+    </table></div>
+    <div id="fleet-errors"></div>
+    <form id="fleet-form" class="actions">
+      <label class="meta" for="fleet-profile">Where should this run?</label>
+      <input id="fleet-profile" list="fleet-profiles" placeholder="profile name" autocomplete="off">
+      <datalist id="fleet-profiles"></datalist>
+      <button type="submit">Rank machines</button>
+    </form>
+    <div id="fleet-placement" class="list"></div>
   </section>
   <section class="card">
     <div class="thead"><h2>Telemetry</h2>
@@ -49,6 +66,11 @@
     <h2>Tracked servers</h2>
     <div id="servers" class="list"></div>
   </section>
+  <section class="card hidden" id="logs-card">
+    <h2>Live logs <span id="logs-title" class="muted"></span></h2>
+    <div class="actions ctx"><button id="logs-close">Close</button><label class="meta"><input type="checkbox" id="logs-follow" checked> Follow</label><span class="meta">Last 2000 lines; the full log stays on disk.</span></div>
+    <pre id="logs" class="logs"></pre>
+  </section>
   <section class="card">
     <h2>Active command</h2>
     <pre id="command">—</pre>
@@ -82,5 +104,6 @@
 <div id="toast" role="status"></div>
 <script src="/app.js"></script>
 <script src="/telemetry.js"></script>
+<script src="/fleet.js"></script>
 </body>
 </html>
