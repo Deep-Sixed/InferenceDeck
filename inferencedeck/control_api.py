@@ -192,6 +192,8 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, payload)
             elif parsed.path == "/metrics":
                 self._text(HTTPStatus.OK, self.control_plane.metrics(), PROMETHEUS_CONTENT_TYPE)
+            elif parsed.path == "/api/hf/files":
+                self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
             elif parsed.path == "/api/updates":
                 refresh = (query.get("refresh") or ["0"])[0] in ("1", "true")
                 self._json(HTTPStatus.OK, self.control_plane.updates(refresh=refresh))
@@ -286,6 +288,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     str(body.get("mode") or ""),
                     validate_overrides(body.get("overrides")),
                     completion_tokens=_bounded_int(body, "completion_tokens", 128, 16, 2048),
+                )
+            elif parsed.path == "/api/hf/download":
+                # Always into the HF cache: the API never picks a destination path.
+                payload = self.control_plane.hf_download(
+                    str(body.get("repo_id") or ""),
+                    quant=str(body.get("quant") or "") or None,
+                    pattern=str(body.get("pattern") or "") or None,
+                    include_mmproj=bool(body.get("include_mmproj", True)),
+                    dry_run=bool(body.get("dry_run", False)),
                 )
             elif parsed.path == "/api/runtime":
                 payload = self.control_plane.set_runtime(str(body.get("runtime") or ""))
