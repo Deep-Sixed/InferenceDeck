@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
 from ..config import AppConfig
@@ -62,6 +62,13 @@ APIS = {
         anthropic_api.render_error,
     ),
 }
+
+
+def _header_value(target: Any) -> str:
+    """``<model> @ <endpoint or local>``, in the ASCII an HTTP header can carry."""
+    where = getattr(target, "endpoint", "") or ("local" if getattr(target, "server_id", "") else "default")
+    text = f"{getattr(target, 'model_id', '')} @ {where}"
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in text)
 
 
 class GatewayRequestHandler(BaseHTTPRequestHandler):
@@ -103,9 +110,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_stream(self, chunks: Iterator[bytes], lease: Any = None) -> None:
+    def _send_stream(self, chunks: Iterator[bytes], lease: Any = None, headers: dict[str, str] | None = None) -> None:
         try:
             self.send_response(HTTPStatus.OK)
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
@@ -164,6 +173,17 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._guard(openai_api.render_error):
             return
+        if path == "/route":
+            # Which target a model name routes to, and why; never loads a profile.
+            explain = getattr(self.router, "explain", None)
+            if explain is None:
+                self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
+                return
+            try:
+                self._send(HTTPStatus.OK, explain((parse_qs(urlparse(self.path).query).get("model") or [""])[0]))
+            except GatewayError as exc:
+                self._send(exc.status, openai_api.render_error(exc))
+            return
         if path == "/v1/models":
             try:
                 targets = self.router.catalog()
@@ -206,6 +226,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             request: ChatRequest = api.parse(body)
             target = self.router.resolve(request.model)
             model = request.model or target.model_id
+            # Says which machine answered, for when placement picked between several.
+            routed = {"X-InferenceDeck-Target": _header_value(target)}
             # The lease tells a model switch this server is still busy; for a
             # stream it is held until the last chunk is written.
             lease = target.lease()
@@ -214,12 +236,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
                 if request.stream:
                     events = target.engine.stream(request)
                     stream_lease, lease = lease, None
-                    self._send_stream(api.render_stream(events, model, body), stream_lease)
+                    self._send_stream(api.render_stream(events, model, body), stream_lease, routed)
                 else:
                     result = target.engine.complete(request)
                     # Report the model the client asked for, so aliases stay stable.
                     result.model = model
-                    self._send(HTTPStatus.OK, api.render_result(result))
+                    self._send(HTTPStatus.OK, api.render_result(result), headers=routed)
             finally:
                 if lease is not None:
                     lease.__exit__(None, None, None)

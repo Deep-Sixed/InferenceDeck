@@ -20,6 +20,11 @@ With a ``ModelSwitcher`` (``inferencedeck-gateway --switch-models``), a name tha
 routes nowhere but names a launchable profile (mode, display name or alias)
 loads that profile first; see ``switching``. Local targets then carry a lease,
 so a later switch waits for the requests they are serving.
+
+When several targets match the same name and the fleet view is configured,
+they are ordered by where the model runs best (see placement.py); otherwise
+the first match in catalog order wins, as before. Placement only reorders
+existing matches, so it never starts anything or overrides a model switch.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from ..remotes import RemoteEndpoint, list_endpoints
 from ..server_manager import http_base, list_servers
 from .engines import AnthropicEngine, OllamaEngine, OpenAICompatibleEngine
 from .ir import GatewayError
+from .placement import GROUP_LABELS, LOCAL, FleetRanker, rank_target, url_host
 from .switching import ModelSwitcher
 
 Engine = OpenAICompatibleEngine | OllamaEngine | AnthropicEngine
@@ -50,6 +56,8 @@ class Target:
     endpoint: str = ""           # remote endpoint name, for <endpoint>/<model>
     default: bool = False
     server_id: str = ""          # tracked local server, when this is one
+    # Keys that identify the machine behind the target in the fleet view.
+    host_keys: tuple[str, ...] = ()
     # Held while a request is served, so a model switch waits for it.
     lease: Callable[[], AbstractContextManager[Any]] = field(default=nullcontext, repr=False, compare=False)
 
@@ -111,7 +119,8 @@ def remote_target(remote: RemoteEndpoint, default: bool = False) -> Target:
         engine = OpenAICompatibleEngine(_api_base(remote.base_url), model=remote.model, api_key=key)
     label = f"{remote.display_name} ({remote.summary})" if remote.summary else remote.display_name
     names = _unique([*remote.aliases, remote.model, remote.name])
-    return Target(engine, label, names[0], names, endpoint=remote.name, default=default)
+    keys = _unique([url_host(remote.base_url), remote.host.casefold(), remote.name.casefold()])
+    return Target(engine, label, names[0], names, endpoint=remote.name, default=default, host_keys=keys)
 
 
 def local_target(server: dict[str, Any], default: bool = False) -> Target:
@@ -119,7 +128,8 @@ def local_target(server: dict[str, Any], default: bool = False) -> Target:
     model_path = server.get("model_path")
     names = _unique([mode, str(server.get("id") or ""), Path(model_path).stem if model_path else ""])
     engine = OpenAICompatibleEngine(http_base(server.get("host"), int(server.get("port") or 8080)) + "/v1")
-    return Target(engine, f"{mode} (local)", mode, names, default=default, server_id=str(server.get("id") or ""))
+    return Target(engine, f"{mode} (local)", mode, names, default=default, server_id=str(server.get("id") or ""),
+                  host_keys=(LOCAL,))
 
 
 @dataclass
@@ -129,6 +139,7 @@ class Router:
     endpoints: Any = field(default=list_endpoints)
     servers: Any = field(default=list_servers)
     switcher: ModelSwitcher | None = None
+    ranker: Any = field(default_factory=FleetRanker)
 
     def catalog(self, remotes: list[RemoteEndpoint] | None = None) -> list[Target]:
         remotes = self.endpoints() if remotes is None else remotes
@@ -168,7 +179,31 @@ class Router:
     def resolve(self, model: str = "") -> Target:
         return self._leased(self._resolve(model))
 
-    def _resolve(self, model: str) -> Target:
+    def _ordered_matches(self, targets: list[Target], model: str) -> list[tuple[Target, Any]]:
+        """Targets answering to ``model``, best first, each with its fleet rank (or None)."""
+        matches = [t for t in targets if t.matches(model)]
+        ranks = self.ranker.ranks(model) if len(matches) > 1 and self.ranker is not None else None
+        if not ranks:
+            return [(t, None) for t in matches]
+        # Stable: targets that rank equally keep catalog order.
+        return sorted(((t, rank_target(t.host_keys, ranks)) for t in matches), key=lambda pair: pair[1].key())
+
+    def explain(self, model: str = "") -> dict[str, Any]:
+        """Which target a request for ``model`` would use, and the ranking behind it. Never loads anything."""
+        ordered = self._ordered_matches(self.catalog(), model) if model else []
+        chosen = self._resolve(model, allow_switch=False)  # explaining must not start a profile
+        return {
+            "model": model or None,
+            "target": chosen.to_dict(),
+            "placement_used": any(rank is not None for _, rank in ordered),
+            "candidates": [
+                {**t.to_dict(), "group": GROUP_LABELS[r.group] if r else None,
+                 "fleet_host": r.host if r else None, "reason": r.reason if r else None}
+                for t, r in ordered
+            ],
+        }
+
+    def _resolve(self, model: str, allow_switch: bool = True) -> Target:
         # An enabled endpoint that cannot be used is an error, not a reason to
         # silently send traffic somewhere else.
         remotes = self.endpoints()
@@ -177,9 +212,9 @@ class Router:
             _remote_key(enabled)
         targets = self.catalog(remotes)
         if model:
-            for target in targets:
-                if target.matches(model):
-                    return target
+            ordered = self._ordered_matches(targets, model)
+            if ordered:
+                return ordered[0][0]
             prefix, _, rest = model.partition("/")
             if rest:
                 for target in targets:
@@ -187,7 +222,7 @@ class Router:
                         engine = dataclasses.replace(target.engine, model=rest)
                         return dataclasses.replace(target, engine=engine)
             # Local starts are refused while an endpoint is enabled, so only switch without one.
-            if self.switcher is not None and enabled is None:
+            if allow_switch and self.switcher is not None and enabled is None:
                 profile = self.switcher.find_profile(model)
                 if profile is not None:
                     return local_target(self.switcher.ensure_loaded(profile, self.servers))

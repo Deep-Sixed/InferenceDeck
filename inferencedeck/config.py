@@ -60,6 +60,9 @@ class AppConfig:
     fleet_name: str = ""
     # Gateway loads the profile a request's model names, releasing the loaded one.
     gateway_model_switching: bool = False
+    # With fleet_peers set, order gateway targets that share a model name by where
+    # the model runs best (loaded first). False keeps plain catalog order.
+    gateway_placement: bool = True
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AppConfig":

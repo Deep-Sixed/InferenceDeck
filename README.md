@@ -615,6 +615,32 @@ The Anthropic API's `thinking` setting is dropped, and its server tools (such as
 
 API keys for remote endpoints are attached by the gateway from `apiKeyEnv`. A client's own key is never forwarded upstream.
 
+### Choosing between machines that serve the same model
+
+Two targets can answer to the same name, for example a local `qwen3-30b` and the
+`friday` endpoint aliased `qwen3-30b`. When `fleet_peers` is configured (see
+**Machines** above), the gateway orders them by the fleet's placement ranking:
+
+1. machines with the model **loaded** and serving, fastest first (live tok/s, else
+   the last benchmark), then least busy;
+2. machines that answer but don't have it loaded;
+3. machines the fleet view can't see (for example, no peer entry for that endpoint's host);
+4. machines where it is loaded but **paused**, which can't answer until resumed.
+
+A remote endpoint is matched to a fleet machine by the host name in its `baseUrl`,
+its `host` label, or its file name. Local servers belong to this machine.
+
+This only reorders targets that already match the name. It never starts, stops or
+switches a model, and it never makes a request wait: the gateway reads the fleet
+view it last cached and refreshes it in the background. Until the first view
+arrives, and whenever telemetry is unavailable, targets keep their usual order.
+Without `fleet_peers`, or with `"gateway_placement": false`, routing is exactly as
+described above.
+
+Every reply carries `X-InferenceDeck-Target: <model> @ <endpoint|local>`.
+`GET /route?model=qwen3-30b` shows the target a name would route to and the
+ranking behind it, without loading anything.
+
 ### Switching models on demand
 
 ```bash
