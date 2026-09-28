@@ -35,7 +35,8 @@ from .paths import is_windows
 
 MIB = 1024 * 1024
 # Statuses of tracked servers whose processes hold (or are taking) GPU memory.
-_HOLDING = {"running", "starting", "startup_timeout"}
+# Paused ("suspended") servers are frozen, not stopped, so their VRAM stays allocated.
+_HOLDING = {"running", "starting", "startup_timeout", "suspended"}
 
 
 def estimate_server_vram_mib(params: dict[str, Any], model: dict[str, Any] | None) -> int | None:
