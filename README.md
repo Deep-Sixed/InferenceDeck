@@ -333,6 +333,10 @@ This means clients with a hard-coded model name keep working. An enabled endpoin
 | Anthropic Messages | `POST /v1/messages` |
 | Model list (the current target) | `GET /v1/models` |
 
+POST requests must send `Content-Type: application/json` and no `Origin` header. OpenAI/Anthropic SDKs already do this; with `curl`, pass `-H 'Content-Type: application/json'`. This stops a web page you visit from quietly sending requests to a gateway on localhost, which could use your GPU or your cloud API keys.
+
+Behind a reverse proxy, set `INFERENCEDECK_TRUSTED_PROXIES` to the proxy's address. The gateway then throttles failed token attempts per client (using `X-Forwarded-For`), so one client's bad attempts don't lock out everyone.
+
 Requests are translated through one internal request format, so each API and each engine needs only one adapter. That means N + M adapters rather than one per API/engine pair.
 
 The translation covers:

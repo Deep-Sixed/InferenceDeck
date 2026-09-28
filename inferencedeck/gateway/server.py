@@ -10,6 +10,12 @@ Binding follows the control API's rule: loopback without a token, anything
 else only with INFERENCEDECK_TOKEN set. Clients present the token the way their
 SDK sends API keys (``Authorization: Bearer``, ``x-api-key``) or as
 ``X-Auth-Token``.
+
+POSTs must be ``Content-Type: application/json`` and carry no ``Origin``
+header. A web page can send a CORS "simple" (text/plain) POST to localhost
+without a preflight; these checks stop such a page from spending local GPU
+time or a configured cloud API key. The gateway grants no CORS, so no browser
+page could read a reply anyway, and SDK clients send JSON with no Origin.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
-from ..auth import LOOPBACK_HOSTS, AuthState, validate_bind_security
+from ..auth import LOOPBACK_HOSTS, AuthState, client_address, validate_bind_security
 from . import anthropic_api, openai_api
 from .ir import ChatRequest, GatewayError
 from .router import Router
@@ -86,6 +92,11 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         ) or self.headers.get("x-api-key", "") or self.headers.get("X-Auth-Token", "")
         return bool(supplied) and secrets.compare_digest(supplied, self.auth_state.token)
 
+    def _client(self) -> str:
+        return client_address(
+            str(self.client_address[0]), self.headers.get("X-Forwarded-For", ""), self.auth_state.trusted_proxies
+        )
+
     def _send(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -115,7 +126,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._send(HTTPStatus.FORBIDDEN, render_error(GatewayError(403, "host not allowed", "authentication")))
             return False
-        client = str(self.client_address[0])
+        client = self._client()
         wait = self.auth_state.retry_after(client)
         if wait:
             self._send(HTTPStatus.TOO_MANY_REQUESTS,
@@ -125,6 +136,21 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
         if not self._token_ok():
             self.auth_state.record_failure(client)
             self._send(HTTPStatus.UNAUTHORIZED, render_error(GatewayError(401, "invalid or missing token", "authentication")))
+            return False
+        if self.auth_state.enabled:
+            self.auth_state.record_success(client)
+        return True
+
+    def _browser_guard(self, render_error: Callable[[GatewayError], Any]) -> bool:
+        """Refuse POSTs a web page could send cross-origin (see the module docstring)."""
+        if self.headers.get("Origin") is not None:
+            self._send(HTTPStatus.FORBIDDEN,
+                       render_error(GatewayError(403, "browser cross-origin requests are not allowed", "permission")))
+            return False
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send(HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                       render_error(GatewayError(415, "Content-Type must be application/json", "invalid_request")))
             return False
         return True
 
@@ -171,7 +197,7 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
             if self._guard(openai_api.render_error):
                 self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
             return
-        if not self._guard(api.render_error):
+        if not self._guard(api.render_error) or not self._browser_guard(api.render_error):
             return
         try:
             body = self._body()

@@ -320,6 +320,59 @@ class GatewayServerTests(unittest.TestCase):
         status, _ = self.post("/v1/messages", {"max_tokens": 5, **body}, {"x-api-key": "s3cret"})
         self.assertEqual(status, 200)
 
+    def raw_post(self, path: str, data: bytes, headers: dict[str, str]) -> int:
+        request = urllib.request.Request(self.base + path, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_browser_simple_requests_are_refused(self) -> None:
+        # A web page can POST text/plain (or form data) to localhost without a
+        # CORS preflight; none of it may reach the upstream.
+        body = json.dumps({"model": "qwen", "max_tokens": 5, "messages": [{"role": "user", "content": "x"}]}).encode()
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            for content_type in ("text/plain", "text/plain;charset=UTF-8", "application/x-www-form-urlencoded",
+                                 "multipart/form-data; boundary=x"):
+                self.assertEqual(self.raw_post(path, body, {"Content-Type": content_type}), 415, (path, content_type))
+            self.assertEqual(self.raw_post(path, body, {}), 415, path)
+            status = self.raw_post(path, body, {"Content-Type": "application/json", "Origin": "https://evil.example"})
+            self.assertEqual(status, 403, path)
+        self.assertEqual(_FakeUpstream.received, [])
+        self.assertEqual(self.raw_post("/v1/chat/completions", body, {"Content-Type": "application/json; charset=utf-8"}), 200)
+
+    def test_browser_refusals_use_the_callers_error_format(self) -> None:
+        request = urllib.request.Request(self.base + "/v1/messages", data=b"{}", method="POST",
+                                         headers={"Content-Type": "text/plain"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=10)
+        payload = json.loads(caught.exception.read())
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+
+    def test_throttle_is_per_client_behind_a_trusted_proxy(self) -> None:
+        self.start_gateway(AuthState(token="s3cret", trusted_proxies=frozenset({"127.0.0.1"})))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for _ in range(5):
+            status, _ = self.post("/v1/chat/completions", body,
+                                  {"Authorization": "Bearer wrong", "X-Forwarded-For": "203.0.113.7"})
+            self.assertEqual(status, 401)
+        blocked = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "203.0.113.7"}
+        self.assertEqual(self.post("/v1/chat/completions", body, blocked)[0], 429)
+        other = {"Authorization": "Bearer s3cret", "X-Forwarded-For": "203.0.113.8"}
+        self.assertEqual(self.post("/v1/chat/completions", body, other)[0], 200)
+
+    def test_valid_token_clears_earlier_failures(self) -> None:
+        self.start_gateway(AuthState(token="s3cret"))
+        body = {"messages": [{"role": "user", "content": "x"}]}
+        for _ in range(4):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+        # Without the reset, this fifth failure would lock the client out.
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+        self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer s3cret"})[0], 200)
+
     def test_non_loopback_bind_needs_token(self) -> None:
         with self.assertRaises(Exception):
             make_server("0.0.0.0", 0, AuthState(token=""))

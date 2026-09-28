@@ -36,6 +36,7 @@ _KNOWN_FIELDS = {
 _ERROR_TYPES = {
     "invalid_request": "invalid_request_error",
     "authentication": "authentication_error",
+    "permission": "permission_error",
     "not_found": "not_found_error",
     "rate_limit": "rate_limit_error",
     "overloaded": "server_error",
