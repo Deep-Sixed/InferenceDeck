@@ -1,8 +1,14 @@
-"""Anthropic Messages API (client side) <-> canonical form."""
+"""Anthropic Messages API <-> canonical form.
+
+Both directions live here, as in ``openai_api``: clients may send the Messages
+API to the gateway (``parse_request``/``render_*``), and the Anthropic engine
+sends it upstream (``to_wire``/``from_wire``/``stream_events``).
+"""
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -21,6 +27,7 @@ from .ir import (
     StreamEvent,
     Tool,
     ToolCall,
+    Usage,
 )
 
 _STOP_REASONS = {
@@ -229,3 +236,191 @@ def render_stream(events: Iterable[StreamEvent], model: str) -> Iterator[bytes]:
 
 def render_error(error: GatewayError) -> dict[str, Any]:
     return {"type": "error", "error": {"type": _ERROR_TYPES.get(error.kind, "api_error"), "message": error.message}}
+
+
+# ---- canonical -> Anthropic wire (for engines) -----------------------------
+
+# The API requires max_tokens; used when the client did not set one. Streaming
+# gets more room because it is not bound by an HTTP read timeout.
+DEFAULT_MAX_TOKENS = 16000
+DEFAULT_STREAM_MAX_TOKENS = 64000
+
+_FINISH_REASONS = {
+    "end_turn": FINISH_STOP,
+    "stop_sequence": FINISH_STOP,
+    "pause_turn": FINISH_STOP,
+    "max_tokens": FINISH_LENGTH,
+    "model_context_window_exceeded": FINISH_LENGTH,
+    "tool_use": FINISH_TOOL_CALLS,
+    "refusal": FINISH_CONTENT_FILTER,
+}
+_DATA_URL = re.compile(r"^data:([^;,]+);base64,(.*)$", re.S)
+
+
+def _tool_id(raw: str, index: int) -> str:
+    # tool_use ids must match ^[a-zA-Z0-9_-]+$; ids from other engines may not.
+    return re.sub(r"[^A-Za-z0-9_-]", "_", raw) or f"toolu_gateway_{index}"
+
+
+def _wire_image(part: ContentPart) -> dict[str, Any]:
+    if part.data:
+        source = {"type": "base64", "media_type": part.media_type or "image/png", "data": part.data}
+    else:
+        match = _DATA_URL.match(part.url)
+        if match:
+            source = {"type": "base64", "media_type": match.group(1), "data": match.group(2)}
+        else:
+            source = {"type": "url", "url": part.url}
+    return {"type": "image", "source": source}
+
+
+def _wire_blocks(message: Message, ids: dict[str, str]) -> list[dict[str, Any]]:
+    if message.role == "tool":
+        # Tool results travel as a user turn; tool_use_id must match the call.
+        return [{"type": "tool_result", "tool_use_id": ids.get(message.tool_call_id, _tool_id(message.tool_call_id, 0)),
+                 "content": message.text}]
+    blocks: list[dict[str, Any]] = []
+    for part in message.parts:
+        if part.type == "image":
+            blocks.append(_wire_image(part))
+        elif part.text:  # the API rejects empty text blocks
+            blocks.append({"type": "text", "text": part.text})
+    for call in message.tool_calls:
+        blocks.append({"type": "tool_use", "id": ids[call.id], "name": call.name, "input": _tool_input(call.arguments)})
+    return blocks
+
+
+def _wire_tool_choice(choice: str) -> dict[str, Any] | None:
+    if not choice:
+        return None
+    if choice in {"auto", "none"}:
+        return {"type": choice}
+    if choice == "required":
+        return {"type": "any"}
+    return {"type": "tool", "name": choice}
+
+
+def to_wire(request: ChatRequest, model: str) -> dict[str, Any]:
+    ids: dict[str, str] = {}
+    for message in request.messages:
+        for call in message.tool_calls:
+            ids.setdefault(call.id, _tool_id(call.id, len(ids)))
+    system = "\n\n".join(m.text for m in request.messages if m.role == "system" and m.text)
+    messages: list[dict[str, Any]] = []
+    for message in request.messages:
+        if message.role == "system":
+            continue  # folded into the top-level system prompt
+        role = "assistant" if message.role == "assistant" else "user"
+        blocks = _wire_blocks(message, ids)
+        if not blocks:
+            continue
+        if messages and messages[-1]["role"] == role:
+            # One turn per role: parallel tool results, and text sent after
+            # them, belong in a single user message.
+            messages[-1]["content"].extend(blocks)
+        else:
+            messages.append({"role": role, "content": blocks})
+    sampling = request.sampling
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": sampling.max_tokens or (DEFAULT_STREAM_MAX_TOKENS if request.stream else DEFAULT_MAX_TOKENS),
+        "stream": request.stream,
+    }
+    if system:
+        body["system"] = system
+    # Only fields the Messages API accepts: it rejects unknown ones, so min_p,
+    # penalties, seed and engine extras are not forwarded.
+    for name in ("temperature", "top_p", "top_k"):
+        value = getattr(sampling, name)
+        if value is not None:
+            body[name] = value
+    if sampling.stop:
+        body["stop_sequences"] = sampling.stop
+    if request.tools:
+        body["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.parameters}
+                         for t in request.tools]
+        choice = _wire_tool_choice(request.tool_choice)
+        if choice is not None:
+            body["tool_choice"] = choice
+    fmt = request.response_format if isinstance(request.response_format, dict) else {}
+    schema = (fmt.get("json_schema") or {}).get("schema") if fmt.get("type") == "json_schema" else None
+    if isinstance(schema, dict):
+        body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+    return body
+
+
+def _wire_usage(raw: Any) -> Usage:
+    raw = raw if isinstance(raw, dict) else {}
+    # Cached prompt tokens are reported separately; the client wants the total.
+    prompt = sum(int(raw.get(key) or 0) for key in
+                 ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    return Usage(prompt, int(raw.get("output_tokens") or 0))
+
+
+def from_wire(payload: dict[str, Any], model: str) -> ChatResult:
+    text: list[str] = []
+    calls: list[ToolCall] = []
+    for block in payload.get("content") or []:
+        if block.get("type") == "text":
+            text.append(str(block.get("text") or ""))
+        elif block.get("type") == "tool_use":
+            calls.append(ToolCall(str(block.get("id") or ""), str(block.get("name") or ""),
+                                  json.dumps(block.get("input") or {})))
+        # thinking / redacted_thinking and server-tool blocks have no canonical slot.
+    return ChatResult(
+        id=str(payload.get("id") or ""),
+        model=str(payload.get("model") or model),
+        text="".join(text),
+        tool_calls=calls,
+        finish_reason=_FINISH_REASONS.get(str(payload.get("stop_reason") or ""), FINISH_STOP),
+        usage=_wire_usage(payload.get("usage")),
+    )
+
+
+def stream_events(lines: Iterable[bytes]) -> Iterator[StreamEvent]:
+    """Canonical events from a Messages API SSE stream."""
+    tool_index: dict[int, int] = {}  # content block index -> canonical tool-call index
+    usage = Usage()
+    finish = FINISH_STOP
+    for raw in lines:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue  # event: names repeat the data's "type"
+        try:
+            event = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        kind = event.get("type")
+        if kind == "message_start":
+            usage = _wire_usage((event.get("message") or {}).get("usage"))
+        elif kind == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                index = tool_index[int(event.get("index") or 0)] = len(tool_index)
+                yield StreamEvent("tool_call", index=index, tool_id=str(block.get("id") or ""),
+                                  tool_name=str(block.get("name") or ""))
+        elif kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                yield StreamEvent("text", text=str(delta["text"]))
+            elif delta.get("type") == "input_json_delta" and delta.get("partial_json"):
+                block_index = int(event.get("index") or 0)
+                if block_index in tool_index:
+                    yield StreamEvent("tool_call", index=tool_index[block_index], arguments=str(delta["partial_json"]))
+            # thinking_delta / signature_delta have no canonical slot.
+        elif kind == "message_delta":
+            reason = (event.get("delta") or {}).get("stop_reason")
+            if reason:
+                finish = _FINISH_REASONS.get(str(reason), FINISH_STOP)
+            final = event.get("usage") or {}
+            if final.get("output_tokens") is not None:
+                usage.output_tokens = int(final["output_tokens"])
+        elif kind == "error":
+            error = event.get("error") or {}
+            raise GatewayError(502, f"upstream: {error.get('message') or 'stream error'}",
+                               "overloaded" if error.get("type") == "overloaded_error" else "api_error")
+        elif kind == "message_stop":
+            break
+    yield StreamEvent("usage", usage=usage)
+    yield StreamEvent("finish", finish_reason=finish)
