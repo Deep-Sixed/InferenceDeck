@@ -7,6 +7,8 @@ server state. Browsers and both trays talk to that one process.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Any
@@ -15,8 +17,12 @@ from urllib.parse import parse_qs, urlparse
 from .api_params import validate_overrides
 from .auth import SESSION_TTL_SECONDS, AuthState, host_header_ok, request_client
 from .control import ControlPlane
+from .logstream import DEFAULT_HISTORY_BYTES, LogFollower
 
 MAX_BODY_BYTES = 1024 * 1024
+# Each live log stream holds a handler thread open; cap how many run at once.
+MAX_LOG_STREAMS = 8
+MAX_LOG_HISTORY_BYTES = 256 * 1024
 
 
 def _bounded_int(body: dict[str, Any], key: str, default: int, low: int, high: int) -> int:
@@ -35,6 +41,13 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
     control_plane = ControlPlane()
     auth_state = AuthState()
     server_version = "InferenceDeckControl/1"
+    log_stream_slots = threading.BoundedSemaphore(MAX_LOG_STREAMS)
+    log_poll_seconds = 0.5
+    log_keepalive_seconds = 15.0
+    # How often a stream checks that its server is still tracked.
+    log_check_seconds = 2.0
+    # Streams end after this long; EventSource reconnects on its own.
+    log_max_seconds = 3600.0
     # Set when served over TLS, so the session cookie is never sent over plain HTTP.
     secure_cookies = False
 
@@ -103,6 +116,71 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sse(self, event: str, data: dict[str, Any] | None = None) -> None:
+        payload = f"event: {event}\ndata: {json.dumps(data or {})}\n\n" if event else ": keepalive\n\n"
+        self.wfile.write(payload.encode("utf-8"))
+        self.wfile.flush()
+
+    def _stream_logs(self, query: dict[str, list[str]]) -> None:
+        """Server-sent events: recent history, then new log lines as they are written."""
+
+        server_id = (query.get("server_id") or [""])[0]
+        if not server_id:
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "server_id is required"})
+            return
+        wanted = (query.get("stream") or ["both"])[0]
+        if wanted not in ("both", "stderr", "stdout"):
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "stream must be both, stderr or stdout"})
+            return
+        try:
+            history = int((query.get("history") or [str(DEFAULT_HISTORY_BYTES)])[0])
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": "history must be an integer"})
+            return
+        paths = self.control_plane.log_paths(server_id)
+        if paths is None:
+            self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "No tracked server matched the request."})
+            return
+        if wanted != "both":
+            paths = {wanted: paths[wanted]} if wanted in paths else {}
+        if not self.log_stream_slots.acquire(blocking=False):
+            self._json(HTTPStatus.TOO_MANY_REQUESTS, {"success": False, "error": "Too many live log streams are open."})
+            return
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            follower = LogFollower(paths, history_bytes=max(0, min(history, MAX_LOG_HISTORY_BYTES)))
+            for event in follower.start():
+                self._sse(event["type"], event)
+            self._sse("ready", {"server_id": server_id, "streams": sorted(paths)})
+            started = last_write = last_check = time.monotonic()
+            while True:
+                time.sleep(self.log_poll_seconds)
+                now = time.monotonic()
+                for event in follower.poll():
+                    self._sse(event["type"], event)
+                    last_write = now
+                if now - last_check >= self.log_check_seconds:
+                    last_check = now
+                    # A restart gives the mode a new server id (and truncates the
+                    # files), so this stream ends when its server is gone.
+                    if self.control_plane.log_paths(server_id) is None:
+                        self._sse("end", {"reason": "server_gone"})
+                        return
+                if now - started >= self.log_max_seconds:
+                    self._sse("end", {"reason": "timeout"})
+                    return
+                if now - last_write >= self.log_keepalive_seconds:
+                    self._sse("")  # also how a vanished viewer is noticed
+                    last_write = now
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self.log_stream_slots.release()
+
     def _body(self) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length", "0")
         try:
@@ -136,13 +214,22 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        if parsed.path == "/api/logs/stream":
+            self._stream_logs(query)
+            return
         try:
             if parsed.path == "/api/status":
                 self._json(HTTPStatus.OK, self.control_plane.status())
             elif parsed.path == "/api/inventory":
                 self._json(HTTPStatus.OK, self.control_plane.inventory())
             elif parsed.path == "/api/profiles":
-                self._json(HTTPStatus.OK, {"profiles": self.control_plane.profiles()})
+                capability = (query.get("capability") or [""])[0]
+                try:
+                    profiles = self.control_plane.profiles(capability) if capability else self.control_plane.profiles()
+                except ValueError as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})
+                    return
+                self._json(HTTPStatus.OK, {"profiles": profiles})
             elif parsed.path == "/api/hardware":
                 self._json(HTTPStatus.OK, self.control_plane.hardware())
             elif parsed.path == "/api/benchmarks":
@@ -151,6 +238,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, self.control_plane.remote_endpoints())
             elif parsed.path == "/api/runtime":
                 self._json(HTTPStatus.OK, self.control_plane.runtime())
+            elif parsed.path == "/api/config/check":
+                self._json(HTTPStatus.OK, self.control_plane.config_check())
+            elif parsed.path == "/api/sampling":
+                self._json(HTTPStatus.OK, self.control_plane.sampling_presets())
             elif parsed.path == "/api/hf/files":
                 self._json(HTTPStatus.OK, self.control_plane.hf_files(str((query.get("repo_id") or [""])[0])))
             elif parsed.path == "/api/updates":
@@ -210,6 +301,9 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                 return
             if not self._require_auth():
                 return
+            # Only for start/restore/restart: what to do when the new server would not
+            # fit in GPU memory next to the running ones (see gpu_budget.py).
+            vram_flags = {key: True for key in ("release_conflicts", "force") if body.get(key) is True}
             if parsed.path == "/api/prepare":
                 mode = str(body.get("mode") or "")
                 payload = self.control_plane.prepare(mode, validate_overrides(body.get("overrides")))
@@ -219,7 +313,10 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     mode,
                     validate_overrides(body.get("overrides")),
                     stop_existing=bool(body.get("stop_existing", False)),
+                    **vram_flags,
                 )
+            elif parsed.path == "/api/plan":
+                payload = self.control_plane.plan(str(body.get("mode") or ""), validate_overrides(body.get("overrides")))
             elif parsed.path == "/api/stop":
                 payload = self.control_plane.stop(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/suspend":
@@ -235,7 +332,15 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
                     # the saved spec is reused as it was.
                     extra = validate_overrides({"ctx_size": body["ctx_size"]}) if body.get("ctx_size") is not None else None
                     action = self.control_plane.restore if parsed.path == "/api/restore" else self.control_plane.restart
-                    payload = action(server_id, extra)
+                    payload = action(server_id, extra, **vram_flags)
+            elif parsed.path == "/api/idle":
+                server_id = str(body.get("server_id") or "")
+                if not server_id:
+                    raise ValueError("server_id is required")
+                seconds = body.get("seconds")
+                if seconds is not None:
+                    seconds = validate_overrides({"idle_release_seconds": seconds})["idle_release_seconds"]
+                payload = self.control_plane.set_idle_release(server_id, seconds)
             elif parsed.path == "/api/resume":
                 payload = self.control_plane.resume(server_id=body.get("server_id"), mode=body.get("mode"))
             elif parsed.path == "/api/fit":
@@ -274,7 +379,12 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"success": False, "error": "not found"})
                 return
-            code = HTTPStatus.OK if payload.get("success", True) else HTTPStatus.BAD_REQUEST
+            if payload.get("success", True):
+                code = HTTPStatus.OK
+            elif payload.get("reason") in ("vram_conflict", "vram_busy"):
+                code = HTTPStatus.CONFLICT
+            else:
+                code = HTTPStatus.BAD_REQUEST
             self._json(code, payload)
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"success": False, "error": str(exc)})

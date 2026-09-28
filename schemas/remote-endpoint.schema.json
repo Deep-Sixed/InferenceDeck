@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InferenceDeck remote endpoint (remote_endpoints/*.json)",
+  "type": "object",
+  "required": [
+    "baseUrl"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "lane": {
+      "enum": [
+        "remote_host",
+        "true_cloud"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "baseUrl": {
+      "type": "string",
+      "minLength": 1
+    },
+    "apiKeyEnv": {
+      "type": "string",
+      "description": "Name of the environment variable holding the key, never the key."
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "contextSize": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "transport": {
+      "enum": [
+        "https",
+        "lan",
+        "tailscale"
+      ]
+    },
+    "host": {
+      "type": "string"
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Extra model names the gateway routes to this endpoint."
+    },
+    "routable": {
+      "type": "boolean",
+      "description": "Take name-routed gateway requests while not the enabled endpoint."
+    }
+  }
+}

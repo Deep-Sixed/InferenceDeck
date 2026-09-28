@@ -49,7 +49,7 @@ class Target:
     names: tuple[str, ...] = ()  # every name that routes here
     endpoint: str = ""           # remote endpoint name, for <endpoint>/<model>
     default: bool = False
-    server_id: str = ""          # tracked local server, when this is one
+    server_id: str = ""          # tracked local server; in-flight tracking keys on it (see inflight.py)
     # Held while a request is served, so a model switch waits for it.
     lease: Callable[[], AbstractContextManager[Any]] = field(default=nullcontext, repr=False, compare=False)
 
@@ -59,7 +59,7 @@ class Target:
 
     def to_dict(self) -> dict[str, Any]:
         return {"label": self.label, "model": self.model_id, "names": list(self.names),
-                "api_base": self.engine.api_base, "default": self.default}
+                "api_base": self.engine.api_base, "default": self.default, "server_id": self.server_id}
 
 
 def _api_base(base_url: str) -> str:
