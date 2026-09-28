@@ -150,6 +150,15 @@ class TrayControllerUpdateTests(unittest.TestCase):
         c.state = tray.TrayState(error="unreachable")
         self.assertFalse(c.updates_due(now=started + 10 * tray.UPDATE_CHECK_SECONDS))
 
+    def test_due_exactly_an_interval_later_whatever_the_clock_reads(self) -> None:
+        # time.monotonic() is uptime; for some values (t + 3600) - t rounds to
+        # just under 3600, which made the check above fail on some CI runners.
+        c, _api, _notes, _ = self._controller()
+        for last in (523312.47000279423, 4194145.3468878143, 100.0):
+            c._last_update_check = last
+            self.assertTrue(c.updates_due(now=last + tray.UPDATE_CHECK_SECONDS), last)
+            self.assertFalse(c.updates_due(now=last + tray.UPDATE_CHECK_SECONDS - 1), last)
+
 
 @unittest.skipUnless(HAS_PYSTRAY, "pip install inferencedeck[tray]")
 class PystrayUpdateMenuTests(unittest.TestCase):
