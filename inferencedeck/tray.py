@@ -131,7 +131,8 @@ class ApiClient:
         return self.request("/api/remote", {"action": action, "name": name})
 
     def updates(self, refresh: bool = False) -> dict[str, Any]:
-        return self.request("/api/updates" + ("?refresh=1" if refresh else ""), timeout=UPDATE_TIMEOUT_SECONDS)
+        # A refresh (skip the server's cache and ask GitHub) is a POST.
+        return self.request("/api/updates", {} if refresh else None, timeout=UPDATE_TIMEOUT_SECONDS)
 
 
 def is_parked(server: dict[str, Any]) -> bool:
@@ -337,7 +338,9 @@ class TrayController:
         if self.state.error or self.state.unauthorized:
             return False
         now = time.monotonic() if now is None else now
-        return not self._last_update_check or now - self._last_update_check >= UPDATE_CHECK_SECONDS
+        # Compared against the deadline: now - last can round to just under the
+        # interval for large monotonic readings, deferring a due check.
+        return not self._last_update_check or now >= self._last_update_check + UPDATE_CHECK_SECONDS
 
     def active_command(self) -> str | None:
         return (self.state.active or {}).get("command_line") if self.state.alive else None
