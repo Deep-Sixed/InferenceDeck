@@ -176,6 +176,11 @@ class Router:
     def _ordered_matches(self, targets: list[Target], model: str) -> list[tuple[Target, Any]]:
         """Targets answering to ``model``, best first, each with its fleet rank (or None)."""
         matches = [t for t in targets if t.matches(model)]
+        # The endpoint the user enabled is the default target (the catalog puts it
+        # first); placement never moves its traffic to another machine.
+        enabled = next((t for t in matches if t.default and t.endpoint), None)
+        if enabled is not None:
+            return [(t, None) for t in [enabled] + [t for t in matches if t is not enabled]]
         ranks = self.ranker.ranks(model) if len(matches) > 1 and self.ranker is not None else None
         if not ranks:
             return [(t, None) for t in matches]
