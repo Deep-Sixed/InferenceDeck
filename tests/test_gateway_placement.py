@@ -146,6 +146,12 @@ class RouterPlacementTests(unittest.TestCase):
         first = report["candidates"][0]
         self.assertEqual({k: report["target"][k] for k in report["target"] if k in first},
                          {k: first[k] for k in report["target"] if k in first})
+    def test_enabled_endpoint_is_never_overridden_by_placement(self) -> None:
+        _write_endpoints(self.root, friday={"provider": "llamacpp", "model": "qwen", "enabled": True,
+                                            "baseUrl": "http://friday.tail.ts.net:8080/v1"})
+        # The local server is loaded and fast; friday isn't in the fleet view at all.
+        overview = {"hosts": [_host("thanatos", local=True, servers=[_qwen(50.0)])]}
+        self.assertEqual(self._router(_ranker(overview)).resolve("qwen").endpoint, "friday")
 
     def test_single_match_never_consults_the_fleet(self) -> None:
         ranker = mock.Mock()
