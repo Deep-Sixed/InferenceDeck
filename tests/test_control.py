@@ -20,6 +20,14 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(payload["running_count"], 1)
         json.dumps(payload)
 
+    def test_switch_is_refused_while_a_remote_endpoint_is_active(self) -> None:
+        remote = mock.Mock(display_name="Thanatos")
+        remote.to_dict.return_value = {}
+        with mock.patch("inferencedeck.control.active_endpoint", return_value=remote), \
+                mock.patch("inferencedeck.control.switch_to") as switch:
+            self.assertFalse(ControlPlane().switch("llama")["success"])
+        switch.assert_not_called()
+
     def test_suspend_is_delegated_by_id(self) -> None:
         with mock.patch("inferencedeck.control.suspend_server", return_value={"success": True}) as call:
             self.assertTrue(ControlPlane().suspend(server_id="abc")["success"])
@@ -96,6 +104,30 @@ class ControlApiTests(unittest.TestCase):
         for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", "localhost"):
             req = urllib.request.Request(self.base + "/api/status", headers={"Host": host})
             self.assertEqual(self._status_code(req), 200, host)
+
+    def _switch(self, body: dict) -> tuple[int, dict]:
+        req = urllib.request.Request(self.base + "/api/switch", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=2) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.load(exc)
+
+    def test_switch_endpoint(self) -> None:
+        self.control.switch.return_value = {"success": True, "server": {"mode": "llama"}}
+        self.assertEqual(self._switch({"mode": "llama", "drain_timeout": 30})[0], 200)
+        self.control.switch.assert_called_once_with("llama", drain_timeout=30)
+
+    def test_busy_switch_is_409(self) -> None:
+        self.control.switch.return_value = {"success": False, "reason": "switch_busy", "error": "still serving qwen"}
+        self.assertEqual(self._switch({"mode": "llama"})[0], 409)
+
+    def test_switch_drain_timeout_is_bounded(self) -> None:
+        for bad in (-1, 10_000, "30", True):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._switch({"mode": "llama", "drain_timeout": bad})[0], 400)
+        self.control.switch.assert_not_called()
 
     def test_non_integer_log_lines_is_400(self) -> None:
         req = urllib.request.Request(self.base + "/api/logs?server_id=abc&lines=lots")

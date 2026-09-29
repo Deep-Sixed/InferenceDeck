@@ -35,7 +35,8 @@ from .paths import is_windows
 
 MIB = 1024 * 1024
 # Statuses of tracked servers whose processes hold (or are taking) GPU memory.
-_HOLDING = {"running", "starting", "startup_timeout"}
+# Paused ("suspended") servers are frozen, not stopped, so their VRAM stays allocated.
+_HOLDING = {"running", "starting", "startup_timeout", "suspended"}
 
 
 def estimate_server_vram_mib(params: dict[str, Any], model: dict[str, Any] | None) -> int | None:
@@ -137,7 +138,14 @@ def plan_start(
         # The driver already counts running servers; ones still loading may not
         # have allocated yet, so hold their estimate back as well.
         loading = sum(o["estimated_vram_mib"] or 0 for o in others if o["status"] == "starting")
-        available = live_free - loading
+        # Excluded servers (the one this start replaces) are stopped first, so the
+        # memory they hold now, which the live reading counts as used, comes back.
+        replaced = sum(
+            s.get("estimated_vram_mib") or 0
+            for s in _holding(servers, set())
+            if str(s.get("id")) in (exclude or set()) and s.get("status") != "starting"
+        )
+        available = live_free - loading + replaced
         plan["source"] = "live"
     elif capacity is not None:
         available = capacity - sum(o["estimated_vram_mib"] or 0 for o in others)

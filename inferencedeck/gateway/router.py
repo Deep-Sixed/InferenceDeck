@@ -18,8 +18,8 @@ hard-coded model name keep working.
 
 With a ``ModelSwitcher`` (``inferencedeck-gateway --switch-models``), a name that
 routes nowhere but names a launchable profile (mode, display name or alias)
-loads that profile first; see ``switching``. Local targets then carry a lease,
-so a later switch waits for the requests they are serving.
+loads that profile first; see ``switching``. ``explain`` (``GET /route``)
+reports that switch without making it.
 
 When several targets match the same name and the fleet view is configured,
 they are ordered by where the model runs best (see placement.py); otherwise
@@ -31,8 +31,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,7 +40,7 @@ from ..server_manager import http_base, list_servers
 from .engines import AnthropicEngine, OllamaEngine, OpenAICompatibleEngine
 from .ir import GatewayError
 from .placement import GROUP_LABELS, LOCAL, FleetRanker, rank_target, url_host
-from .switching import ModelSwitcher
+from .switching import ModelSwitcher, profile_names
 
 Engine = OpenAICompatibleEngine | OllamaEngine | AnthropicEngine
 
@@ -58,8 +56,6 @@ class Target:
     server_id: str = ""          # tracked local server; in-flight tracking keys on it (see inflight.py)
     # Keys that identify the machine behind the target in the fleet view.
     host_keys: tuple[str, ...] = ()
-    # Held while a request is served, so a model switch waits for it.
-    lease: Callable[[], AbstractContextManager[Any]] = field(default=nullcontext, repr=False, compare=False)
 
     def matches(self, name: str) -> bool:
         wanted = name.casefold()
@@ -159,12 +155,6 @@ class Router:
                 continue  # invalid or missing its key: not offered
         return targets
 
-    def _leased(self, target: Target) -> Target:
-        if self.switcher is None or not target.server_id:
-            return target
-        inflight, server_id = self.switcher.inflight, target.server_id
-        return dataclasses.replace(target, lease=lambda: inflight.lease(server_id))
-
     def loadable(self) -> list[dict[str, Any]]:
         """Launchable profiles that aren't running; empty without switching."""
         if self.switcher is None:
@@ -177,7 +167,11 @@ class Router:
         return [p for p in profiles if p.get("mode") not in running]
 
     def resolve(self, model: str = "") -> Target:
-        return self._leased(self._resolve(model))
+        target, profile = self._pick(model)
+        if profile is not None:
+            assert self.switcher is not None
+            return local_target(self.switcher.ensure_loaded(profile, self.servers))
+        return target
 
     def _ordered_matches(self, targets: list[Target], model: str) -> list[tuple[Target, Any]]:
         """Targets answering to ``model``, best first, each with its fleet rank (or None)."""
@@ -196,10 +190,21 @@ class Router:
     def explain(self, model: str = "") -> dict[str, Any]:
         """Which target a request for ``model`` would use, and the ranking behind it. Never loads anything."""
         ordered = self._ordered_matches(self.catalog(), model) if model else []
-        chosen = self._resolve(model, allow_switch=False)  # explaining must not start a profile
+        target, profile = self._pick(model)
+        if profile is not None:
+            mode = str(profile["mode"])
+            running = [str(s.get("mode") or s.get("id")) for s in self.servers()
+                       if s.get("running") and s.get("mode") != mode]
+            chosen: dict[str, Any] = {"label": f"{mode} (local)", "model": mode, "names": sorted(profile_names(profile)),
+                                      "api_base": None, "default": False, "server_id": None, "loaded": False}
+            switch: dict[str, Any] = {"action": "switch", "would_load": mode, "would_release": running}
+        else:
+            assert target is not None
+            chosen, switch = {**target.to_dict(), "loaded": True}, {"action": "route"}
         return {
             "model": model or None,
-            "target": chosen.to_dict(),
+            "target": chosen,
+            **switch,
             "placement_used": any(rank is not None for _, rank in ordered),
             "candidates": [
                 {**t.to_dict(), "group": GROUP_LABELS[r.group] if r else None,
@@ -208,7 +213,11 @@ class Router:
             ],
         }
 
-    def _resolve(self, model: str, allow_switch: bool = True) -> Target:
+    def _pick(self, model: str) -> tuple[Target | None, dict[str, Any] | None]:
+        """The target for ``model``, or (with switching) the profile that would be loaded for it.
+
+        Has no side effects, so ``explain`` reports exactly what ``resolve`` would do.
+        """
         # An enabled endpoint that cannot be used is an error, not a reason to
         # silently send traffic somewhere else.
         remotes = self.endpoints()
@@ -219,21 +228,21 @@ class Router:
         if model:
             ordered = self._ordered_matches(targets, model)
             if ordered:
-                return ordered[0][0]
+                return ordered[0][0], None
             prefix, _, rest = model.partition("/")
             if rest:
                 for target in targets:
                     if target.endpoint and target.endpoint.casefold() == prefix.casefold():
                         engine = dataclasses.replace(target.engine, model=rest)
-                        return dataclasses.replace(target, engine=engine)
+                        return dataclasses.replace(target, engine=engine), None
             # Local starts are refused while an endpoint is enabled, so only switch without one.
-            if allow_switch and self.switcher is not None and enabled is None:
+            if self.switcher is not None and enabled is None:
                 profile = self.switcher.find_profile(model)
                 if profile is not None:
-                    return local_target(self.switcher.ensure_loaded(profile, self.servers))
+                    return None, profile
         for target in targets:
             if target.default:
-                return target
+                return target, None
         raise GatewayError(503, "no inference target: start a local profile or enable a remote endpoint", "overloaded")
 
 

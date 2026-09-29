@@ -19,7 +19,9 @@ from inferencedeck.gateway.engines import AnthropicEngine, OllamaEngine, OpenAIC
 from inferencedeck.gateway.ir import GatewayError, StreamEvent, Usage
 from inferencedeck.gateway.router import Target
 from inferencedeck.remotes import list_endpoints
+from inferencedeck.gateway import server as server_module
 from inferencedeck.gateway.server import make_server
+from inferencedeck.inflight import Tracker
 
 
 def _sse_events(raw: bytes) -> list[tuple[str, Any]]:
@@ -218,10 +220,13 @@ class GatewayServerTests(unittest.TestCase):
         self.upstream_base = f"http://127.0.0.1:{self.upstream.server_address[1]}/v1"
         self.target: Target | None = Target(OpenAICompatibleEngine(self.upstream_base, api_key="up-key"),
                                             "Qwen (Thanatos · Tailscale · Self-hosted)", "qwen")
+        counts = tempfile.TemporaryDirectory()
+        self.addCleanup(counts.cleanup)
+        self.inflight = Tracker(path=Path(counts.name) / "gateway.json")
         self.start_gateway(AuthState(token=""))
 
     def start_gateway(self, auth: AuthState) -> None:
-        gateway = make_server("127.0.0.1", 0, auth, _StubRouter(lambda: self.target))
+        gateway = make_server("127.0.0.1", 0, auth, _StubRouter(lambda: self.target), inflight=self.inflight)
         threading.Thread(target=gateway.serve_forever, daemon=True).start()
         self.addCleanup(gateway.server_close)
         self.addCleanup(gateway.shutdown)
@@ -236,7 +241,7 @@ class GatewayServerTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
-    def _broken_stream_target(self, released: list[bool]) -> Target:
+    def _broken_stream_target(self) -> Target:
         class BrokenEngine:
             api_base = "http://upstream.invalid/v1"
 
@@ -247,29 +252,22 @@ class GatewayServerTests(unittest.TestCase):
                     raise AttributeError("'str' object has no attribute 'get'")
                 return events()
 
-        class Lease:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                released.append(True)
-
-        return Target(BrokenEngine(), "broken", "m", lease=Lease)
+        return Target(BrokenEngine(), "broken", "m", server_id="broken-1")
 
     def test_unexpected_stream_failure_is_reported_in_band(self) -> None:
         chat = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
         anthropic = {"model": "m", "stream": True, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
         for path, body in (("/v1/chat/completions", chat), ("/v1/messages", anthropic)):
             with self.subTest(path=path):
-                released: list[bool] = []
-                self.target = self._broken_stream_target(released)
+                self.target = self._broken_stream_target()
                 status, raw = self.post(path, body)
                 self.assertEqual(status, 200)
                 # One response only: no second status line written into the stream.
                 self.assertNotIn(b"HTTP/1.", raw)
                 self.assertIn(b"Hel", raw)
                 self.assertIn(b"upstream stream failed", raw)
-                self.assertEqual(released, [True])  # a model switch isn't left waiting on it
+                # No longer counted, so a model switch or release isn't left waiting on it.
+                self.assertEqual(self.inflight.counts()["broken-1"]["in_flight"], 0)
 
     def test_trusted_proxy_throttles_each_gateway_client_separately(self) -> None:
         self.start_gateway(AuthState(token="secret", trusted_proxies=frozenset({"127.0.0.1"})))
@@ -426,6 +424,23 @@ class GatewayServerTests(unittest.TestCase):
         status, raw = self.post("/v1/chat/completions", body, fresh)
         self.assertEqual(status, 429)
         self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
+    def test_refused_posts_read_the_body_first(self) -> None:
+        # Replying with the body unread makes Windows reset the connection; check
+        # the handler drains it on 401 and 404 as it does on 415.
+        self.start_gateway(AuthState(token="s3cret"))
+        drained: list[int] = []
+        original = server_module.GatewayRequestHandler._discard_body
+
+        def spy(handler) -> None:
+            original(handler)
+            drained.append(1)
+
+        body = {"messages": [{"role": "user", "content": "x" * 1000}]}
+        with mock.patch.object(server_module.GatewayRequestHandler, "_discard_body", spy):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+            self.assertEqual(self.post("/v1/nope", body, {"Authorization": "Bearer s3cret"})[0], 404)
+        self.assertEqual(len(drained), 2)
 
     def test_valid_token_clears_earlier_failures(self) -> None:
         self.start_gateway(AuthState(token="s3cret"))

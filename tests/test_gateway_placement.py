@@ -56,6 +56,17 @@ class RankHostsTests(unittest.TestCase):
         self.assertEqual(ranks["10.0.0.7"].group, placement.AVAILABLE)
         self.assertEqual(placement.rank_target(("elsewhere",), ranks).group, placement.UNKNOWN)
 
+    def test_a_peer_sharing_the_local_name_keeps_its_own_identity(self) -> None:
+        # Config validation rejects this now, but placement must not depend on it:
+        # the remote's rank is keyed by its own name/URL, never by @local.
+        overview = {"hosts": [
+            _host("thanatos", local=True, servers=[]),
+            _host("thanatos", url="http://other-box:8716", servers=[_qwen(30)]),
+        ]}
+        ranks = placement.rank_hosts(overview, "qwen")
+        self.assertEqual(ranks["other-box"].group, placement.LOADED)
+        self.assertEqual(ranks[placement.LOCAL].group, placement.AVAILABLE)
+
     def test_ranker_is_off_without_peers_or_when_disabled_or_broken(self) -> None:
         overview = {"hosts": [_host("thanatos", local=True, servers=[_qwen()])]}
         self.assertIsNone(_ranker(overview, peers=False).ranks("qwen"))
@@ -142,6 +153,7 @@ class RouterPlacementTests(unittest.TestCase):
             _host("friday", url="http://friday.tail.ts.net:8716", servers=[_qwen(31.8)]),
         ]}
         switcher = mock.Mock()
+        switcher.find_profile.return_value = None
         r = router.Router(endpoints=lambda: list_endpoints(self.root), servers=lambda: self.servers,
                           ranker=_ranker(overview), switcher=switcher)
         explained = r.explain("qwen")

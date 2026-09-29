@@ -15,6 +15,7 @@ from .inflight import snapshot as inflight_snapshot
 from .hf_download import download_model, repo_gguf_listing
 from .inventory import build_inventory
 from .live_config import rejected_files
+from .model_switch import switch_to
 from .paths import find_project_root
 from .profile_resolver import resolve_profiles
 from .telemetry import render_prometheus, snapshot as telemetry_snapshot
@@ -307,6 +308,14 @@ class ControlPlane:
             server_id, overrides, project_root=self.project_root, model_dirs=self.model_dirs,
             release_conflicts=release_conflicts, force=force,
         )
+
+    def switch(self, mode: str, *, drain_timeout: float | None = None) -> dict[str, Any]:
+        """Release the other local servers once their gateway requests finish, then load ``mode``."""
+        blocked = self._remote_blocks_local()
+        if blocked:
+            return blocked
+        extra = {} if drain_timeout is None else {"drain_timeout": drain_timeout}
+        return switch_to(mode, project_root=self.project_root, model_dirs=self.model_dirs, **extra)
 
     def set_idle_release(self, server_id: str, seconds: int | None) -> dict[str, Any]:
         return set_idle_release(server_id, seconds)

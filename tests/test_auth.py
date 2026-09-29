@@ -95,6 +95,13 @@ class AuthHttpTests(unittest.TestCase):
         # Locked out now, even with the right password.
         self.assertEqual(self._code(self._login("secret")), 429)
 
+    def test_proxy_basic_auth_header_is_not_a_failed_guess(self) -> None:
+        # nginx/Caddy basic auth forwards this on every request; it isn't our token.
+        for _ in range(10):
+            req = urllib.request.Request(self.base + "/api/status", headers={"Authorization": "Basic dXNlcjpwYXNz"})
+            self.assertEqual(self._code(req), 401)
+        self.assertEqual(self._code(self._login("secret")), 200)
+
     def test_wrong_header_tokens_count_as_failures(self) -> None:
         for _ in range(5):
             req = urllib.request.Request(self.base + "/api/status", headers={"X-Auth-Token": "guess"})
@@ -154,7 +161,22 @@ class SessionLimitTests(unittest.TestCase):
         for _ in range(MAX_GLOBAL_FAILURES):
             auth.record_failure("shared")
             auth.record_success("shared")
-        self.assertGreater(auth.retry_after("shared"), 0)
+        self.assertGreater(auth.retry_after("stranger"), 0)
+
+    def test_known_good_clients_ride_out_a_global_lockout(self) -> None:
+        from inferencedeck.auth import KNOWN_GOOD_SECONDS, MAX_FAILURES, MAX_GLOBAL_FAILURES
+
+        now = [0.0]
+        auth = AuthState(username="admin", token="secret", clock=lambda: now[0])
+        auth.record_success("10.9.9.9")  # a client that authenticated earlier
+        for n in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure(f"198.51.{n // (MAX_FAILURES - 1)}.1")
+        self.assertGreater(auth.retry_after("203.0.113.1"), 0)  # unknown clients wait
+        self.assertEqual(auth.retry_after("10.9.9.9"), 0)  # the known-good one doesn't
+        now[0] += KNOWN_GOOD_SECONDS + 1
+        for n in range(MAX_GLOBAL_FAILURES):
+            auth.record_failure(f"192.0.{n // (MAX_FAILURES - 1)}.1")
+        self.assertGreater(auth.retry_after("10.9.9.9"), 0)  # exemption expires
 
     def test_success_clears_failures(self) -> None:
         auth = AuthState(username="admin", token="secret")

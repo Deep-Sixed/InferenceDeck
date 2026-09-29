@@ -53,8 +53,12 @@ class Peer:
         }
 
 
-def parse_peers(entries: list[Any]) -> tuple[list[Peer], list[str]]:
-    """Valid peers from config, and a message for each entry that was skipped."""
+def parse_peers(entries: list[Any], local: str = "") -> tuple[list[Peer], list[str]]:
+    """Valid peers from config, and a message for each entry that was skipped.
+
+    Names are unique across the whole fleet, ``local`` (this machine's name)
+    included, since the fleet view and placement tell machines apart by name.
+    """
     peers: list[Peer] = []
     errors: list[str] = []
     seen: set[str] = set()
@@ -67,6 +71,9 @@ def parse_peers(entries: list[Any]) -> tuple[list[Peer], list[str]]:
         name = str(entry.get("name") or parsed.hostname or "").strip()
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             errors.append(f"fleet_peers[{index}]: url must be http:// or https://, got {url!r}")
+            continue
+        if local.strip() and name.lower() == local.strip().lower():
+            errors.append(f"fleet_peers[{index}]: name {name!r} is this machine's own fleet name; give the peer another name")
             continue
         if name.lower() in seen:
             errors.append(f"fleet_peers[{index}]: duplicate name {name!r}")
@@ -188,8 +195,8 @@ class Fleet:
             with ThreadPoolExecutor(max_workers=min(8, len(self.peers))) as pool:
                 results = list(pool.map(self._safe_fetch, self.peers))
             for peer, result in zip(self.peers, results):
-                hosts.append(
-                    summarize_host(
+                try:
+                    host = summarize_host(
                         peer.name,
                         result.get("snapshot"),
                         local=False,
@@ -197,8 +204,14 @@ class Fleet:
                         error=result.get("error"),
                         latency_ms=result.get("latency_ms"),
                     )
-                    | {"url": peer.url}
-                )
+                except Exception as exc:
+                    # A peer's snapshot is untrusted input (an older build, or any
+                    # service at that URL): one bad reply marks that peer, not the fleet.
+                    host = summarize_host(
+                        peer.name, None, local=False, reachable=False,
+                        error=f"unreadable telemetry: {type(exc).__name__}: {exc}",
+                    )
+                hosts.append(host | {"url": peer.url})
         return {
             "version": 1,
             "timestamp": telemetry._now_iso(),
@@ -300,6 +313,8 @@ def placement(overview: dict[str, Any], profile: str = "", model: str = "") -> d
             {
                 "host": host["name"],
                 "local": host.get("local", False),
+                # With the name, identifies the machine without looking it up by name again.
+                "url": host.get("url"),
                 "tier": tier,
                 "state": TIER_LABELS[tier],
                 "tokens_per_second": speed,
@@ -329,7 +344,8 @@ def current(peers_config: list[Any], configured_name: str = "") -> Fleet:
     key = (json.dumps(peers_config, sort_keys=True, default=str), configured_name)
     with _fleet_lock:
         if _fleet is None or key != _fleet_key:
-            peers, errors = parse_peers(peers_config)
-            _fleet = Fleet(peers, local_name(configured_name), config_errors=errors)
+            name = local_name(configured_name)
+            peers, errors = parse_peers(peers_config, local=name)
+            _fleet = Fleet(peers, name, config_errors=errors)
             _fleet_key = key
         return _fleet
