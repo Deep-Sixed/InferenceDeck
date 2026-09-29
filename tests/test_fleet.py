@@ -66,6 +66,21 @@ class PeerConfigTests(unittest.TestCase):
         ])
         self.assertEqual(len(errors), 3)
 
+    def test_a_peer_may_not_share_the_local_fleet_name(self) -> None:
+        peers, errors = fleet.parse_peers([
+            {"name": "Thanatos", "url": "https://another-machine:8716"},
+            {"url": "http://thanatos:8716"},  # named after its URL host
+            {"name": "friday", "url": "http://friday:8716"},
+        ], local="thanatos")
+        self.assertEqual([p.name for p in peers], ["friday"])
+        self.assertEqual(len(errors), 2)
+        self.assertIn("this machine's own fleet name", errors[0])
+
+    def test_current_fleet_rejects_a_peer_named_like_this_machine(self) -> None:
+        current = fleet.current([{"name": "thanatos", "url": "https://another-machine:8716"}], "thanatos")
+        self.assertEqual(current.peers, [])
+        self.assertTrue(any("own fleet name" in e for e in current._config_errors))
+
     def test_peer_description_never_includes_the_token(self) -> None:
         peer = fleet.Peer("thanatos", "http://t:8716", "THANATOS_TOKEN")
         with mock.patch.dict(os.environ, {"THANATOS_TOKEN": "s3cret"}):

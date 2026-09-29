@@ -697,6 +697,9 @@ whether the machine answered. `GET /api/fleet` returns the same data.
   `caFile` trusts a private CA for a peer served over HTTPS with `--certfile`.
 - Only `/api/telemetry` is read, never a peer's own fleet view, so machines that
   list each other don't loop.
+- Machine names must be unique across the fleet, this machine's `fleet_name` (or, without
+  one, its hostname) included. A peer whose name repeats another is skipped and listed
+  under `config_errors` in `/api/fleet`.
 
 **Where should this run?** The card's form, and
 `GET /api/fleet/placement?profile=qwen3-30b` (or `?model=<file>.gguf`), rank the
@@ -819,7 +822,9 @@ described above.
 
 Every reply carries `X-InferenceDeck-Target: <model> @ <endpoint|local>`.
 `GET /route?model=qwen3-30b` shows the target a name would route to and the
-ranking behind it, without loading anything.
+ranking behind it, without loading anything. With model switching on, a name that
+would load a profile reports `"action": "switch"` with `would_load` and
+`would_release`, and a target marked `"loaded": false`; otherwise `"action": "route"`.
 ### Requests in flight
 
 The gateway counts the requests it is sending to each local server, from the moment the
@@ -829,6 +834,8 @@ reads them, ignoring (and deleting) the files of gateways that are no longer run
 
 - **Idle auto-release** treats a server with requests in flight as busy, and each finished
   request restarts its idle clock.
+- **Model switching** (`--switch-models`) waits for them before releasing a server, and
+  gives up with a 503 rather than stop one mid-request.
 - **Making room** for another model (`release_conflicts`) never releases a server with
   requests in flight; the start is refused with `"reason": "vram_busy"` instead. The check
   runs again just before releasing, so a request that arrived after the plan was made still
@@ -859,10 +866,19 @@ without switching. A client can move between local models just by changing `mode
 3. the request is answered once the server reports ready.
 
 Only one model is loaded at a time, since profiles usually share the GPU and the
-default port. Switches are serialized: concurrent requests for the same model load it
-once. Before releasing a server, the gateway waits up to two minutes for requests it
-is still answering from that server, including streams. It can't see clients that
-talk to `llama-server` directly.
+default port. The switch itself runs in `inferencedeck-web` (`POST /api/switch`), so it
+is safe with several gateway processes on one machine:
+
+- Switches are serialized machine-wide: concurrent requests for the same model, from
+  any gateway, load it once.
+- Before releasing a server, it waits up to two minutes for requests *any* gateway
+  process is still answering from it, including streams (see
+  [Requests in flight](#requests-in-flight)), and checks again just before each release.
+- If requests are still running when the wait runs out, nothing is stopped: the request
+  that asked for the switch gets a 503 ("still serving …, try again shortly"). Stopping a
+  busy server is only ever an explicit Release.
+
+It can't see clients that talk to `llama-server` directly.
 
 The gateway does not start processes itself. Like the trays, it asks the
 `inferencedeck-web` control API at `INFERENCEDECK_URL` (default
