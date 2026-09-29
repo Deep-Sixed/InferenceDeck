@@ -169,6 +169,8 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def _discard_body(self) -> None:
         """Read and drop a body we won't use. Closing with unread bytes makes
         Windows reset the connection, so the client never sees our reply."""
+        if getattr(self, "_body_read", False):
+            return
         try:
             remaining = min(max(int(self.headers.get("Content-Length", "0")), 0), MAX_BODY_BYTES)
         except ValueError:
@@ -240,15 +242,12 @@ class GatewayRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._body_read = False  # a keep-alive connection reuses this handler
         api = APIS.get(urlparse(self.path).path)
-        # Each rejection below leaves the body unread; it is drained after the
-        # reply so the close is clean (see _discard_body).
+        # Rejections below leave the body unread; _send drains it before an error reply.
         if api is None:
             if self._guard(openai_api.render_error):
                 self._send(HTTPStatus.NOT_FOUND, openai_api.render_error(GatewayError(404, "not found", "not_found")))
-            self._discard_body()
             return
         if not self._guard(api.render_error):
-            self._discard_body()
             return
         # Browsers send text/plain (or form) POSTs cross-origin without a CORS
         # preflight, so without this any web page could make a loopback gateway
