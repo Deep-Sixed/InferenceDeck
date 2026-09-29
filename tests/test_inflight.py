@@ -33,6 +33,41 @@ class _Dir(unittest.TestCase):
 
 
 class TrackerTests(_Dir):
+    def test_slow_disk_never_blocks_other_requests(self) -> None:
+        t = inflight.Tracker(pid=os.getpid())
+        release = threading.Event()
+        real_write = inflight.atomic_write_text
+
+        def slow_write(path, text):
+            release.wait(5)
+            real_write(path, text)
+
+        with mock.patch.object(inflight, "atomic_write_text", slow_write):
+            first = threading.Thread(target=t.begin, args=("a",))
+            first.start()
+            time.sleep(0.1)  # the first request is now stuck writing its file
+            started = time.monotonic()
+            t.counts()  # needs the request lock, not the write lock
+            self.assertLess(time.monotonic() - started, 1.0)
+            release.set()
+            first.join(5)
+        self.assertEqual(json.loads(t.path.read_text())["servers"]["a"]["in_flight"], 1)
+
+    def test_stale_write_never_overwrites_a_newer_one(self) -> None:
+        t = inflight.Tracker(pid=os.getpid())
+        t.begin("a")
+        t._write(1, "old")  # an earlier state arriving late
+        self.assertEqual(json.loads(t.path.read_text())["servers"]["a"]["in_flight"], 1)
+
+    def test_gateway_identity_is_checked_once_per_ttl(self) -> None:
+        t = inflight.Tracker(pid=os.getpid())
+        t.begin("a")
+        inflight._confirmed.clear()
+        with mock.patch("inferencedeck.server_manager._is_same_process", return_value=True) as same:
+            for _ in range(5):
+                self.assertEqual(inflight.busy_servers(), {"a": 1})
+        self.assertEqual(same.call_count, 1)
+
     def test_counts_are_published_and_merged(self) -> None:
         tracker = inflight.Tracker()
         self.assertEqual(tracker.path, self.dir / "inflight" / f"gateway-{os.getpid()}.json")

@@ -66,6 +66,21 @@ class PeerConfigTests(unittest.TestCase):
         ])
         self.assertEqual(len(errors), 3)
 
+    def test_a_peer_may_not_share_the_local_fleet_name(self) -> None:
+        peers, errors = fleet.parse_peers([
+            {"name": "Thanatos", "url": "https://another-machine:8716"},
+            {"url": "http://thanatos:8716"},  # named after its URL host
+            {"name": "friday", "url": "http://friday:8716"},
+        ], local="thanatos")
+        self.assertEqual([p.name for p in peers], ["friday"])
+        self.assertEqual(len(errors), 2)
+        self.assertIn("this machine's own fleet name", errors[0])
+
+    def test_current_fleet_rejects_a_peer_named_like_this_machine(self) -> None:
+        current = fleet.current([{"name": "thanatos", "url": "https://another-machine:8716"}], "thanatos")
+        self.assertEqual(current.peers, [])
+        self.assertTrue(any("own fleet name" in e for e in current._config_errors))
+
     def test_peer_description_never_includes_the_token(self) -> None:
         peer = fleet.Peer("thanatos", "http://t:8716", "THANATOS_TOKEN")
         with mock.patch.dict(os.environ, {"THANATOS_TOKEN": "s3cret"}):
@@ -121,6 +136,19 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(view["hosts"][0]["free_vram_bytes"], 20 * GB)
         self.assertEqual(view["hosts"][1]["servers"][0]["tokens_per_second"], 76.2)
         self.assertEqual(view["hosts"][2]["error"], "boom")
+
+    def test_malformed_peer_snapshot_marks_only_that_peer(self) -> None:
+        peers = [fleet.Peer("friday", "http://f:1"), fleet.Peer("junk", "http://j:1")]
+
+        def fetch(peer):
+            if peer.name == "junk":  # reachable, but not InferenceDeck telemetry
+                return {"reachable": True, "latency_ms": 3.0, "snapshot": {"gpus": ["x"], "servers": "nope"}}
+            return {"reachable": True, "latency_ms": 12.0, "snapshot": _snap()}
+
+        view = fleet.Fleet(peers, "thanatos", collect_local=lambda: _snap(), fetch=fetch).overview()
+        names = [(h["name"], h["reachable"]) for h in view["hosts"]]
+        self.assertEqual(names, [("thanatos", True), ("friday", True), ("junk", False)])
+        self.assertIn("unreadable telemetry", view["hosts"][2]["error"])
 
     def test_overview_is_cached(self) -> None:
         collect = mock.Mock(return_value=_snap())

@@ -6,19 +6,20 @@ switching on, a match that isn't loaded is loaded on demand, like Ollama or
 llama-cpp-python's multi-model server: the other local servers are released
 (stopped, settings kept for Restore) and the profile is started or restored.
 
-The gateway never launches processes itself. Like the trays, it asks the
+The gateway never launches or stops processes itself. It asks the
 ``inferencedeck-web`` control API (``INFERENCEDECK_URL``), the one process that
-owns server state. Switches are serialized, and a switch waits (bounded) for
-requests the gateway is still streaming from the server it is about to release.
+owns server state, to switch (``POST /api/switch``, see model_switch.py). The
+switch runs there because several gateway processes may share a machine: it is
+serialized machine-wide and waits (bounded) until no gateway has a request
+running on a server it would release, then fails with a 503 rather than cut a
+request off.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from collections import Counter
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import Any
 
 from ..tray import TIMEOUTS, ApiClient, ApiError
@@ -26,55 +27,22 @@ from .ir import GatewayError
 
 PROFILE_CACHE_SECONDS = 30.0
 DRAIN_TIMEOUT_SECONDS = 120.0
+# Long enough for the drain, releasing the other servers and a cold start.
+SWITCH_TIMEOUT_PADDING = TIMEOUTS["restart"] + TIMEOUTS["release"]
 
 
-def _names(item: dict[str, Any]) -> set[str]:
+def profile_names(item: dict[str, Any]) -> set[str]:
     params = item.get("params") or item.get("overrides") or {}
     values = (item.get("mode"), item.get("name"), params.get("alias"))
     return {str(value).strip().lower() for value in values if value and str(value).strip()}
 
 
 def matches(item: dict[str, Any], model: str | None) -> bool:
-    return bool(model) and model.strip().lower() in _names(item)
+    return bool(model) and model.strip().lower() in profile_names(item)
 
 
 def is_live(server: dict[str, Any]) -> bool:
     return bool(server.get("running")) and not server.get("suspended")
-
-
-class InFlight:
-    """Requests the gateway is serving per server, so a switch can wait for them."""
-
-    def __init__(self) -> None:
-        self._counts: Counter[str] = Counter()
-        self._cond = threading.Condition()
-
-    @contextmanager
-    def lease(self, server_id: str) -> Iterator[None]:
-        with self._cond:
-            self._counts[server_id] += 1
-        try:
-            yield
-        finally:
-            with self._cond:
-                self._counts[server_id] -= 1
-                if self._counts[server_id] <= 0:
-                    del self._counts[server_id]
-                self._cond.notify_all()
-
-    def count(self, server_id: str) -> int:
-        with self._cond:
-            return self._counts.get(server_id, 0)
-
-    def wait_idle(self, server_ids: list[str], timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while any(self._counts.get(sid, 0) for sid in server_ids):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._cond.wait(remaining)
-            return True
 
 
 class ModelSwitcher:
@@ -88,7 +56,6 @@ class ModelSwitcher:
         self.client = client or ApiClient()
         self.drain_timeout = drain_timeout
         self.clock = clock
-        self.inflight = InFlight()
         self._switch_lock = threading.Lock()
         self._profiles: list[dict[str, Any]] = []
         self._profiles_at: float | None = None
@@ -108,26 +75,16 @@ class ModelSwitcher:
         return next((p for p in self.profiles() if matches(p, model)), None)
 
     def ensure_loaded(self, profile: dict[str, Any], servers: Callable[[], list[dict[str, Any]]]) -> dict[str, Any]:
-        """Release every other running local server, then resume, restore or start ``profile``."""
+        """Have inferencedeck-web release the other local servers and load ``profile``."""
         mode = str(profile["mode"])
+        # Only saves this process's concurrent requests a round trip each; the
+        # switch itself is serialized, machine-wide, by inferencedeck-web.
         with self._switch_lock:
-            current = servers()
-            ready = next((s for s in current if s.get("mode") == mode and is_live(s)), None)
+            ready = next((s for s in servers() if s.get("mode") == mode and is_live(s)), None)
             if ready:
                 return ready  # another request switched to it while we waited
-            # Paused servers still hold their VRAM, so they are released too.
-            others = [s for s in current if s.get("running") and s.get("mode") != mode]
-            self.inflight.wait_idle([str(s["id"]) for s in others], self.drain_timeout)
-            for server in others:
-                self._call("release", {"server_id": server["id"]}, f"release {server.get('mode')}")
-            paused = next((s for s in current if s.get("mode") == mode and s.get("running") and s.get("suspended")), None)
-            parked = next((s for s in current if s.get("mode") == mode and s.get("status") == "parked"), None)
-            if paused:
-                result = self._call("resume", {"server_id": paused["id"]}, f"resume {mode}")
-            elif parked:
-                result = self._call("restore", {"server_id": parked["id"]}, f"restore {mode}")
-            else:
-                result = self._call("start", {"mode": mode}, f"start {mode}")
+            result = self._call("switch", {"mode": mode, "drain_timeout": self.drain_timeout}, f"switch to {mode}",
+                                timeout=self.drain_timeout + SWITCH_TIMEOUT_PADDING)
             server = result.get("server")
             if not isinstance(server, dict) or not is_live(server):
                 server = next((s for s in servers() if s.get("mode") == mode and is_live(s)), None)
@@ -135,9 +92,9 @@ class ModelSwitcher:
                 raise GatewayError(503, f"{mode} did not come up: {result.get('error') or 'no running server'}", "overloaded")
             return server
 
-    def _call(self, action: str, body: dict[str, Any], what: str) -> dict[str, Any]:
+    def _call(self, action: str, body: dict[str, Any], what: str, timeout: float = 20) -> dict[str, Any]:
         try:
-            result = self.client.request(f"/api/{action}", body, timeout=TIMEOUTS.get(action, 20))
+            result = self.client.request(f"/api/{action}", body, timeout=timeout)
         except ApiError as exc:
             raise GatewayError(503, f"could not {what}: {exc}", "overloaded") from exc
         if not result.get("success", True):
