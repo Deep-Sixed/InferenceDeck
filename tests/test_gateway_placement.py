@@ -134,6 +134,18 @@ class RouterPlacementTests(unittest.TestCase):
         ]}
         self.assertEqual(self._router(_ranker(overview)).resolve("qwen").server_id, "qwen-1")
 
+    def test_explain_target_is_its_first_candidate(self) -> None:
+        # The fleet view arrives between two lookups: the first sees none, the second sees friday loaded.
+        views = iter([None, {"hosts": [
+            _host("thanatos", local=True, servers=[]),
+            _host("friday", url="http://friday.tail.ts.net:8716", servers=[_qwen(31.8)]),
+        ]}])
+        config = SimpleNamespace(fleet_peers=[{"url": "http://friday:8716"}], fleet_name="", gateway_placement=True)
+        ranker = placement.FleetRanker(config=lambda: config, get_fleet=lambda *_: _Fleet(next(views, None)))
+        report = self._router(ranker).explain("qwen")
+        first = report["candidates"][0]
+        self.assertEqual({k: report["target"][k] for k in report["target"] if k in first},
+                         {k: first[k] for k in report["target"] if k in first})
     def test_enabled_endpoint_is_never_overridden_by_placement(self) -> None:
         _write_endpoints(self.root, friday={"provider": "llamacpp", "model": "qwen", "enabled": True,
                                             "baseUrl": "http://friday.tail.ts.net:8080/v1"})

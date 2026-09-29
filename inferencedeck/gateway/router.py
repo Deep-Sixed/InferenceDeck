@@ -189,8 +189,12 @@ class Router:
 
     def explain(self, model: str = "") -> dict[str, Any]:
         """Which target a request for ``model`` would use, and the ranking behind it. Never loads anything."""
-        ordered = self._ordered_matches(self.catalog(), model) if model else []
-        target, profile = self._pick(model)
+        # Rank once and pick from that same list: ranking again could see a fleet
+        # view that arrived meanwhile and report a target the candidates contradict.
+        remotes = self.endpoints()
+        targets = self.catalog(remotes)
+        ordered = self._ordered_matches(targets, model) if model else []
+        target, profile = self._pick(model, remotes, targets, ordered)
         if profile is not None:
             mode = str(profile["mode"])
             running = [str(s.get("mode") or s.get("id")) for s in self.servers()
@@ -213,20 +217,29 @@ class Router:
             ],
         }
 
-    def _pick(self, model: str) -> tuple[Target | None, dict[str, Any] | None]:
+    def _pick(
+        self,
+        model: str,
+        remotes: list[Any] | None = None,
+        targets: list[Target] | None = None,
+        ordered: list[tuple[Target, Any]] | None = None,
+    ) -> tuple[Target | None, dict[str, Any] | None]:
         """The target for ``model``, or (with switching) the profile that would be loaded for it.
 
         Has no side effects, so ``explain`` reports exactly what ``resolve`` would do.
         """
         # An enabled endpoint that cannot be used is an error, not a reason to
         # silently send traffic somewhere else.
-        remotes = self.endpoints()
+        if remotes is None:
+            remotes = self.endpoints()
         enabled = next((r for r in remotes if r.enabled), None)
         if enabled is not None:
             _remote_key(enabled)
-        targets = self.catalog(remotes)
+        if targets is None:
+            targets = self.catalog(remotes)
         if model:
-            ordered = self._ordered_matches(targets, model)
+            if ordered is None:
+                ordered = self._ordered_matches(targets, model)
             if ordered:
                 return ordered[0][0], None
             prefix, _, rest = model.partition("/")
