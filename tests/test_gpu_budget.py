@@ -69,7 +69,8 @@ class PlanStartTests(unittest.TestCase):
         servers = [
             _server("parked", 20000, status="parked", running=False),
             _server("dead", 20000, running=False),
-            {**_server("paused", 5000), "suspended": True},
+            # As suspend_server records a pause.
+            {**_server("paused", 5000, status="suspended"), "suspended": True},
         ]
         plan = gpu_budget.plan_start(8000, HW_24G, servers)
         self.assertEqual(plan["available_mib"], 24576 - 5000)
