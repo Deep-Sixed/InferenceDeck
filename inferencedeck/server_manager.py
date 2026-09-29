@@ -923,6 +923,7 @@ def start_profile(
             }
 
         vram_plan: dict[str, Any] | None = None
+        to_release: list[str] = []
         check_mode = str(AppConfig.load().concurrent_vram_check or "block").lower()
         if check_mode != "off" and prepared.get("runtime", "llama.cpp") == "llama.cpp":
             # A server of this mode that stop_existing replaces frees its memory first.
@@ -949,15 +950,9 @@ def start_profile(
                             "reason": "vram_busy",
                             "vram_plan": vram_plan,
                         }
-                    for release_id in vram_plan["release"]:
-                        released = release_gpu(server_id=release_id)
-                        if not released.get("success"):
-                            return {
-                                "success": False,
-                                "error": f"Could not release {release_id} to make room: {released.get('error')}",
-                                "vram_plan": vram_plan,
-                            }
-                    vram_plan["released"] = list(vram_plan["release"])
+                    # Released below, once every check that can still refuse
+                    # this start has passed, so a refused start stops nothing.
+                    to_release = list(vram_plan["release"])
                 elif check_mode == "block":
                     return {
                         "success": False,
@@ -969,20 +964,36 @@ def start_profile(
                 prepared["warnings"] = list(prepared.get("warnings") or []) + [vram_plan["message"]]
             prepared["warnings"] = list(prepared.get("warnings") or []) + list(vram_plan.get("warnings") or [])
 
-        if existing and existing.get("running"):
-            stop_result = stop_server(mode=mode)
-            if not stop_result.get("success"):
-                return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
-
         params = prepared["params"]
         host, port = str(params.get("host", "127.0.0.1")), int(params.get("port", 8080))
-        clash = next((s for s in list_servers() if s.get("running") and _same_listener(s, host, port)), None)
+        # Servers stopped or released below free their ports first.
+        leaving = set(to_release) | ({str(existing.get("id"))} if existing and existing.get("running") else set())
+        clash = next(
+            (s for s in list_servers()
+             if s.get("running") and str(s.get("id")) not in leaving and _same_listener(s, host, port)),
+            None,
+        )
         if clash:
             return {
                 "success": False,
                 "error": f"Port {port} is already used by tracked server '{clash.get('mode') or clash.get('id')}'.",
                 "server": clash,
             }
+
+        if existing and existing.get("running"):
+            stop_result = stop_server(mode=mode)
+            if not stop_result.get("success"):
+                return {"success": False, "error": "Could not stop existing tracked server.", "stop_result": stop_result}
+        for release_id in to_release:
+            released = release_gpu(server_id=release_id)
+            if not released.get("success"):
+                return {
+                    "success": False,
+                    "error": f"Could not release {release_id} to make room: {released.get('error')}",
+                    "vram_plan": vram_plan,
+                }
+        if to_release and vram_plan is not None:
+            vram_plan["released"] = to_release
 
         command = LaunchCommand(
             argv=prepared["command"]["argv"],

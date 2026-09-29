@@ -69,7 +69,8 @@ class PlanStartTests(unittest.TestCase):
         servers = [
             _server("parked", 20000, status="parked", running=False),
             _server("dead", 20000, running=False),
-            {**_server("paused", 5000), "suspended": True},
+            # As suspend_server records a pause.
+            {**_server("paused", 5000, status="suspended"), "suspended": True},
         ]
         plan = gpu_budget.plan_start(8000, HW_24G, servers)
         self.assertEqual(plan["available_mib"], 24576 - 5000)
@@ -79,6 +80,14 @@ class PlanStartTests(unittest.TestCase):
         plan = gpu_budget.plan_start(20000, HW_24G, [_server("same-mode", 20000)], exclude={"same-mode"})
         self.assertEqual(plan["status"], "fits")
         self.assertEqual(plan["running"], [])
+
+    def test_replaced_server_frees_its_memory_on_the_live_path(self) -> None:
+        # stop_existing: the same-mode server (18 GiB) is stopped before the new one starts.
+        servers = [_server("same-mode", 18000), _server("other", 4000)]
+        plan = gpu_budget.plan_start(18000, HW_24G, servers, live_free=2000, exclude={"same-mode"})
+        self.assertEqual(plan["available_mib"], 20000)
+        self.assertIn(plan["status"], ("fits", "tight"))
+        self.assertEqual(plan["release"], [])
 
     def test_live_free_counts_only_loading_servers_again(self) -> None:
         servers = [_server("ready", 10000), _server("loading", 4000, status="starting")]
@@ -226,6 +235,16 @@ class StartProfileVramTests(unittest.TestCase):
         self.assertEqual(result["vram_plan"]["released"], [other])
         self.assertEqual(server_manager._find_server(other)["status"], server_manager.PARKED)
         self.assertEqual(result["server"]["estimated_vram_mib"], 14000)
+
+    def test_refused_start_releases_nothing(self) -> None:
+        other = self._track_other()
+        # A small server already on the new server's port (127.0.0.1:1): the start must fail.
+        squatter = self._track_other(mib=500)
+        server_manager._update_server(squatter, {"mode": "squatter", "host": "127.0.0.1", "port": 1})
+        result = self._start(release_conflicts=True)
+        self.assertFalse(result["success"])
+        self.assertIn("already used", result["error"])
+        self.assertEqual(server_manager._find_server(other)["status"], "running")
 
     def test_server_answering_requests_is_not_released(self) -> None:
         other = self._track_other()

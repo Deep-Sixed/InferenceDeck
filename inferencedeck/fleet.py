@@ -195,8 +195,8 @@ class Fleet:
             with ThreadPoolExecutor(max_workers=min(8, len(self.peers))) as pool:
                 results = list(pool.map(self._safe_fetch, self.peers))
             for peer, result in zip(self.peers, results):
-                hosts.append(
-                    summarize_host(
+                try:
+                    host = summarize_host(
                         peer.name,
                         result.get("snapshot"),
                         local=False,
@@ -204,8 +204,14 @@ class Fleet:
                         error=result.get("error"),
                         latency_ms=result.get("latency_ms"),
                     )
-                    | {"url": peer.url}
-                )
+                except Exception as exc:
+                    # A peer's snapshot is untrusted input (an older build, or any
+                    # service at that URL): one bad reply marks that peer, not the fleet.
+                    host = summarize_host(
+                        peer.name, None, local=False, reachable=False,
+                        error=f"unreadable telemetry: {type(exc).__name__}: {exc}",
+                    )
+                hosts.append(host | {"url": peer.url})
         return {
             "version": 1,
             "timestamp": telemetry._now_iso(),

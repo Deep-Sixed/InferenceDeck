@@ -137,6 +137,19 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(view["hosts"][1]["servers"][0]["tokens_per_second"], 76.2)
         self.assertEqual(view["hosts"][2]["error"], "boom")
 
+    def test_malformed_peer_snapshot_marks_only_that_peer(self) -> None:
+        peers = [fleet.Peer("friday", "http://f:1"), fleet.Peer("junk", "http://j:1")]
+
+        def fetch(peer):
+            if peer.name == "junk":  # reachable, but not InferenceDeck telemetry
+                return {"reachable": True, "latency_ms": 3.0, "snapshot": {"gpus": ["x"], "servers": "nope"}}
+            return {"reachable": True, "latency_ms": 12.0, "snapshot": _snap()}
+
+        view = fleet.Fleet(peers, "thanatos", collect_local=lambda: _snap(), fetch=fetch).overview()
+        names = [(h["name"], h["reachable"]) for h in view["hosts"]]
+        self.assertEqual(names, [("thanatos", True), ("friday", True), ("junk", False)])
+        self.assertIn("unreadable telemetry", view["hosts"][2]["error"])
+
     def test_overview_is_cached(self) -> None:
         collect = mock.Mock(return_value=_snap())
         view = fleet.Fleet([], "x", collect_local=collect, max_age=60)

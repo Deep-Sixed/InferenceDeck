@@ -27,6 +27,9 @@ MAX_TRACKED_CLIENTS = 1024
 MAX_GLOBAL_FAILURES = 50
 # IPv6 clients are throttled by /64: one host usually holds the whole prefix.
 IPV6_THROTTLE_PREFIX = 64
+# A client that authenticated within this long is exempt from the global cap, so
+# a flood of bad guesses from elsewhere can't lock out clients already known good.
+KNOWN_GOOD_SECONDS = 24 * 3600
 
 _Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 _LOOPBACK_NETWORKS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
@@ -196,6 +199,8 @@ class AuthState:
     _sessions: OrderedDict[str, float] = field(default_factory=OrderedDict, init=False, repr=False)
     # client -> recent failure times, for login/token throttling.
     _failures: OrderedDict[str, deque[float]] = field(default_factory=OrderedDict, init=False, repr=False)
+    # client -> last successful authentication (see KNOWN_GOOD_SECONDS).
+    _known_good: OrderedDict[str, float] = field(default_factory=OrderedDict, init=False, repr=False)
     # Every recent failure, whoever made it (MAX_GLOBAL_FAILURES).
     _all_failures: deque[float] = field(
         default_factory=lambda: deque(maxlen=MAX_GLOBAL_FAILURES), init=False, repr=False
@@ -264,7 +269,7 @@ class AuthState:
             if len(recent) >= MAX_FAILURES:
                 waits.append(self._wait_for(recent[-MAX_FAILURES]))
             self._expire(self._all_failures)
-            if len(self._all_failures) >= MAX_GLOBAL_FAILURES:
+            if len(self._all_failures) >= MAX_GLOBAL_FAILURES and not self._is_known_good(client):
                 waits.append(self._wait_for(self._all_failures[-MAX_GLOBAL_FAILURES]))
             return max(waits)
 
@@ -285,6 +290,14 @@ class AuthState:
         # guesses interleaved with someone else's good requests from one address.
         with self._lock:
             self._failures.pop(client, None)
+            self._known_good[client] = self.clock()
+            self._known_good.move_to_end(client)
+            while len(self._known_good) > MAX_TRACKED_CLIENTS:
+                self._known_good.popitem(last=False)
+
+    def _is_known_good(self, client: str) -> bool:
+        last = self._known_good.get(client)
+        return last is not None and self.clock() - last < KNOWN_GOOD_SECONDS
 
     def _wait_for(self, oldest: float) -> int:
         return max(1, int(oldest + FAILURE_WINDOW_SECONDS - self.clock()) + 1)

@@ -19,6 +19,7 @@ from inferencedeck.gateway.engines import AnthropicEngine, OllamaEngine, OpenAIC
 from inferencedeck.gateway.ir import GatewayError, StreamEvent, Usage
 from inferencedeck.gateway.router import Target
 from inferencedeck.remotes import list_endpoints
+from inferencedeck.gateway import server as server_module
 from inferencedeck.gateway.server import make_server
 from inferencedeck.inflight import Tracker
 
@@ -423,6 +424,23 @@ class GatewayServerTests(unittest.TestCase):
         status, raw = self.post("/v1/chat/completions", body, fresh)
         self.assertEqual(status, 429)
         self.assertIn("too many failed attempts", json.loads(raw)["error"]["message"])
+
+    def test_refused_posts_read_the_body_first(self) -> None:
+        # Replying with the body unread makes Windows reset the connection; check
+        # the handler drains it on 401 and 404 as it does on 415.
+        self.start_gateway(AuthState(token="s3cret"))
+        drained: list[int] = []
+        original = server_module.GatewayRequestHandler._discard_body
+
+        def spy(handler) -> None:
+            original(handler)
+            drained.append(1)
+
+        body = {"messages": [{"role": "user", "content": "x" * 1000}]}
+        with mock.patch.object(server_module.GatewayRequestHandler, "_discard_body", spy):
+            self.assertEqual(self.post("/v1/chat/completions", body, {"Authorization": "Bearer wrong"})[0], 401)
+            self.assertEqual(self.post("/v1/nope", body, {"Authorization": "Bearer s3cret"})[0], 404)
+        self.assertEqual(len(drained), 2)
 
     def test_valid_token_clears_earlier_failures(self) -> None:
         self.start_gateway(AuthState(token="s3cret"))
