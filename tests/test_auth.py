@@ -95,6 +95,13 @@ class AuthHttpTests(unittest.TestCase):
         # Locked out now, even with the right password.
         self.assertEqual(self._code(self._login("secret")), 429)
 
+    def test_proxy_basic_auth_header_is_not_a_failed_guess(self) -> None:
+        # nginx/Caddy basic auth forwards this on every request; it isn't our token.
+        for _ in range(10):
+            req = urllib.request.Request(self.base + "/api/status", headers={"Authorization": "Basic dXNlcjpwYXNz"})
+            self.assertEqual(self._code(req), 401)
+        self.assertEqual(self._code(self._login("secret")), 200)
+
     def test_wrong_header_tokens_count_as_failures(self) -> None:
         for _ in range(5):
             req = urllib.request.Request(self.base + "/api/status", headers={"X-Auth-Token": "guess"})

@@ -89,7 +89,11 @@ class ControlRequestHandler(BaseHTTPRequestHandler):
         if wait:
             self._throttled(wait)
             return False
-        if self.headers.get("X-Auth-Token") or self.headers.get("Authorization"):
+        # Only headers that carry our token count as a guess: a reverse proxy's
+        # "Authorization: Basic ..." isn't one, and counting it would lock out
+        # every browser behind that proxy on its first page load.
+        scheme = self.headers.get("Authorization", "").partition(" ")[0].lower()
+        if self.headers.get("X-Auth-Token") or scheme == "bearer":
             if self.auth_state.supplied_token_ok(self.headers):
                 self.auth_state.record_success(client)
                 return True
