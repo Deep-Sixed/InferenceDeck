@@ -81,6 +81,14 @@ class PlanStartTests(unittest.TestCase):
         self.assertEqual(plan["status"], "fits")
         self.assertEqual(plan["running"], [])
 
+    def test_replaced_server_frees_its_memory_on_the_live_path(self) -> None:
+        # stop_existing: the same-mode server (18 GiB) is stopped before the new one starts.
+        servers = [_server("same-mode", 18000), _server("other", 4000)]
+        plan = gpu_budget.plan_start(18000, HW_24G, servers, live_free=2000, exclude={"same-mode"})
+        self.assertEqual(plan["available_mib"], 20000)
+        self.assertIn(plan["status"], ("fits", "tight"))
+        self.assertEqual(plan["release"], [])
+
     def test_live_free_counts_only_loading_servers_again(self) -> None:
         servers = [_server("ready", 10000), _server("loading", 4000, status="starting")]
         plan = gpu_budget.plan_start(6000, HW_24G, servers, live_free=12000)
